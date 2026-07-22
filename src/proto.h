@@ -113,6 +113,22 @@ int _proto_action_can_pickup(int pid);
 char* protoGetMessage(int pid, int message);
 char* protoGetName(int pid);
 char* protoGetDescription(int pid);
+
+// Copy the host's sheet into every extra player actor's row, so an actor
+// carrying pid kPlayerActorPidBase+slot resolves to its own CritterProto
+// (PLAYER_SHEET_DESIGN.md stage 2). Must run before any extra is spawned or
+// blob-loaded; harmless and unreachable when no extras exist.
+void protoPlayerActorSheetsSeed();
+// ONE slot (1..kMaxPlayerActors-1), for spawn-at-login. The bulk seeder above
+// must NOT run once players are live — it resets every extra's sheet to the
+// host's (ACCOUNT_IDENTITY_DESIGN.md trap 1).
+void protoPlayerActorSheetSeedSlot(int slot);
+
+// Skills + base/bonus SPECIAL for one actor (PLAYER_SHEET_DESIGN.md §5). Slot 0
+// is gDudeProto. Seed the rows BEFORE reading — only critter.data is on the
+// wire; see the definition.
+int protoPlayerActorRowWrite(File* stream, int slot);
+int protoPlayerActorRowRead(File* stream, int slot);
 int proto_item_init(Proto* proto, int pid);
 int proto_item_subdata_init(Proto* proto, int type);
 int proto_critter_init(Proto* proto, int pid);
@@ -121,6 +137,11 @@ int objectDataRead(Object* obj, File* stream);
 int objectDataWrite(Object* obj, File* stream);
 int _proto_update_init(Object* obj);
 int _proto_dude_update_gender();
+// Co-op: re-derive the EXTRA player actors' native (unarmored) vault-suit look —
+// the N-actor generalization of the gDude tail of _proto_dude_update_gender.
+// Idempotent derive from (MOVIE_VSUIT world flag, per-actor gender, armor state);
+// drive it from the baseline choke so every rebuild carries the right fid.
+void protoPlayerActorsUpdateLook();
 int _proto_dude_init(const char* path);
 int proto_scenery_init(Proto* proto, int pid);
 int proto_scenery_subdata_init(Proto* proto, int type);

@@ -1,0 +1,656 @@
+== F2CE STATE DUMP v1 ==
+game_time 304400
+rng_state 0xB2D4D2A8
+map 126
+map_name ARTEMPLE.MAP
+elevation 0
+worldmap pos=173,122 area=-1 walking=0 gas=80000 subtile_state=2
+gvars_len 696
+gvar 47 50
+gvar 104 2
+gvar 134 100
+gvar 135 100
+gvar 136 100
+gvar 144 10
+gvar 216 100
+gvar 257 -1
+gvar 258 -1
+gvar 461 20
+gvar 464 200
+gvar 580 10
+gvar 619 1
+mvars_len 0
+lvars_len 15
+lvar 0 302400
+dude id=18000 tile=17488 elev=0 hp=44 rad=0 poison=0 netid=1
+dude_stat 0 9
+dude_stat 1 6
+dude_stat 2 10
+dude_stat 3 4
+dude_stat 4 5
+dude_stat 5 8
+dude_stat 6 5
+dude_stat 7 44
+dude_stat 8 9
+dude_stat 9 8
+dude_stat 10 0
+dude_stat 11 8
+dude_stat 12 250
+dude_stat 13 12
+dude_stat 14 3
+dude_stat 15 5
+dude_stat 16 -30
+dude_stat 17 0
+dude_stat 18 0
+dude_stat 19 0
+dude_stat 20 0
+dude_stat 21 0
+dude_stat 22 0
+dude_stat 23 0
+dude_stat 24 0
+dude_stat 25 0
+dude_stat 26 0
+dude_stat 27 0
+dude_stat 28 0
+dude_stat 29 100
+dude_stat 30 0
+dude_stat 31 20
+dude_stat 32 50
+dude_pcstat 0 0
+dude_pcstat 1 1
+dude_pcstat 2 0
+dude_pcstat 3 0
+dude_pcstat 4 0
+dude_skill 0 47
+dude_skill 1 6
+dude_skill 2 6
+dude_skill 3 54
+dude_skill 4 64
+dude_skill 5 42
+dude_skill 6 2
+dude_skill 7 -4
+dude_skill 8 9
+dude_skill 9 4
+dude_skill 10 4
+dude_skill 11 4
+dude_skill 12 0
+dude_skill 13 -5
+dude_skill 14 0
+dude_skill 15 -4
+dude_skill 16 5
+dude_skill 17 10
+dude_tags 4 0 5 -1
+dude_traits 6 15
+  inv pid=0x00000007 qty=1 flags=0x00000008 charges=0
+objects 567
+obj id=16 pid=0x02000158 tile=11684 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=3
+obj id=252 pid=0x02000158 tile=11685 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=4
+obj id=20 pid=0x02000158 tile=11882 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=5
+obj id=18 pid=0x02000158 tile=11883 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=6
+obj id=250 pid=0x02000158 tile=11885 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=7
+obj id=248 pid=0x02000158 tile=11886 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=8
+obj id=24 pid=0x02000158 tile=12080 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=9
+obj id=22 pid=0x02000158 tile=12081 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=10
+obj id=246 pid=0x02000158 tile=12086 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=11
+obj id=28 pid=0x02000158 tile=12278 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=12
+obj id=26 pid=0x02000158 tile=12279 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=13
+obj id=244 pid=0x02000158 tile=12287 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=14
+obj id=32 pid=0x02000158 tile=12476 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=15
+obj id=30 pid=0x02000158 tile=12477 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=16
+obj id=242 pid=0x02000158 tile=12487 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=17
+obj id=240 pid=0x02000158 tile=12488 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=18
+obj id=36 pid=0x02000158 tile=12674 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=19
+obj id=34 pid=0x02000158 tile=12675 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=20
+obj id=238 pid=0x02000158 tile=12688 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=21
+obj id=40 pid=0x02000158 tile=12872 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=22
+obj id=38 pid=0x02000158 tile=12873 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=23
+obj id=234 pid=0x02000158 tile=12889 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=24
+obj id=44 pid=0x02000158 tile=13070 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=25
+obj id=42 pid=0x02000158 tile=13071 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=26
+obj id=22 pid=0x02000550 tile=13085 elev=0 rot=0 flags=0x00008010 sid=-1 script_idx=-1 netid=27
+obj id=236 pid=0x02000158 tile=13089 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=28
+obj id=232 pid=0x02000158 tile=13090 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=29
+obj id=48 pid=0x02000158 tile=13268 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=30
+obj id=46 pid=0x02000158 tile=13269 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=31
+obj id=230 pid=0x02000158 tile=13290 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=32
+obj id=52 pid=0x02000158 tile=13466 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=33
+obj id=50 pid=0x02000158 tile=13467 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=34
+obj id=18 pid=0x02000552 tile=13480 elev=0 rot=0 flags=0x00008010 sid=-1 script_idx=-1 netid=35
+obj id=228 pid=0x02000158 tile=13491 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=36
+obj id=56 pid=0x02000158 tile=13664 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=37
+obj id=54 pid=0x02000158 tile=13665 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=38
+obj id=226 pid=0x02000158 tile=13691 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=39
+obj id=224 pid=0x02000158 tile=13692 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=40
+obj id=60 pid=0x02000158 tile=13862 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=41
+obj id=58 pid=0x02000158 tile=13863 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=42
+obj id=222 pid=0x02000158 tile=13892 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=43
+obj id=278 pid=0x02000158 tile=14061 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=44
+obj id=276 pid=0x02000158 tile=14062 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=45
+obj id=220 pid=0x02000158 tile=14093 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=46
+obj id=274 pid=0x02000158 tile=14262 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=47
+obj id=16 pid=0x02000553 tile=14276 elev=0 rot=0 flags=0x00008010 sid=-1 script_idx=-1 netid=48
+obj id=218 pid=0x02000158 tile=14293 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=49
+obj id=216 pid=0x02000158 tile=14294 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=50
+obj id=272 pid=0x02000158 tile=14463 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=51
+obj id=20 pid=0x02000551 tile=14490 elev=0 rot=0 flags=0x00008010 sid=-1 script_idx=-1 netid=52
+obj id=214 pid=0x02000158 tile=14494 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=53
+obj id=270 pid=0x02000158 tile=14663 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=54
+obj id=268 pid=0x02000158 tile=14664 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=55
+obj id=1212 pid=0x0500000C tile=14682 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=56
+obj id=212 pid=0x02000158 tile=14695 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=57
+obj id=266 pid=0x02000158 tile=14864 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=58
+obj id=14 pid=0x02000554 tile=14870 elev=0 rot=0 flags=0x00008010 sid=-1 script_idx=-1 netid=59
+obj id=1216 pid=0x0500000C tile=14880 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=60
+obj id=1214 pid=0x0500000C tile=14881 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=61
+obj id=1202 pid=0x0500000C tile=14882 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=62
+obj id=210 pid=0x02000158 tile=14895 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=63
+obj id=208 pid=0x02000158 tile=14896 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=64
+obj id=264 pid=0x02000158 tile=15065 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=65
+obj id=1220 pid=0x0500000C tile=15078 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=66
+obj id=1218 pid=0x0500000C tile=15079 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=67
+obj id=1206 pid=0x0500000C tile=15080 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=68
+obj id=1204 pid=0x0500000C tile=15081 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=69
+obj id=1188 pid=0x0500000C tile=15083 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=70
+obj id=206 pid=0x02000158 tile=15096 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=71
+obj id=262 pid=0x02000158 tile=15265 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=72
+obj id=260 pid=0x02000158 tile=15266 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=73
+obj id=1210 pid=0x0500000C tile=15278 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=74
+obj id=1208 pid=0x0500000C tile=15279 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=75
+obj id=1362 pid=0x0500000C tile=15283 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=76
+obj id=164 pid=0x0300026E tile=15284 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=77
+obj id=1032 pid=0x0500000C tile=15284 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=78
+obj id=162 pid=0x0300026E tile=15288 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=79
+obj id=204 pid=0x02000158 tile=15297 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=80
+obj id=258 pid=0x02000158 tile=15466 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=81
+obj id=1196 pid=0x0500000C tile=15479 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=82
+obj id=112 pid=0x0300026E tile=15484 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=83
+obj id=1364 pid=0x0500000C tile=15484 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=84
+obj id=160 pid=0x0300026E tile=15488 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=85
+obj id=202 pid=0x02000158 tile=15497 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=86
+obj id=200 pid=0x02000158 tile=15498 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=87
+obj id=256 pid=0x02000158 tile=15667 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=88
+obj id=1648 pid=0x0200005C tile=15669 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=89
+obj id=144 pid=0x0300026E tile=15670 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=90
+obj id=140 pid=0x0300026E tile=15672 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=91
+obj id=1154 pid=0x0500000C tile=15679 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=92
+obj id=1040 pid=0x0500000C tile=15680 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=93
+obj id=110 pid=0x0300026E tile=15684 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=94
+obj id=1186 pid=0x0500000C tile=15685 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=95
+obj id=30 pid=0x05000017 tile=15686 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=96
+obj id=158 pid=0x0300026E tile=15688 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=97
+obj id=198 pid=0x02000158 tile=15698 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=98
+obj id=150 pid=0x0300026E tile=15867 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=99
+obj id=148 pid=0x0300026E tile=15868 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=100
+obj id=146 pid=0x0300026E tile=15869 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=101
+obj id=142 pid=0x0300026E tile=15871 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=102
+obj id=138 pid=0x0300026E tile=15873 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=103
+obj id=1088 pid=0x0500000C tile=15880 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=104
+obj id=46 pid=0x02000558 tile=15884 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=106
+obj id=108 pid=0x0300026E tile=15884 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=105
+obj id=1366 pid=0x0500000C tile=15885 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=107
+obj id=28 pid=0x05000017 tile=15885 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=108
+obj id=1184 pid=0x0500000C tile=15886 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=109
+obj id=32 pid=0x05000017 tile=15887 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=110
+obj id=156 pid=0x0300026E tile=15888 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=111
+obj id=196 pid=0x02000158 tile=15899 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=112
+obj id=1498 pid=0x020003B3 tile=16069 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=113
+obj id=136 pid=0x0300026E tile=16073 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=114
+obj id=134 pid=0x0300026E tile=16074 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=115
+obj id=1090 pid=0x0500000C tile=16081 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=116
+obj id=106 pid=0x0300026E tile=16084 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=117
+obj id=1368 pid=0x0500000C tile=16086 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=118
+obj id=154 pid=0x0300026E tile=16088 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=119
+obj id=194 pid=0x02000158 tile=16099 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=120
+obj id=192 pid=0x02000158 tile=16100 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=121
+obj id=56 pid=0x0200005D tile=16269 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=122
+obj id=58 pid=0x02000043 tile=16270 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=123
+obj id=132 pid=0x0300026E tile=16274 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=124
+obj id=124 pid=0x0300026E tile=16278 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=125
+obj id=120 pid=0x0300026E tile=16280 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=126
+obj id=1092 pid=0x0500000C tile=16281 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=127
+obj id=116 pid=0x0300026E tile=16282 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=128
+obj id=1094 pid=0x0500000C tile=16282 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=129
+obj id=104 pid=0x0300026E tile=16284 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=130
+obj id=44 pid=0x02000559 tile=16285 elev=0 rot=0 flags=0xA0008010 sid=-1 script_idx=-1 netid=131
+obj id=1182 pid=0x0500000C tile=16287 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=132
+obj id=152 pid=0x0300026E tile=16288 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=133
+obj id=190 pid=0x02000158 tile=16300 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=134
+obj id=1506 pid=0x020003B3 tile=16465 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=135
+obj id=500 pid=0x02000158 tile=16469 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=136
+obj id=1654 pid=0x020003B1 tile=16472 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=137
+obj id=130 pid=0x0300026E tile=16475 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=138
+obj id=128 pid=0x0300026E tile=16476 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=139
+obj id=126 pid=0x0300026E tile=16477 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=140
+obj id=122 pid=0x0300026E tile=16479 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=141
+obj id=118 pid=0x0300026E tile=16481 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=142
+obj id=1096 pid=0x0500000C tile=16482 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=143
+obj id=114 pid=0x0300026E tile=16483 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=144
+obj id=440 pid=0x02000158 tile=16484 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=145
+obj id=1370 pid=0x0500000C tile=16487 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=146
+obj id=102 pid=0x0300026E tile=16488 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=147
+obj id=1180 pid=0x0500000C tile=16488 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=148
+obj id=98 pid=0x0300026E tile=16490 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=149
+obj id=14 pid=0x0200054F tile=16491 elev=0 rot=0 flags=0x00008010 sid=-1 script_idx=-1 netid=150
+obj id=94 pid=0x0300026E tile=16492 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=151
+obj id=90 pid=0x0300026E tile=16494 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=152
+obj id=84 pid=0x0300026E tile=16496 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=153
+obj id=188 pid=0x02000158 tile=16501 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=154
+obj id=498 pid=0x02000158 tile=16669 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=155
+obj id=1496 pid=0x020003B3 tile=16670 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=156
+obj id=326 pid=0x02000158 tile=16675 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=157
+obj id=328 pid=0x02000158 tile=16676 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=158
+obj id=402 pid=0x02000158 tile=16683 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=159
+obj id=1098 pid=0x0500000C tile=16683 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=160
+obj id=438 pid=0x02000158 tile=16684 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=161
+obj id=1372 pid=0x0500000C tile=16688 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=162
+obj id=100 pid=0x0300026E tile=16689 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=163
+obj id=96 pid=0x0300026E tile=16691 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=164
+obj id=92 pid=0x0300026E tile=16693 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=165
+obj id=88 pid=0x0300026E tile=16695 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=166
+obj id=86 pid=0x0300026E tile=16697 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=167
+obj id=82 pid=0x0300026E tile=16698 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=168
+obj id=42 pid=0x0300026E tile=16699 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=169
+obj id=22 pid=0x0300026E tile=16700 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=170
+obj id=20 pid=0x0300026E tile=16701 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=171
+obj id=388 pid=0x02000158 tile=16702 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=172
+obj id=496 pid=0x02000158 tile=16870 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=173
+obj id=1656 pid=0x020003B1 tile=16875 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=174
+obj id=330 pid=0x02000158 tile=16876 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=175
+obj id=404 pid=0x02000158 tile=16883 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=176
+obj id=1100 pid=0x0500000C tile=16883 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=177
+obj id=400 pid=0x02000158 tile=16884 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=178
+obj id=1102 pid=0x0500000C tile=16884 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=179
+obj id=406 pid=0x02000158 tile=16889 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=180
+obj id=1178 pid=0x0500000C tile=16889 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=181
+obj id=300 pid=0x02000158 tile=16898 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=182
+obj id=386 pid=0x02000158 tile=16902 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=183
+obj id=494 pid=0x02000158 tile=17070 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=184
+obj id=1494 pid=0x020003B3 tile=17072 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=185
+obj id=332 pid=0x02000158 tile=17076 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=186
+obj id=378 pid=0x02000158 tile=17082 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=187
+obj id=380 pid=0x02000158 tile=17083 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=188
+obj id=398 pid=0x02000158 tile=17084 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=189
+obj id=1104 pid=0x0500000C tile=17084 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=190
+obj id=408 pid=0x02000158 tile=17089 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=191
+obj id=1374 pid=0x0500000C tile=17089 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=192
+obj id=410 pid=0x02000158 tile=17090 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=193
+obj id=1176 pid=0x0500000C tile=17090 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=194
+obj id=298 pid=0x02000158 tile=17099 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=195
+obj id=384 pid=0x02000158 tile=17103 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=196
+obj id=1504 pid=0x020003B3 tile=17270 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=197
+obj id=862 pid=0x02000066 tile=17276 elev=0 rot=0 flags=0xA0008010 sid=-1 script_idx=-1 netid=198
+obj id=334 pid=0x02000158 tile=17277 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=199
+obj id=14 pid=0x02000556 tile=17278 elev=0 rot=0 flags=0xA0008010 sid=50331648 script_idx=511 netid=200
+obj id=376 pid=0x02000158 tile=17281 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=201
+obj id=382 pid=0x02000158 tile=17283 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=202
+obj id=384 pid=0x02000158 tile=17284 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=203
+obj id=1106 pid=0x0500000C tile=17285 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=204
+obj id=412 pid=0x02000158 tile=17290 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=205
+obj id=1376 pid=0x0500000C tile=17290 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=206
+obj id=436 pid=0x02000158 tile=17292 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=207
+obj id=18 pid=0x02000555 tile=17294 elev=0 rot=0 flags=0xA0008010 sid=50331649 script_idx=511 netid=208
+obj id=302 pid=0x02000158 tile=17299 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=209
+obj id=1470 pid=0x020003B2 tile=17301 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=210
+obj id=382 pid=0x02000158 tile=17303 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=211
+obj id=380 pid=0x02000158 tile=17304 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=212
+obj id=492 pid=0x02000158 tile=17470 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=213
+obj id=336 pid=0x02000158 tile=17477 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=214
+obj id=338 pid=0x02000158 tile=17478 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=215
+obj id=374 pid=0x02000158 tile=17481 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=216
+obj id=386 pid=0x02000158 tile=17484 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=217
+obj id=396 pid=0x02000158 tile=17485 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=218
+obj id=1108 pid=0x0500000C tile=17485 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=219
+obj id=1110 pid=0x0500000C tile=17486 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=220
+obj id=414 pid=0x02000158 tile=17490 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=221
+obj id=424 pid=0x02000158 tile=17491 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=222
+obj id=1174 pid=0x0500000C tile=17491 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=223
+obj id=434 pid=0x02000158 tile=17493 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=224
+obj id=306 pid=0x02000158 tile=17498 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=225
+obj id=304 pid=0x02000158 tile=17499 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=226
+obj id=378 pid=0x02000158 tile=17504 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=227
+obj id=490 pid=0x02000158 tile=17671 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=228
+obj id=1658 pid=0x020003B3 tile=17676 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=229
+obj id=340 pid=0x02000158 tile=17678 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=230
+obj id=372 pid=0x02000158 tile=17681 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=231
+obj id=356 pid=0x02000158 tile=17682 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=232
+obj id=388 pid=0x02000158 tile=17684 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=233
+obj id=394 pid=0x02000158 tile=17685 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=234
+obj id=1112 pid=0x0500000C tile=17686 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=235
+obj id=416 pid=0x02000158 tile=17690 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=236
+obj id=422 pid=0x02000158 tile=17691 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=237
+obj id=1378 pid=0x0500000C tile=17691 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=238
+obj id=1172 pid=0x0500000C tile=17692 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=239
+obj id=432 pid=0x02000158 tile=17693 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=240
+obj id=430 pid=0x02000158 tile=17694 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=241
+obj id=308 pid=0x02000158 tile=17698 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=242
+obj id=376 pid=0x02000158 tile=17705 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=243
+obj id=374 pid=0x02000158 tile=17706 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=244
+obj id=488 pid=0x02000158 tile=17871 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=245
+obj id=342 pid=0x02000158 tile=17878 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=246
+obj id=22 pid=0x0200008D tile=17879 elev=0 rot=0 flags=0xA0000038 sid=-1 script_idx=-1 netid=247
+obj id=354 pid=0x02000158 tile=17882 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=248
+obj id=390 pid=0x02000158 tile=17885 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=249
+obj id=392 pid=0x02000158 tile=17886 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=250
+obj id=1114 pid=0x0500000C tile=17887 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=251
+obj id=418 pid=0x02000158 tile=17891 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=252
+obj id=420 pid=0x02000158 tile=17892 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=253
+obj id=1380 pid=0x0500000C tile=17892 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=254
+obj id=324 pid=0x02000158 tile=17894 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=255
+obj id=20 pid=0x0200008D tile=17895 elev=0 rot=0 flags=0xA0000038 sid=-1 script_idx=-1 netid=256
+obj id=310 pid=0x02000158 tile=17898 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=257
+obj id=1552 pid=0x020003B2 tile=17905 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=258
+obj id=1550 pid=0x020003B2 tile=17907 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=259
+obj id=486 pid=0x02000158 tile=18071 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=260
+obj id=484 pid=0x02000158 tile=18072 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=261
+obj id=1500 pid=0x020003B3 tile=18076 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=262
+obj id=344 pid=0x02000158 tile=18079 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=263
+obj id=348 pid=0x02000158 tile=18080 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=264
+obj id=352 pid=0x02000158 tile=18082 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=265
+obj id=1116 pid=0x0500000C tile=18087 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=266
+obj id=1118 pid=0x0500000C tile=18088 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=267
+obj id=1170 pid=0x0500000C tile=18093 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=268
+obj id=322 pid=0x02000158 tile=18094 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=269
+obj id=312 pid=0x02000158 tile=18098 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=270
+obj id=1468 pid=0x020003B2 tile=18105 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=271
+obj id=372 pid=0x02000158 tile=18107 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=272
+obj id=370 pid=0x02000158 tile=18108 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=273
+obj id=1502 pid=0x020003B3 tile=18272 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=274
+obj id=482 pid=0x02000158 tile=18273 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=275
+obj id=480 pid=0x02000158 tile=18274 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=276
+obj id=346 pid=0x02000158 tile=18279 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=277
+obj id=350 pid=0x02000158 tile=18281 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=278
+obj id=1120 pid=0x0500000C tile=18288 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=279
+obj id=1382 pid=0x0500000C tile=18293 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=280
+obj id=1168 pid=0x0500000C tile=18294 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=281
+obj id=320 pid=0x02000158 tile=18295 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=282
+obj id=318 pid=0x02000158 tile=18296 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=283
+obj id=316 pid=0x02000158 tile=18297 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=284
+obj id=314 pid=0x02000158 tile=18298 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=285
+obj id=368 pid=0x02000158 tile=18308 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=286
+obj id=1492 pid=0x020003B3 tile=18475 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=287
+obj id=1122 pid=0x0500000C tile=18489 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=288
+obj id=1384 pid=0x0500000C tile=18494 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=289
+obj id=366 pid=0x02000158 tile=18509 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=290
+obj id=478 pid=0x02000158 tile=18675 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=291
+obj id=1124 pid=0x0500000C tile=18689 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=292
+obj id=1126 pid=0x0500000C tile=18690 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=293
+obj id=1166 pid=0x0500000C tile=18695 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=294
+obj id=364 pid=0x02000158 tile=18709 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=295
+obj id=362 pid=0x02000158 tile=18710 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=296
+obj id=476 pid=0x02000158 tile=18875 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=297
+obj id=1490 pid=0x020003B3 tile=18876 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=298
+obj id=1128 pid=0x0500000C tile=18890 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=299
+obj id=1386 pid=0x0500000C tile=18895 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=300
+obj id=1150 pid=0x0500000C tile=18896 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=301
+obj id=1548 pid=0x020003B2 tile=18910 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=302
+obj id=474 pid=0x02000158 tile=19076 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=303
+obj id=1660 pid=0x020003B3 tile=19079 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=304
+obj id=1130 pid=0x0500000C tile=19091 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=305
+obj id=1388 pid=0x0500000C tile=19096 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=306
+obj id=1542 pid=0x020003B2 tile=19107 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=307
+obj id=360 pid=0x02000158 tile=19110 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=308
+obj id=472 pid=0x02000158 tile=19276 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=309
+obj id=1132 pid=0x0500000C tile=19291 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=310
+obj id=1140 pid=0x0500000C tile=19292 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=311
+obj id=1224 pid=0x0500000C tile=19297 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=312
+obj id=1586 pid=0x0200004A tile=19309 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=313
+obj id=358 pid=0x02000158 tile=19310 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=314
+obj id=470 pid=0x02000158 tile=19477 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=315
+obj id=1280 pid=0x0500000C tile=19492 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=316
+obj id=1390 pid=0x0500000C tile=19497 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=317
+obj id=1228 pid=0x0500000C tile=19498 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=318
+obj id=60 pid=0x02000043 tile=19509 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=319
+obj id=1544 pid=0x020003B2 tile=19510 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=320
+obj id=468 pid=0x02000158 tile=19677 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=321
+obj id=466 pid=0x02000158 tile=19678 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=322
+obj id=860 pid=0x02000069 tile=19686 elev=0 rot=0 flags=0xA0008010 sid=-1 script_idx=-1 netid=323
+obj id=1282 pid=0x0500000C tile=19693 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=324
+obj id=1392 pid=0x0500000C tile=19698 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=325
+obj id=1540 pid=0x020003B2 tile=19707 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=326
+obj id=1464 pid=0x020003B2 tile=19710 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=327
+obj id=464 pid=0x02000158 tile=19878 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=328
+obj id=1662 pid=0x020003B3 tile=19883 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=329
+obj id=1284 pid=0x0500000C tile=19893 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=330
+obj id=1286 pid=0x0500000C tile=19894 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=331
+obj id=1232 pid=0x0500000C tile=19899 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=332
+obj id=356 pid=0x02000158 tile=19910 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=333
+obj id=462 pid=0x02000158 tile=20079 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=334
+obj id=1288 pid=0x0500000C tile=20094 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=335
+obj id=1394 pid=0x0500000C tile=20099 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=336
+obj id=1236 pid=0x0500000C tile=20100 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=337
+obj id=1466 pid=0x020003B2 tile=20108 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=338
+obj id=354 pid=0x02000158 tile=20109 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=339
+obj id=1546 pid=0x020003B2 tile=20114 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=340
+obj id=1488 pid=0x020003B3 tile=20277 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=341
+obj id=460 pid=0x02000158 tile=20279 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=342
+obj id=458 pid=0x02000158 tile=20280 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=343
+obj id=1484 pid=0x020003B3 tile=20282 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=344
+obj id=1290 pid=0x0500000C tile=20295 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=345
+obj id=1396 pid=0x0500000C tile=20300 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=346
+obj id=352 pid=0x02000158 tile=20306 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=347
+obj id=1538 pid=0x020003B2 tile=20307 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=348
+obj id=1556 pid=0x020003B2 tile=20312 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=349
+obj id=1486 pid=0x020003B3 tile=20480 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=350
+obj id=1664 pid=0x020003B3 tile=20484 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=351
+obj id=1292 pid=0x0500000C tile=20495 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=352
+obj id=1294 pid=0x0500000C tile=20496 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=353
+obj id=1240 pid=0x0500000C tile=20501 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=354
+obj id=1536 pid=0x020003B2 tile=20505 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=355
+obj id=456 pid=0x02000158 tile=20681 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=356
+obj id=1592 pid=0x0200005C tile=20688 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=357
+obj id=1296 pid=0x0500000C tile=20696 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=358
+obj id=1398 pid=0x0500000C tile=20701 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=359
+obj id=1244 pid=0x0500000C tile=20702 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=360
+obj id=1588 pid=0x0200004A tile=20704 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=361
+obj id=350 pid=0x02000158 tile=20705 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=362
+obj id=1582 pid=0x0200005A tile=20709 elev=0 rot=0 flags=0x20008000 sid=-1 script_idx=-1 netid=363
+obj id=1462 pid=0x020003B2 tile=20712 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=364
+obj id=1554 pid=0x020003B2 tile=20715 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=365
+obj id=1646 pid=0x020003B3 tile=20717 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=366
+obj id=454 pid=0x02000158 tile=20881 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=367
+obj id=452 pid=0x02000158 tile=20882 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=368
+obj id=1482 pid=0x020003B3 tile=20887 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=369
+obj id=78 pid=0x02000043 tile=20888 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=370
+obj id=76 pid=0x02000043 tile=20889 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=371
+obj id=1298 pid=0x0500000C tile=20897 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=372
+obj id=1400 pid=0x0500000C tile=20902 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=373
+obj id=348 pid=0x02000158 tile=20904 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=374
+obj id=1576 pid=0x020003B3 tile=20911 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=375
+obj id=450 pid=0x02000158 tile=21082 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=376
+obj id=1300 pid=0x0500000C tile=21097 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=377
+obj id=1302 pid=0x0500000C tile=21098 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=378
+obj id=948 pid=0x02000158 tile=21100 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=379
+obj id=24 pid=0x01000003 tile=21101 elev=0 rot=5 flags=0x20000000 sid=67108865 script_idx=750 netid=380
+  critter hp=50 rad=0 poison=0 ap=9 team=1 ai=1 maneuver=0 results=0x0 who_hit_me=-1
+  inv pid=0x00000007 qty=1 flags=0x02000008 charges=0
+obj id=1248 pid=0x0500000C tile=21103 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=382
+obj id=1578 pid=0x020003B3 tile=21104 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=383
+obj id=528 pid=0x0200005C tile=21105 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=384
+obj id=858 pid=0x02000068 tile=21113 elev=0 rot=0 flags=0xA0008010 sid=-1 script_idx=-1 netid=385
+obj id=1584 pid=0x0200004A tile=21115 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=386
+obj id=1558 pid=0x020003B2 tile=21116 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=387
+obj id=796 pid=0x02000158 tile=21117 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=388
+obj id=798 pid=0x02000158 tile=21118 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=389
+obj id=448 pid=0x02000158 tile=21283 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=390
+obj id=1594 pid=0x0200005B tile=21288 elev=0 rot=0 flags=0x20008000 sid=-1 script_idx=-1 netid=391
+obj id=70 pid=0x02000043 tile=21289 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=392
+obj id=62 pid=0x02000043 tile=21290 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=393
+obj id=956 pid=0x020003B1 tile=21296 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=394
+obj id=942 pid=0x0200005D tile=21298 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=396
+obj id=1304 pid=0x0500000C tile=21298 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=395
+obj id=950 pid=0x02000158 tile=21299 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=397
+obj id=932 pid=0x0200005A tile=21300 elev=0 rot=0 flags=0x20008000 sid=-1 script_idx=-1 netid=398
+obj id=946 pid=0x02000158 tile=21301 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=399
+obj id=944 pid=0x02000158 tile=21302 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=400
+obj id=546 pid=0x020003AE tile=21303 elev=0 rot=0 flags=0x00008000 sid=-1 script_idx=-1 netid=402
+obj id=1402 pid=0x0500000C tile=21303 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=401
+obj id=1252 pid=0x0500000C tile=21304 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=403
+obj id=346 pid=0x02000158 tile=21305 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=404
+obj id=1450 pid=0x020003B3 tile=21306 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=405
+obj id=526 pid=0x0200005C tile=21308 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=406
+obj id=1452 pid=0x020003B3 tile=21309 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=407
+obj id=792 pid=0x02000158 tile=21314 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=408
+obj id=794 pid=0x02000158 tile=21315 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=409
+obj id=800 pid=0x02000158 tile=21318 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=410
+obj id=446 pid=0x02000158 tile=21483 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=411
+obj id=444 pid=0x02000158 tile=21484 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=412
+obj id=72 pid=0x02000043 tile=21487 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=413
+obj id=64 pid=0x02000043 tile=21490 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=414
+obj id=952 pid=0x02000158 tile=21497 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=415
+obj id=1306 pid=0x0500000C tile=21499 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=416
+obj id=550 pid=0x02000158 tile=21501 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=417
+obj id=1404 pid=0x0500000C tile=21504 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=418
+obj id=344 pid=0x02000158 tile=21507 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=419
+obj id=846 pid=0x020003B1 tile=21511 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=420
+obj id=852 pid=0x0200005D tile=21513 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=422
+obj id=850 pid=0x020003B3 tile=21513 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=421
+obj id=790 pid=0x02000158 tile=21514 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=423
+obj id=844 pid=0x020003B1 tile=21515 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=424
+obj id=802 pid=0x02000158 tile=21519 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=425
+obj id=1480 pid=0x020003B1 tile=21685 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=426
+obj id=442 pid=0x02000158 tile=21686 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=427
+obj id=74 pid=0x02000043 tile=21687 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=428
+obj id=68 pid=0x02000043 tile=21688 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=429
+obj id=66 pid=0x02000043 tile=21689 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=430
+obj id=1440 pid=0x020003B3 tile=21693 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=431
+obj id=426 pid=0x02000158 tile=21698 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=432
+obj id=1308 pid=0x0500000C tile=21699 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=433
+obj id=1534 pid=0x020003B2 tile=21700 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=435
+obj id=1310 pid=0x0500000C tile=21700 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=434
+obj id=534 pid=0x02000158 tile=21701 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=436
+obj id=1516 pid=0x0500000C tile=21702 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=437
+obj id=1514 pid=0x0500000C tile=21703 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=438
+obj id=1508 pid=0x0500000C tile=21704 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=439
+obj id=1256 pid=0x0500000C tile=21705 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=440
+obj id=342 pid=0x02000158 tile=21707 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=441
+obj id=1520 pid=0x020003B2 tile=21708 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=442
+obj id=340 pid=0x02000158 tile=21709 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=443
+obj id=338 pid=0x02000158 tile=21710 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=444
+obj id=786 pid=0x02000158 tile=21712 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=445
+obj id=788 pid=0x02000158 tile=21713 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=446
+obj id=848 pid=0x020003B2 tile=21717 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=447
+obj id=880 pid=0x02000031 tile=21718 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=448
+obj id=756 pid=0x05000012 tile=21718 elev=0 rot=0 flags=0x20008018 sid=-1 script_idx=-1 netid=449
+obj id=804 pid=0x02000158 tile=21719 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=450
+obj id=806 pid=0x02000158 tile=21720 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=451
+obj id=440 pid=0x02000158 tile=21887 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=452
+obj id=1604 pid=0x0200005D tile=21888 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=453
+obj id=1442 pid=0x020003B3 tile=21892 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=454
+obj id=1446 pid=0x020003B3 tile=21896 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=455
+obj id=428 pid=0x02000158 tile=21897 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=456
+obj id=958 pid=0x020003B2 tile=21897 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=457
+obj id=1438 pid=0x020003B3 tile=21899 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=458
+obj id=1312 pid=0x0500000C tile=21900 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=459
+obj id=1518 pid=0x0500000C tile=21901 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=460
+obj id=1512 pid=0x0500000C tile=21902 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=461
+obj id=1510 pid=0x0500000C tile=21903 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=462
+obj id=1454 pid=0x020003B2 tile=21911 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=463
+obj id=1460 pid=0x020003B2 tile=21913 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=464
+obj id=760 pid=0x05000012 tile=21916 elev=0 rot=0 flags=0x20008018 sid=-1 script_idx=-1 netid=465
+obj id=758 pid=0x05000012 tile=21917 elev=0 rot=0 flags=0x20008018 sid=-1 script_idx=-1 netid=466
+obj id=808 pid=0x02000158 tile=21920 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=467
+obj id=1474 pid=0x020003B1 tile=22089 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=468
+obj id=438 pid=0x02000158 tile=22090 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=469
+obj id=430 pid=0x02000158 tile=22095 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=470
+obj id=1428 pid=0x0200005C tile=22098 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=471
+obj id=424 pid=0x02000158 tile=22099 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=472
+obj id=954 pid=0x02000158 tile=22100 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=473
+obj id=530 pid=0x0200005C tile=22101 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=475
+obj id=1314 pid=0x0500000C tile=22101 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=474
+obj id=82 pid=0x02000043 tile=22102 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=476
+obj id=874 pid=0x02000031 tile=22115 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=477
+obj id=762 pid=0x05000012 tile=22115 elev=0 rot=0 flags=0x20008018 sid=-1 script_idx=-1 netid=478
+obj id=810 pid=0x02000158 tile=22121 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=479
+obj id=436 pid=0x02000158 tile=22290 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=480
+obj id=434 pid=0x02000158 tile=22292 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=481
+obj id=432 pid=0x02000158 tile=22294 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=482
+obj id=1424 pid=0x0200005B tile=22295 elev=0 rot=0 flags=0x20008000 sid=-1 script_idx=-1 netid=483
+obj id=422 pid=0x02000158 tile=22299 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=484
+obj id=80 pid=0x02000043 tile=22301 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=485
+obj id=764 pid=0x05000014 tile=22315 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=486
+obj id=828 pid=0x02000158 tile=22321 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=487
+obj id=830 pid=0x02000158 tile=22322 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=488
+obj id=1478 pid=0x020003B1 tile=22486 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=489
+obj id=1602 pid=0x0200005D tile=22491 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=490
+obj id=1472 pid=0x020003B2 tile=22493 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=491
+obj id=420 pid=0x02000158 tile=22499 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=492
+obj id=1426 pid=0x0200005C tile=22500 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=493
+obj id=418 pid=0x02000158 tile=22501 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=494
+obj id=416 pid=0x02000158 tile=22502 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=495
+obj id=766 pid=0x05000014 tile=22515 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=496
+obj id=832 pid=0x02000158 tile=22522 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=497
+obj id=414 pid=0x02000158 tile=22703 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=498
+obj id=412 pid=0x02000158 tile=22704 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=499
+obj id=410 pid=0x02000158 tile=22706 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=500
+obj id=870 pid=0x02000031 tile=22715 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=501
+obj id=768 pid=0x05000014 tile=22715 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=502
+obj id=834 pid=0x02000158 tile=22723 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=503
+obj id=1476 pid=0x020003B1 tile=22891 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=504
+obj id=1430 pid=0x020003B1 tile=22905 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=505
+obj id=408 pid=0x02000158 tile=22907 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=506
+obj id=406 pid=0x02000158 tile=22908 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=507
+obj id=770 pid=0x05000014 tile=22915 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=508
+obj id=784 pid=0x05000011 tile=22922 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=509
+obj id=836 pid=0x02000158 tile=22923 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=510
+obj id=838 pid=0x02000158 tile=22924 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=511
+obj id=1444 pid=0x020003B3 tile=23098 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=512
+obj id=1434 pid=0x020003B2 tile=23100 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=513
+obj id=404 pid=0x02000158 tile=23108 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=514
+obj id=772 pid=0x05000014 tile=23115 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=515
+obj id=840 pid=0x02000158 tile=23124 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=516
+obj id=1422 pid=0x0200005B tile=23304 elev=0 rot=0 flags=0x20008000 sid=-1 script_idx=-1 netid=517
+obj id=1448 pid=0x020003B3 tile=23307 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=518
+obj id=402 pid=0x02000158 tile=23309 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=519
+obj id=1528 pid=0x020003B2 tile=23310 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=520
+obj id=872 pid=0x02000031 tile=23315 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=521
+obj id=774 pid=0x05000014 tile=23315 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=522
+obj id=782 pid=0x05000011 tile=23319 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=523
+obj id=842 pid=0x02000158 tile=23325 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=524
+obj id=1600 pid=0x0200004B tile=23494 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=525
+obj id=1620 pid=0x020003B3 tile=23495 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=526
+obj id=1622 pid=0x020003B3 tile=23497 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=527
+obj id=1432 pid=0x020003B1 tile=23503 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=528
+obj id=400 pid=0x02000158 tile=23511 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=529
+obj id=398 pid=0x02000158 tile=23512 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=530
+obj id=776 pid=0x05000014 tile=23515 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=531
+obj id=878 pid=0x02000031 tile=23518 elev=0 rot=0 flags=0xA0000018 sid=-1 script_idx=-1 netid=532
+obj id=824 pid=0x02000158 tile=23524 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=533
+obj id=826 pid=0x02000158 tile=23525 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=534
+obj id=1618 pid=0x020003B3 tile=23694 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=535
+obj id=1566 pid=0x020003B3 tile=23701 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=536
+obj id=1560 pid=0x020003B3 tile=23709 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=537
+obj id=396 pid=0x02000158 tile=23713 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=538
+obj id=1530 pid=0x020003B2 tile=23714 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=539
+obj id=778 pid=0x05000014 tile=23715 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=540
+obj id=820 pid=0x02000158 tile=23722 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=541
+obj id=822 pid=0x02000158 tile=23723 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=542
+obj id=1598 pid=0x0200004B tile=23895 elev=0 rot=0 flags=0xA0008000 sid=-1 script_idx=-1 netid=543
+obj id=394 pid=0x02000158 tile=23915 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=544
+obj id=780 pid=0x05000014 tile=23915 elev=0 rot=0 flags=0xA0008018 sid=-1 script_idx=-1 netid=545
+obj id=816 pid=0x02000158 tile=23920 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=546
+obj id=818 pid=0x02000158 tile=23921 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=547
+obj id=1614 pid=0x020003B3 tile=24100 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=548
+obj id=1564 pid=0x020003B3 tile=24105 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=549
+obj id=1562 pid=0x020003B3 tile=24107 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=550
+obj id=1568 pid=0x020003B3 tile=24112 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=551
+obj id=1570 pid=0x020003B3 tile=24114 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=552
+obj id=392 pid=0x02000158 tile=24115 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=553
+obj id=390 pid=0x02000158 tile=24116 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=554
+obj id=812 pid=0x02000158 tile=24118 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=555
+obj id=814 pid=0x02000158 tile=24119 elev=0 rot=0 flags=0xA0000008 sid=-1 script_idx=-1 netid=556
+obj id=1616 pid=0x020003B3 tile=24297 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=557
+obj id=1596 pid=0x0200004E tile=24298 elev=0 rot=0 flags=0x20008000 sid=-1 script_idx=-1 netid=558
+obj id=856 pid=0x02000067 tile=24307 elev=0 rot=0 flags=0xA0008010 sid=-1 script_idx=-1 netid=559
+obj id=1636 pid=0x020003B3 tile=24317 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=560
+obj id=1634 pid=0x020003B3 tile=24515 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=561
+obj id=864 pid=0x02000066 tile=24702 elev=0 rot=0 flags=0xA0008010 sid=-1 script_idx=-1 netid=562
+obj id=1610 pid=0x020003B2 tile=24704 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=563
+obj id=1612 pid=0x020003B3 tile=24706 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=564
+obj id=1632 pid=0x020003B3 tile=24712 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=565
+obj id=1630 pid=0x020003B3 tile=24910 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=566
+obj id=1608 pid=0x020003B2 tile=25104 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=567
+obj id=1624 pid=0x020003B3 tile=25300 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=568
+obj id=1628 pid=0x020003B3 tile=25302 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=569
+obj id=1626 pid=0x020003B3 tile=25498 elev=0 rot=0 flags=0x80008000 sid=-1 script_idx=-1 netid=570
+queue_empty 0
+queue_next_time 304530

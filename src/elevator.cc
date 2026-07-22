@@ -332,6 +332,57 @@ static FrmImage _elevatorFrmImages[ELEVATOR_FRM_COUNT];
 static FrmImage _elevatorBackgroundFrmImage;
 static FrmImage _elevatorPanelFrmImage;
 
+// Ledger H-57 (extracted from the elevator UI): normalize the player's
+// current map/elevation into the elevator's gauge level index, including the
+// Sierra Army Depot / Military Base remap math.
+int elevatorResolveStartLevel(int elevator, int map, int elevation)
+{
+    const ElevatorDescription* elevatorDescription = gElevatorDescriptions[elevator];
+
+    int index;
+    for (index = 0; index < ELEVATOR_LEVEL_MAX; index++) {
+        if (elevatorDescription[index].map == map) {
+            break;
+        }
+    }
+
+    if (index < ELEVATOR_LEVEL_MAX) {
+        if (elevatorDescription[elevation + index].tile != -1) {
+            elevation += index;
+        }
+    }
+
+    if (elevator == ELEVATOR_SIERRA_2) {
+        if (elevation <= 2) {
+            elevation -= 2;
+        } else {
+            elevation -= 3;
+        }
+    } else if (elevator == ELEVATOR_MILITARY_BASE_LOWER) {
+        if (elevation >= 2) {
+            elevation -= 2;
+        }
+    } else if (elevator == ELEVATOR_MILITARY_BASE_UPPER && elevation == 4) {
+        elevation -= 2;
+    }
+
+    if (elevation > 3) {
+        elevation -= 3;
+    }
+
+    return elevation;
+}
+
+// Ledger H-57: resolve a chosen elevator level into its {map, elevation,
+// tile} destination from the elevator table.
+void elevatorResolveDestination(int elevator, int level, int* mapPtr, int* elevationPtr, int* tilePtr)
+{
+    const ElevatorDescription* description = &(gElevatorDescriptions[elevator][level]);
+    *mapPtr = description->map;
+    *elevationPtr = description->elevation;
+    *tilePtr = description->tile;
+}
+
 // Presents elevator dialog for player to pick a desired level.
 //
 // 0x43EF5C
@@ -346,38 +397,7 @@ int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tileP
         return -1;
     }
 
-    const ElevatorDescription* elevatorDescription = gElevatorDescriptions[elevator];
-
-    int index;
-    for (index = 0; index < ELEVATOR_LEVEL_MAX; index++) {
-        if (elevatorDescription[index].map == *mapPtr) {
-            break;
-        }
-    }
-
-    if (index < ELEVATOR_LEVEL_MAX) {
-        if (elevatorDescription[*elevationPtr + index].tile != -1) {
-            *elevationPtr += index;
-        }
-    }
-
-    if (elevator == ELEVATOR_SIERRA_2) {
-        if (*elevationPtr <= 2) {
-            *elevationPtr -= 2;
-        } else {
-            *elevationPtr -= 3;
-        }
-    } else if (elevator == ELEVATOR_MILITARY_BASE_LOWER) {
-        if (*elevationPtr >= 2) {
-            *elevationPtr -= 2;
-        }
-    } else if (elevator == ELEVATOR_MILITARY_BASE_UPPER && *elevationPtr == 4) {
-        *elevationPtr -= 2;
-    }
-
-    if (*elevationPtr > 3) {
-        *elevationPtr -= 3;
-    }
+    *elevationPtr = elevatorResolveStartLevel(elevator, *mapPtr, *elevationPtr);
 
     debugPrint("\n the start elev level %d\n", *elevationPtr);
 
@@ -467,10 +487,7 @@ int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tileP
     elevatorWindowFree();
 
     if (keyCode != KEY_ESCAPE) {
-        const ElevatorDescription* description = &(elevatorDescription[keyCode]);
-        *mapPtr = description->map;
-        *elevationPtr = description->elevation;
-        *tilePtr = description->tile;
+        elevatorResolveDestination(elevator, keyCode, mapPtr, elevationPtr, tilePtr);
     }
 
     return 0;

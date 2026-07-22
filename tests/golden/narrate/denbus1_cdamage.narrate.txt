@@ -1,0 +1,66 @@
+[t=6100] delta id=20 Guard: flags=0x20002000
+[t=10100] delta id=36 Addict: rot=5
+[t=12200] delta id=55 Door: flags=0xA0000010
+[t=12200] delta id=20 Door: flags=0xA0000010
+[t=20100] delta id=62 Addict: rot=5
+[t=22000] spawn id=178 pid=0x00000103 Jet tile=-1 netid=3001
+[t=22000] destroy id=178 pid=0x00000103 Jet tile=0 netid=3001
+[t=27000] spawn id=180 pid=0x00000103 Jet tile=-1 netid=3002
+[t=27000] destroy id=180 pid=0x00000103 Jet tile=0 netid=3002
+[t=30000] spawn id=184 pid=0x01000036 Loser tile=-1 netid=3004
+[t=30000] destroy id=182 pid=0xFFFFFFFF <None> tile=14500 netid=3003
+[t=30100] delta id=162 Addict: fid=0x013F002B flags=0x20002018 hp=0 results=0x80
+[t=30100] delta id=64 Addict: rot=1
+[t=30100] delta id=22 Addict: rot=1
+[t=30100] delta id=51 Door: flags=0xA0000010
+[t=33100] delta id=86 Anna: rot=1
+[t=35100] delta id=36 Addict: rot=2
+[t=35100] delta id=226 Addict: rot=2
+[t=40100] delta id=62 Addict: rot=3
+[t=40100] delta id=45 Addict: rot=5
+[t=48100] delta id=86 Anna: rot=5
+[t=50100] delta id=150 Addict: rot=4
+[t=50100] delta id=26 Addict: rot=2
+[t=53600] delta id=270 Townsperson: rot=5
+[t=54100] delta id=86 Anna: rot=3
+[t=55100] delta id=22 Addict: rot=0
+[t=60000] destroy id=188 pid=0xFFFFFFFF <None> tile=14886 netid=3005
+[t=60100] delta id=62 Addict: hp=10
+[t=60100] delta id=45 Addict: rot=2
+[t=60100] delta id=60 Addict: rot=3
+[t=60100] delta id=150 Addict: rot=0
+[t=60100] delta id=67 Addict: rot=2
+[t=65100] delta id=86 Anna: rot=5
+[t=70100] delta id=512 Addict: rot=0
+[t=70100] delta id=186 Addict: rot=0
+[t=70100] delta id=22 Addict: rot=4
+[t=70100] delta id=62 Addict: rot=2
+[t=72100] delta id=86 Anna: rot=1
+[t=80100] delta id=62 Addict: rot=1
+[t=80100] delta id=26 Addict: rot=0
+[t=80100] delta id=150 Addict: rot=4
+[t=85100] delta id=36 Addict: rot=3
+[t=85100] delta id=214 Door: flags=0xA0000010
+[t=87100] delta id=86 Anna: rot=3
+[t=90100] delta id=41 Addict: rot=2
+[t=90100] delta id=150 Addict: rot=0
+[t=90100] delta id=49 Addict: rot=2
+[t=90100] delta id=390 Addict: rot=0
+[t=100100] delta id=22 Addict: rot=3
+[t=100100] delta id=64 Addict: rot=5
+[t=105100] delta id=45 Addict: rot=4
+[t=105100] delta id=26 Addict: rot=3
+[t=107100] delta id=86 Anna: rot=0
+[t=110100] delta id=62 Addict: rot=5
+[t=120100] delta id=92 Fred: rot=0
+[t=120100] delta id=28 Door: flags=0xA0000010
+[t=120100] delta id=26 Addict: rot=2
+[t=120100] delta id=60 Addict: rot=0
+[t=120100] delta id=226 Addict: rot=0
+[t=130100] delta id=186 Addict: rot=3
+[t=130100] delta id=226 Addict: rot=2
+[t=130100] delta id=62 Addict: rot=5
+[t=130300] delta id=250 Townsperson: flags=0x20002011
+[t=140100] delta id=226 Addict: rot=1
+[t=145100] delta id=22 Addict: rot=4
+[t=145100] delta id=36 Addict: rot=1

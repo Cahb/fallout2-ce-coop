@@ -4,6 +4,7 @@
 #include "object.h"
 #include <setjmp.h>
 
+#include <functional>
 #include <vector>
 
 namespace fallout {
@@ -221,6 +222,35 @@ Program* runScript(char* name);
 void _updatePrograms();
 void programListFree();
 void interpreterRegisterOpcode(int opcode, OpcodeHandler* handler);
+
+// ---- Opcode hook seam (public API; the interpreter provides MECHANISM ONLY) ----
+//
+// Register a callback to run immediately before or after an opcode's handler.
+// Game, server and mod policy lives in the modules that TAP this — never in the
+// interpreter itself. Consumers today: opcode_trace.cc (F2_TRACE_OPCODE) and the
+// server's own rules, installed from the server's boot path.
+//
+// WHY PRE IS THE USEFUL ONE: a pre-hook runs with the operand stack untouched, so
+// it can read the opcode's arguments (the handler has not popped them yet) via
+// programStackPeekValue. A post-hook sees them already consumed. So "observe the
+// arguments and act on them" is a pre-hook; "react to the result" is a post-hook.
+//
+// Hooks must not push or pop the operand stack — peek only. The opcode numbers
+// and argument shapes they key on are the frozen script bytecode ABI that every
+// shipped .int file is compiled against, so they do not drift.
+//
+// `opcode` < 0 registers for EVERY opcode (what a tracer wants). With nothing
+// registered the dispatch loop takes its original path, so every golden stays
+// byte-identical by construction.
+using OpcodeHookFn = std::function<void(int opcode, Program* program)>;
+void interpreterAddOpcodePreHook(int opcode, OpcodeHookFn hook);
+void interpreterAddOpcodePostHook(int opcode, OpcodeHookFn hook);
+void interpreterClearOpcodeHooks();
+
+// Read an operand WITHOUT consuming it. depth 0 == top of stack == the LAST
+// argument of the source-level call. Returns false when the stack is shallower
+// than `depth` (out is untouched).
+bool programStackPeekValue(Program* program, int depth, ProgramValue* out);
 
 void programStackPushValue(Program* program, ProgramValue& programValue);
 void programStackPushInteger(Program* program, int value);

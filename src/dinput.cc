@@ -1,5 +1,9 @@
 #include "dinput.h"
 
+#include "client_net.h"
+#include "input_replay.h"
+#include "svga.h"
+
 namespace fallout {
 
 static int gMouseWheelDeltaX = 0;
@@ -45,6 +49,11 @@ bool mouseDeviceUnacquire()
 // 0x4E053C
 bool mouseDeviceGetData(MouseData* mouseState)
 {
+    // Phase 0: replayed traces bypass the physical device entirely.
+    if (inputReplayOverrideMouse(mouseState)) {
+        return true;
+    }
+
     // CE: This function is sometimes called outside loops calling `get_input`
     // and subsequently `GNW95_process_message`, so mouse events might not be
     // handled by SDL yet.
@@ -61,6 +70,22 @@ bool mouseDeviceGetData(MouseData* mouseState)
 
     gMouseWheelDeltaX = 0;
     gMouseWheelDeltaY = 0;
+
+    // Viewer: relative-mode raw deltas arrive globally on Linux, so N viewer
+    // processes on one desktop all track the same physical mouse. Only the
+    // focused window may consume input; the read above still drained SDL's
+    // accumulator, so no delta burst lands on refocus.
+    if (clientViewerActive() && gSdlWindow != nullptr
+        && (SDL_GetWindowFlags(gSdlWindow) & SDL_WINDOW_INPUT_FOCUS) == 0) {
+        mouseState->x = 0;
+        mouseState->y = 0;
+        mouseState->buttons[0] = false;
+        mouseState->buttons[1] = false;
+        mouseState->wheelX = 0;
+        mouseState->wheelY = 0;
+    }
+
+    inputReplayRecordMouse(mouseState);
 
     return true;
 }

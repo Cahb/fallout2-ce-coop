@@ -19,9 +19,17 @@ void tickersAdd(TickerProc* fn);
 void tickersRemove(TickerProc* fn);
 void tickersEnable();
 void tickersDisable();
+// Ticker-list lifecycle (definitions in f2_core timing.cc); the client drives
+// these from inputInit()/inputExit(), the server relies on static zero-init.
+void tickersReset();
+void tickersFree();
+// Register the real wall-clock source (client binds this to SDL_GetTicks). When
+// unset, getTicks() uses a core-only monotonic fallback. See timing.cc.
+void clockProviderSet(unsigned int (*provider)());
 void takeScreenshot();
 int screenshotHandlerDefaultImpl(int width, int height, unsigned char* data, unsigned char* palette);
 void screenshotHandlerConfigure(int keyCode, ScreenshotHandler* handler);
+bool getTicksIsSynthetic();
 unsigned int getTicks();
 void inputPauseForTocks(unsigned int ms);
 void inputBlockForTocks(unsigned int ms);

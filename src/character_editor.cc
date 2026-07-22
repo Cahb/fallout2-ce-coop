@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "art.h"
+#include "character_transaction.h"
 #include "color.h"
 #include "combat.h"
 #include "critter.h"
@@ -597,10 +598,11 @@ static char gPerkDialogCardTitle[48];
 // 0x570158
 static int gCharacterEditorTagSkillBtns[SKILL_COUNT];
 
-// pc name
-//
-// 0x5701A0
-static char gCharacterEditorNameBackup[32];
+// Ledger H-49 (character_transaction.cc): the editor's begin/rollback of the
+// dude's committed sim state — critter proto data, hit points, pc name and
+// unspent skill points (formerly gCharacterEditorDudeDataBackup /
+// HitPointsBackup / NameBackup / UnspentSkillPointsBackup).
+static CharacterSnapshot gCharacterEditorSnapshot;
 
 // 0x570418
 static unsigned char* gCharacterEditorFrmCopy[EDITOR_GRAPHIC_COUNT];
@@ -672,33 +674,17 @@ static int gCharacterEditorPrimaryStatPlusBtns[7];
 // 0x57062C
 static unsigned char* gPerkDialogWindowBuffer;
 
-// 0x570630
-static CritterProtoData gCharacterEditorDudeDataBackup;
-
 // 0x5707A8
 static int gPerkDialogCurrentLine;
 
 // 0x5707AC
 static int gPerkDialogPreviousCurrentLine;
 
-// unspent skill points
-//
-// 0x5707B0
-static int gCharacterEditorUnspentSkillPointsBackup;
-
-// 0x5707B4
-static int gCharacterEditorLastLevel;
-
 // 0x5707B8
 static int gCharacterEditorOldFont;
 
 // 0x5707BC
 static int gCharacterEditorKillsCount;
-
-// current hit points
-//
-// 0x5707C4
-static int gCharacterEditorHitPointsBackup;
 
 // 0x5707C8
 static int gCharacterEditorMouseY; // mouse y
@@ -770,9 +756,6 @@ static int gCharacterEditorTempTaggedSkills[NUM_TAGGED_SKILLS];
 
 // 0x570A28
 static char gCharacterEditorHasFreePerkBackup;
-
-// 0x570A29
-static unsigned char gCharacterEditorHasFreePerk;
 
 // 0x570A2A
 static unsigned char gCharacterEditorIsSkillsFirstDraw;
@@ -1196,6 +1179,23 @@ int characterEditorShow(bool isCreationMode)
 
     interfaceRenderHitPoints(false);
 
+    return rc;
+}
+
+// The co-op viewer's character sheet. The DEDICATED SERVER owns every character,
+// and the sheet rides the join blob, so anything this screen writes locally is
+// drift that the next rebaseline silently reverts. Level-up spends and perk picks
+// have no wire verb yet; until they do, rolling the edits back unconditionally
+// makes "Done" and "Cancel" mean the same thing — a player who spends five skill
+// points and presses Done loses them either way, and this way they lose them
+// visibly, on the screen they are looking at, instead of a minute later.
+//
+// Restore AFTER the editor's own rc==1 branch may already have restored: _pop_perks
+// and the snapshot restore are idempotent against a snapshot the editor just took.
+int characterEditorShowViewOnly()
+{
+    int rc = characterEditorShow(0);
+    characterEditorRestorePlayer();
     return rc;
 }
 
@@ -2030,21 +2030,6 @@ bool _isdoschar(int ch)
 // copy filename replacing extension
 //
 // 0x4340D0
-char* _strmfe(char* dest, const char* name, const char* ext)
-{
-    char* save = dest;
-
-    while (*name != '\0' && *name != '.') {
-        *dest++ = *name++;
-    }
-
-    *dest++ = '.';
-
-    strcpy(dest, ext);
-
-    return save;
-}
-
 // 0x43410C
 static void characterEditorDrawFolders()
 {
@@ -4806,13 +4791,10 @@ static void characterEditorRegisterInfoAreas()
 // 0x43A7DC
 static void characterEditorSavePlayer()
 {
-    Proto* proto;
-    protoGetProto(gDude->pid, &proto);
-    critterProtoDataCopy(&gCharacterEditorDudeDataBackup, &(proto->critter.data));
-
-    gCharacterEditorHitPointsBackup = critterGetHitPoints(gDude);
-
-    strncpy(gCharacterEditorNameBackup, critterGetName(gDude), 32);
+    // Ledger H-49: the dude proto-data/hit-points/name capture moved to
+    // character_transaction.cc; the editor-only backups below keep their
+    // exact original positions.
+    characterSnapshotTake(&gCharacterEditorSnapshot);
 
     gCharacterEditorLastLevelBackup = gCharacterEditorLastLevel;
     for (int perk = 0; perk < PERK_COUNT; perk++) {
@@ -4821,7 +4803,7 @@ static void characterEditorSavePlayer()
 
     gCharacterEditorHasFreePerkBackup = gCharacterEditorHasFreePerk;
 
-    gCharacterEditorUnspentSkillPointsBackup = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS);
+    characterSnapshotTakeSkillPoints(&gCharacterEditorSnapshot);
 
     skillsGetTagged(gCharacterEditorTaggedSkillsBackup, NUM_TAGGED_SKILLS);
 
@@ -4837,22 +4819,19 @@ static void characterEditorSavePlayer()
 // 0x43A8BC
 static void characterEditorRestorePlayer()
 {
-    Proto* proto;
     int i;
     int v3;
-    int cur_hp;
 
     _pop_perks();
 
-    protoGetProto(gDude->pid, &proto);
-    critterProtoDataCopy(&(proto->critter.data), &gCharacterEditorDudeDataBackup);
-
-    dudeSetName(gCharacterEditorNameBackup);
+    // Ledger H-49: the dude proto-data restore + name restore moved to
+    // character_transaction.cc.
+    characterSnapshotRestore(&gCharacterEditorSnapshot);
 
     gCharacterEditorLastLevel = gCharacterEditorLastLevelBackup;
     gCharacterEditorHasFreePerk = gCharacterEditorHasFreePerkBackup;
 
-    pcSetStat(PC_STAT_UNSPENT_SKILL_POINTS, gCharacterEditorUnspentSkillPointsBackup);
+    characterSnapshotRestoreSkillPoints(&gCharacterEditorSnapshot);
 
     skillsSetTagged(gCharacterEditorTaggedSkillsBackup, NUM_TAGGED_SKILLS);
 
@@ -4886,10 +4865,9 @@ static void characterEditorRestorePlayer()
 
     gCharacterEditorTempTraitCount = v3;
 
-    critterUpdateDerivedStats(gDude);
-
-    cur_hp = critterGetHitPoints(gDude);
-    critterAdjustHitPoints(gDude, gCharacterEditorHitPointsBackup - cur_hp);
+    // Ledger H-49: the derived-stat recompute + hit-points restore moved to
+    // character_transaction.cc.
+    characterSnapshotRestoreHitPoints(&gCharacterEditorSnapshot);
 }
 
 // 0x43A9CC
@@ -5646,28 +5624,6 @@ static void characterEditorDrawKarmaFolder()
     }
 }
 
-// 0x43C1B0
-int characterEditorSave(File* stream)
-{
-    if (fileWriteInt32(stream, gCharacterEditorLastLevel) == -1)
-        return -1;
-    if (fileWriteUInt8(stream, gCharacterEditorHasFreePerk) == -1)
-        return -1;
-
-    return 0;
-}
-
-// 0x43C1E0
-int characterEditorLoad(File* stream)
-{
-    if (fileReadInt32(stream, &gCharacterEditorLastLevel) == -1)
-        return -1;
-    if (fileReadUInt8(stream, &gCharacterEditorHasFreePerk) == -1)
-        return -1;
-
-    return 0;
-}
-
 // 0x43C20C
 void characterEditorReset()
 {
@@ -5682,44 +5638,8 @@ static int characterEditorUpdateLevel()
 {
     int level = pcGetStat(PC_STAT_LEVEL);
     if (level != gCharacterEditorLastLevel && level <= PC_LEVEL_MAX) {
-        for (int nextLevel = gCharacterEditorLastLevel + 1; nextLevel <= level; nextLevel++) {
-            int sp = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS);
-            sp += 5;
-            sp += critterGetBaseStatWithTraitModifier(gDude, STAT_INTELLIGENCE) * 2;
-            sp += perkGetRank(gDude, PERK_EDUCATED) * 2;
-            sp += traitIsSelected(TRAIT_SKILLED) * 5;
-            if (traitIsSelected(TRAIT_GIFTED)) {
-                sp -= 5;
-                if (sp < 0) {
-                    sp = 0;
-                }
-            }
-            if (sp > 99) {
-                sp = 99;
-            }
-
-            pcSetStat(PC_STAT_UNSPENT_SKILL_POINTS, sp);
-
-            int selectedPerksCount = 0;
-            for (int perk = 0; perk < PERK_COUNT; perk++) {
-                if (perkGetRank(gDude, perk) != 0) {
-                    selectedPerksCount += 1;
-                    if (selectedPerksCount >= 37) {
-                        break;
-                    }
-                }
-            }
-
-            if (selectedPerksCount < 37) {
-                int progression = 3;
-                if (traitIsSelected(TRAIT_SKILLED)) {
-                    progression += 1;
-                }
-
-                if (nextLevel % progression == 0) {
-                    gCharacterEditorHasFreePerk = 1;
-                }
-            }
+        if (pcLevelUpApply(gCharacterEditorLastLevel, level)) {
+            gCharacterEditorHasFreePerk = 1;
         }
     }
 
@@ -5930,8 +5850,12 @@ static int perkDialogShow()
 
     int rc = perkDialogHandleInput(count, perkDialogRefreshPerks);
 
+    // Ledger H-44: the perk commit + instantaneous special-perk effects live
+    // in perkChoiceApply (perk.cc); Tag!/Mutate! report a pending follow-up
+    // choice which the dialog drives below (H-48/H-47).
+    int pendingChoice = PERK_CHOICE_PENDING_NONE;
     if (rc == 1) {
-        if (perkAdd(gDude, gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value) == -1) {
+        if (perkChoiceApply(gDude, gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value, gCharacterEditorPerksBackup, &pendingChoice) == -1) {
             debugPrint("\n*** Unable to add perk! ***\n");
             rc = 2;
         }
@@ -5940,21 +5864,14 @@ static int perkDialogShow()
     rc &= 1;
 
     if (rc != 0) {
-        if (perkGetRank(gDude, PERK_TAG) != 0 && gCharacterEditorPerksBackup[PERK_TAG] == 0) {
+        if (pendingChoice == PERK_CHOICE_PENDING_TAG) {
             if (!perkDialogHandleTagPerk()) {
                 perkRemove(gDude, PERK_TAG);
             }
-        } else if (perkGetRank(gDude, PERK_MUTATE) != 0 && gCharacterEditorPerksBackup[PERK_MUTATE] == 0) {
+        } else if (pendingChoice == PERK_CHOICE_PENDING_MUTATE) {
             if (!perkDialogHandleMutatePerk()) {
                 perkRemove(gDude, PERK_MUTATE);
             }
-        } else if (perkGetRank(gDude, PERK_LIFEGIVER) != gCharacterEditorPerksBackup[PERK_LIFEGIVER]) {
-            int maxHp = critterGetBonusStat(gDude, STAT_MAXIMUM_HIT_POINTS);
-            critterSetBonusStat(gDude, STAT_MAXIMUM_HIT_POINTS, maxHp + 4);
-            critterAdjustHitPoints(gDude, 4);
-        } else if (perkGetRank(gDude, PERK_EDUCATED) != gCharacterEditorPerksBackup[PERK_EDUCATED]) {
-            int sp = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS);
-            pcSetStat(PC_STAT_UNSPENT_SKILL_POINTS, sp + 2);
         }
     }
 
@@ -6375,26 +6292,9 @@ static bool perkDialogHandleMutatePerk()
 
         int rc = perkDialogHandleInput(gCharacterEditorTempTraitCount, perkDialogRefreshTraits);
         if (rc == 1) {
-            if (gPerkDialogCurrentLine == 0) {
-                if (gCharacterEditorTempTraitCount == 1) {
-                    gCharacterEditorTempTraits[0] = -1;
-                    gCharacterEditorTempTraits[1] = -1;
-                } else {
-                    if (gPerkDialogOptionList[0].value == gCharacterEditorTempTraits[0]) {
-                        gCharacterEditorTempTraits[0] = gCharacterEditorTempTraits[1];
-                        gCharacterEditorTempTraits[1] = -1;
-                    } else {
-                        gCharacterEditorTempTraits[1] = -1;
-                    }
-                }
-            } else {
-                if (gPerkDialogOptionList[0].value == gCharacterEditorTempTraits[0]) {
-                    gCharacterEditorTempTraits[1] = -1;
-                } else {
-                    gCharacterEditorTempTraits[0] = gCharacterEditorTempTraits[1];
-                    gCharacterEditorTempTraits[1] = -1;
-                }
-            }
+            // Ledger H-47: the lose-a-trait rule lives in traitsMutateDrop
+            // (trait.cc); the dialog passes its selection state as arguments.
+            traitsMutateDrop(gCharacterEditorTempTraits, gCharacterEditorTempTraitCount, gPerkDialogCurrentLine, gPerkDialogOptionList[0].value);
         } else {
             result = false;
         }
@@ -6427,14 +6327,9 @@ static bool perkDialogHandleMutatePerk()
 
         int rc = perkDialogHandleInput(count, perkDialogRefreshTraits);
         if (rc == 1) {
-            if (gCharacterEditorTempTraitCount != 0) {
-                gCharacterEditorTempTraits[1] = gPerkDialogOptionList[gPerkDialogCurrentLine + gPerkDialogTopLine].value;
-            } else {
-                gCharacterEditorTempTraits[0] = gPerkDialogOptionList[gPerkDialogCurrentLine + gPerkDialogTopLine].value;
-                gCharacterEditorTempTraits[1] = -1;
-            }
-
-            traitsSetSelected(gCharacterEditorTempTraits[0], gCharacterEditorTempTraits[1]);
+            // Ledger H-47: the gain-a-trait commit lives in traitsMutateGain
+            // (trait.cc), which also commits via traitsSetSelected.
+            traitsMutateGain(gCharacterEditorTempTraits, gCharacterEditorTempTraitCount, gPerkDialogOptionList[gPerkDialogCurrentLine + gPerkDialogTopLine].value);
         } else {
             result = false;
         }
@@ -6497,8 +6392,9 @@ static bool perkDialogHandleTagPerk()
         return false;
     }
 
-    gCharacterEditorTempTaggedSkills[3] = gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value;
-    skillsSetTagged(gCharacterEditorTempTaggedSkills, NUM_TAGGED_SKILLS);
+    // Ledger H-48: the 4th-tag commit lives in skillsTagPerkApply (skill.cc);
+    // the dialog passes its session copy and the picked skill as arguments.
+    skillsTagPerkApply(gCharacterEditorTempTaggedSkills, gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value);
 
     return true;
 }

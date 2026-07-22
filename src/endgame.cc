@@ -27,6 +27,7 @@
 #include "pipboy.h"
 #include "platform_compat.h"
 #include "random.h"
+#include "server_loop.h"
 #include "settings.h"
 #include "stat.h"
 #include "svga.h"
@@ -210,6 +211,17 @@ static int gEndgameEndingOverlay;
 // 0x43F788
 void endgamePlaySlideshow()
 {
+    // Headless server: the slideshow is pure presentation -- it only READS
+    // gvars to pick which ending scenes match, never writes sim state. The
+    // rendering path is headless-unsafe (endgameEndingSlideshowWindowInit
+    // creates a window; a matched static scene spins a while(true) loop on a
+    // UINT_MAX delay waiting for a speech-end callback that never fires). Skip
+    // it wholesale; there is nothing sim-visible to preserve. See gameMoviePlay
+    // for the sibling guard.
+    if (serverLoopActive()) {
+        return;
+    }
+
     if (endgameEndingSlideshowWindowInit() == -1) {
         return;
     }
@@ -233,6 +245,19 @@ void endgamePlaySlideshow()
 // 0x43F810
 void endgamePlayMovie()
 {
+    // Headless server: the "movie" is a background-sound + rolling-credits
+    // sequence, all headless-unsafe blocking machinery (inputPauseForTocks
+    // wall-clock spins, creditsOpen's minutes-long render loop, palette fades)
+    // and, like the slideshow, it mutates no sim state. The ONE sim-visible
+    // effect is the terminal transition: endgameEndingHandleContinuePlaying
+    // asks "keep playing?" and sets _game_user_wants_to_quit = 2 on "No". The
+    // headless server has no player to answer, so replicate the "No" (quit)
+    // branch -- the endgame is terminal -- and skip the playback.
+    if (serverLoopActive()) {
+        _game_user_wants_to_quit = 2;
+        return;
+    }
+
     backgroundSoundDelete();
     isoDisable();
     paletteFadeTo(gPaletteBlack);

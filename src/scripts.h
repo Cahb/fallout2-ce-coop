@@ -209,6 +209,11 @@ int scriptSaveAll(File* stream);
 int scriptLoadAll(File* stream);
 int scriptGetScript(int sid, Script** script);
 int scriptAdd(int* sidPtr, int scriptType);
+
+// F2_TRACE_LVAR=1: report a script allocating its local-var block. Only fires
+// when the script was freshly added rather than restored with a saved offset,
+// so on a load it names exactly what is being re-instantiated. No-op unenv'd.
+void scriptTraceLvarAlloc(const char* how, Script* script);
 int scriptRemove(int index);
 int _scr_remove_all();
 int _scr_remove_all_force();

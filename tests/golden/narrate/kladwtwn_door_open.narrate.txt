@@ -1,0 +1,26 @@
+[t=100] delta id=26 Dunton: flags=0x20002000
+[t=700] delta id=106 Torr: flags=0x20002000
+[t=4000] delta id=20 Dunton: flags=0x20002000
+[t=18700] delta id=38 Bar Customer: flags=0x20002000
+[t=30100] delta id=42 Door: flags=0xA0000010
+[t=31100] delta id=36 Bath Attendant: flags=0x20002000
+[t=35700] delta id=106 Torr: rot=5
+[t=38100] delta id=24 Brahmin: rot=2
+[t=50100] delta id=36 Brahmin: rot=3
+[t=58100] delta id=26 Dunton: rot=3
+[t=65600] delta id=142 Child: flags=0x20002000
+[t=66700] delta id=106 Torr: rot=3
+[t=67100] delta id=40 Brahmin: rot=1
+[t=73000] delta id=20 Dunton: rot=5
+[t=73100] delta id=32 Brahmin: rot=4
+[t=75100] delta id=30 Brahmin: rot=3
+[t=80600] delta id=142 Child: rot=2
+[t=85100] delta id=26 Dunton: rot=0
+[t=91000] delta id=20 Dunton: rot=2
+[t=99100] delta id=26 Dunton: rot=1
+[t=102000] delta id=20 Dunton: rot=0
+[t=103100] delta id=24 Brahmin: rot=3
+[t=104700] delta id=106 Torr: rot=0
+[t=104700] delta id=50 Door: flags=0xA0000010
+[t=114000] delta id=20 Dunton: rot=1
+[t=114100] delta id=26 Dunton: rot=4

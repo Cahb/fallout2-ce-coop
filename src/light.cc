@@ -5,6 +5,7 @@
 #include "map_defs.h"
 #include "object.h"
 #include "perk.h"
+#include "presenter.h"
 #include "tile.h"
 
 namespace fallout {
@@ -55,7 +56,7 @@ void lightSetAmbientIntensity(int intensity, bool shouldUpdateScreen)
 
     if (shouldUpdateScreen) {
         if (oldAmbientIntensity != normalizedIntensity) {
-            tileWindowRefresh();
+            presenter()->worldInvalidate();
         }
     }
 }

@@ -1,0 +1,30 @@
+[t=6100] delta id=20 Guard: flags=0x20002000
+[t=10000] spawn id=178 pid=0x00000029 Money tile=-1 netid=3001
+[t=10000] disconn id=178 pid=0x00000029 Money netid=3001
+[t=10100] delta id=18000 Narg: inv=1
+[t=10100] delta id=36 Addict: rot=5
+[t=12200] delta id=55 Door: flags=0xA0000010
+[t=12200] delta id=20 Door: flags=0xA0000010
+[t=20100] delta id=62 Addict: rot=5
+[t=22000] spawn id=180 pid=0x00000103 Jet tile=-1 netid=3002
+[t=22000] destroy id=180 pid=0x00000103 Jet tile=0 netid=3002
+[t=27000] spawn id=182 pid=0x00000103 Jet tile=-1 netid=3003
+[t=27000] destroy id=182 pid=0x00000103 Jet tile=0 netid=3003
+[t=30100] spawn id=190 pid=0x000001D3 Jesse's Container tile=-1 netid=3007
+[t=30100] spawn id=192 pid=0x00000103 Jet tile=-1 netid=3008
+[t=30100] disconn id=192 pid=0x00000103 Jet netid=3008
+[t=30100] spawn id=194 pid=0x00000029 Money tile=-1 netid=3009
+[t=30100] disconn id=194 pid=0x00000029 Money netid=3009
+[t=30100] destroy id=104 pid=0x00000029 Money tile=-1 netid=1109
+[t=30100] destroy id=190 pid=0x000001D3 Jesse's Container tile=-1 netid=3007
+[t=30100] destroy id=188 pid=0xFFFFFFFF <None> tile=-1 netid=3006
+[t=30100] destroy id=186 pid=0xFFFFFFFF <None> tile=-1 netid=3005
+[t=30100] destroy id=184 pid=0xFFFFFFFF <None> tile=-1 netid=3004
+[t=30100] delta id=18000 Narg: inv=2
+[t=30100] delta id=162 Addict: rot=0
+[t=30100] delta id=26 Tubby: inv=2
+[t=30100] delta id=22 Footlocker: inv=12
+[t=30100] delta id=64 Addict: rot=1
+[t=30100] delta id=22 Addict: rot=1
+[t=30100] delta id=51 Door: flags=0xA0000010
+[t=33100] delta id=86 Anna: rot=1

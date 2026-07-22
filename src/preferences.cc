@@ -18,6 +18,7 @@
 #include "message.h"
 #include "mouse.h"
 #include "palette.h"
+#include "preferences_state.h"
 #include "scripts.h"
 #include "settings.h"
 #include "svga.h"
@@ -822,88 +823,73 @@ int _SavePrefs(bool save)
 // 0x493224
 int preferencesSave(File* stream)
 {
-    float textBaseDelay = (float)gPreferencesTextBaseDelay1;
-    float brightness = (float)gPreferencesBrightness1;
-    float mouseSensitivity = (float)gPreferencesMouseSensitivity1;
+    // The field order is the on-disk format and lives in preferences_state.cc,
+    // which the headless server writes through as well.
+    PreferencesBlock block;
+    block.gameDifficulty = gPreferencesGameDifficulty1;
+    block.combatDifficulty = gPreferencesCombatDifficulty1;
+    block.violenceLevel = gPreferencesViolenceLevel1;
+    block.targetHighlight = gPreferencesTargetHighlight1;
+    block.combatLooks = gPreferencesCombatLooks1;
+    block.combatMessages = gPreferencesCombatMessages1;
+    block.combatTaunts = gPreferencesCombatTaunts1;
+    block.languageFilter = gPreferencesLanguageFilter1;
+    block.running = gPreferencesRunning1;
+    block.subtitles = gPreferencesSubtitles1;
+    block.itemHighlight = gPreferencesItemHighlight1;
+    block.combatSpeed = gPreferencesCombatSpeed1;
+    block.playerSpeedup = gPreferencesPlayerSpeedup1;
+    block.textBaseDelay = (float)gPreferencesTextBaseDelay1;
+    block.masterVolume = gPreferencesMasterVolume1;
+    block.musicVolume = gPreferencesMusicVolume1;
+    block.soundEffectsVolume = gPreferencesSoundEffectsVolume1;
+    block.speechVolume = gPreferencesSpeechVolume1;
+    block.brightness = (float)gPreferencesBrightness1;
+    block.mouseSensitivity = (float)gPreferencesMouseSensitivity1;
 
-    if (fileWriteInt32(stream, gPreferencesGameDifficulty1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesCombatDifficulty1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesViolenceLevel1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesTargetHighlight1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesCombatLooks1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesCombatMessages1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesCombatTaunts1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesLanguageFilter1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesRunning1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesSubtitles1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesItemHighlight1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesCombatSpeed1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesPlayerSpeedup1) == -1) goto err;
-    if (fileWriteFloat(stream, textBaseDelay) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesMasterVolume1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesMusicVolume1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesSoundEffectsVolume1) == -1) goto err;
-    if (fileWriteInt32(stream, gPreferencesSpeechVolume1) == -1) goto err;
-    if (fileWriteFloat(stream, brightness) == -1) goto err;
-    if (fileWriteFloat(stream, mouseSensitivity) == -1) goto err;
-
-    return 0;
-
-err:
-
-    debugPrint("\nOPTION MENU: Error save option data!\n");
-
-    return -1;
+    return preferencesBlockWrite(stream, block);
 }
 
 // 0x49340C
 int preferencesLoad(File* stream)
 {
-    float textBaseDelay;
-    float brightness;
-    float mouseSensitivity;
-
     preferencesSetDefaults(false);
 
-    if (fileReadInt32(stream, &gPreferencesGameDifficulty1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesCombatDifficulty1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesViolenceLevel1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesTargetHighlight1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesCombatLooks1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesCombatMessages1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesCombatTaunts1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesLanguageFilter1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesRunning1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesSubtitles1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesItemHighlight1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesCombatSpeed1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesPlayerSpeedup1) == -1) goto err;
-    if (fileReadFloat(stream, &textBaseDelay) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesMasterVolume1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesMusicVolume1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesSoundEffectsVolume1) == -1) goto err;
-    if (fileReadInt32(stream, &gPreferencesSpeechVolume1) == -1) goto err;
-    if (fileReadFloat(stream, &brightness) == -1) goto err;
-    if (fileReadFloat(stream, &mouseSensitivity) == -1) goto err;
+    PreferencesBlock block;
+    if (preferencesBlockRead(stream, block) == -1) {
+        preferencesSetDefaults(false);
+        _JustUpdate_();
+        _SavePrefs(0);
 
-    gPreferencesBrightness1 = brightness;
-    gPreferencesMouseSensitivity1 = mouseSensitivity;
-    gPreferencesTextBaseDelay1 = textBaseDelay;
+        return -1;
+    }
+
+    gPreferencesGameDifficulty1 = block.gameDifficulty;
+    gPreferencesCombatDifficulty1 = block.combatDifficulty;
+    gPreferencesViolenceLevel1 = block.violenceLevel;
+    gPreferencesTargetHighlight1 = block.targetHighlight;
+    gPreferencesCombatLooks1 = block.combatLooks;
+    gPreferencesCombatMessages1 = block.combatMessages;
+    gPreferencesCombatTaunts1 = block.combatTaunts;
+    gPreferencesLanguageFilter1 = block.languageFilter;
+    gPreferencesRunning1 = block.running;
+    gPreferencesSubtitles1 = block.subtitles;
+    gPreferencesItemHighlight1 = block.itemHighlight;
+    gPreferencesCombatSpeed1 = block.combatSpeed;
+    gPreferencesPlayerSpeedup1 = block.playerSpeedup;
+    gPreferencesMasterVolume1 = block.masterVolume;
+    gPreferencesMusicVolume1 = block.musicVolume;
+    gPreferencesSoundEffectsVolume1 = block.soundEffectsVolume;
+    gPreferencesSpeechVolume1 = block.speechVolume;
+
+    gPreferencesBrightness1 = block.brightness;
+    gPreferencesMouseSensitivity1 = block.mouseSensitivity;
+    gPreferencesTextBaseDelay1 = block.textBaseDelay;
 
     _JustUpdate_();
     _SavePrefs(0);
 
     return 0;
-
-err:
-
-    debugPrint("\nOPTION MENU: Error loading option data!, using defaults.\n");
-
-    preferencesSetDefaults(false);
-    _JustUpdate_();
-    _SavePrefs(0);
-
-    return -1;
 }
 
 // 0x4928E4

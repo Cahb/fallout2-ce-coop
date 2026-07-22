@@ -127,6 +127,45 @@ int _item_wd_clear(Object* obj, void* a2);
 int withdrawalEventProcess(Object* obj, void* data);
 int withdrawalEventRead(File* stream, void** dataPtr);
 int withdrawalEventWrite(File* stream, void* data);
+typedef enum LootTransferResult {
+    LOOT_TRANSFER_OK,
+    LOOT_TRANSFER_CAUGHT_STEALING,
+    LOOT_TRANSFER_NO_ROOM,
+} LootTransferResult;
+
+LootTransferResult lootTransferItem(Object* dude, Object* target, Object* item, int quantity, bool isPlanting, bool isSteal);
+void equipmentDetach(Object* critter, Object** leftHandPtr, Object** rightHandPtr, Object** armorPtr);
+void equipmentApply(Object* critter, Object* leftHand, Object* rightHand, Object* armor);
+bool inventoryApCostApply(Object* critter);
+bool itemDropStack(Object* owner, Object* item, int quantity);
+bool itemUseDrug(Object* user, Object* owner, Object* item, bool inventoryResident);
+int itemUseFromInventory(Object* user, Object* owner, Object* item, bool inventoryResident);
+void weaponUnloadIntoInventory(Object* owner, Object* item, bool inventoryResident);
+int containerStoreItem(Object* critter, Object* container, Object* item, int quantityToMove, bool inventoryResident);
+int weaponLoadAmmo(Object* critter, Object* weapon, Object* ammo, int quantityToMove, bool ammoInventoryResident, bool* firstPackConsumedPtr);
+typedef enum LootOpenResult {
+    LOOT_OPEN_OK,
+    LOOT_OPEN_NO_STEAL, // "can't find anything to take" feedback
+    LOOT_OPEN_BLOCKED, // silent refusal (closed container, script override)
+} LootOpenResult;
+
+LootOpenResult lootOpenCheck(Object* looter, Object* target, bool isSteal);
+Object* lootTargetDetach(Object* target, bool isSteal, Object** item1Ptr, Object** item2Ptr, Object** armorPtr);
+void lootTargetReattach(Object* target, Object* hiddenBox, Object* item1, Object* item2, Object* armor);
+void lootCaughtStealingReact(Object* looter, Object* target);
+bool lootTakeAll(Object* looter, Object* target);
+bool lootStealExperience(Object* looter, Object* target, int stealingXp, int* xpGainedPtr);
+
+typedef enum BarterResult {
+    BARTER_RESULT_OK,
+    BARTER_RESULT_TOO_HEAVY, // dude can't carry the goods
+    BARTER_RESULT_NPC_TOO_HEAVY, // party member can't carry the offer
+    BARTER_RESULT_BAD_OFFER, // offer not good enough
+} BarterResult;
+
+int barterReactionModifier(Object* critter);
+int barterComputeValue(Object* dude, Object* npc, Object* barterTable, int barterMod, bool speakerIsPartyMember);
+BarterResult barterAttemptTransaction(Object* dude, Object* offerTable, Object* npc, Object* barterTable, int barterMod, bool speakerIsPartyMember);
 int itemGetTotalCaps(Object* obj);
 int itemCapsAdjust(Object* obj, int amount);
 int itemGetMoney(Object* obj);

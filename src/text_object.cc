@@ -196,8 +196,20 @@ int textObjectAdd(Object* object, char* string, int font, int color, int outline
 
     textObject->width = 0;
 
+    // wordWrap's terminal breakpoint for the last line is strlen+1 (one past the NUL),
+    // inconsistent with its single-line strlen convention. Dereferencing that below
+    // (`ending[-1]`, `*ending`) over-reads/over-writes one byte past the end — harmless
+    // when callers pass a char[] with slack, but the wire float path hands in a tightly
+    // sized std::string::c_str() (length+1, no slack) and ASAN trips. Clamp `ending` to
+    // the real string end; render-neutral since the NUL at strlen already terminates
+    // every width/draw measurement.
+    const char* stringEnd = string + strlen(string);
+
     for (int index = 0; index < textObject->linesCount; index++) {
         char* ending = string + beginnings[index + 1];
+        if (ending > stringEnd) {
+            ending = (char*)stringEnd;
+        }
         char* beginning = string + beginnings[index];
         if (ending[-1] == ' ') {
             --ending;
@@ -238,6 +250,9 @@ int textObjectAdd(Object* object, char* string, int font, int color, int outline
     for (int index = 0; index < textObject->linesCount; index++) {
         char* beginning = string + beginnings[index];
         char* ending = string + beginnings[index + 1];
+        if (ending > stringEnd) {
+            ending = (char*)stringEnd; // see clamp note above (last-line strlen+1 breakpoint)
+        }
         if (ending[-1] == ' ') {
             --ending;
         }

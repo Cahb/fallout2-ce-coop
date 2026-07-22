@@ -149,6 +149,40 @@ int randomBetween(int min, int max)
     return result;
 }
 
+// Deterministic fingerprint of the generator's full internal state. The
+// golden state dump records it as a tripwire: any extraction that consumes
+// one extra (or one fewer) roll shifts the fingerprint even when the visible
+// world state happens to match.
+unsigned int randomStateFingerprint()
+{
+    unsigned int hash = (unsigned int)_idum * 31u + (unsigned int)_iy;
+    for (int index = 0; index < 32; index++) {
+        hash = hash * 31u + (unsigned int)_iv[index];
+    }
+    return hash;
+}
+
+// Capture/rewind the full generator state (see random.h RandomState). The state
+// is just _idum, _iy, and _iv[32]; copying it twice is all "freeze the RNG" means
+// for the presentation record section — run the cosmetic rolls, then rewind.
+void randomSnapshot(RandomState* out)
+{
+    out->idum = _idum;
+    out->iy = _iy;
+    for (int index = 0; index < 32; index++) {
+        out->iv[index] = _iv[index];
+    }
+}
+
+void randomRestore(const RandomState* in)
+{
+    _idum = in->idum;
+    _iy = in->iy;
+    for (int index = 0; index < 32; index++) {
+        _iv[index] = in->iv[index];
+    }
+}
+
 // 0x4A30FC
 static int getRandom(int max)
 {

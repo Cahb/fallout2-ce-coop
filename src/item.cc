@@ -1,5 +1,6 @@
 #include "item.h"
 
+#include <assert.h>
 #include <string.h>
 
 #include <algorithm>
@@ -9,10 +10,12 @@
 #include "art.h"
 #include "automap.h"
 #include "combat.h"
+#include "combat_ap.h"
 #include "critter.h"
 #include "debug.h"
 #include "display_monitor.h"
 #include "game.h"
+#include "game_sound.h"
 #include "interface.h"
 #include "inventory.h"
 #include "light.h"
@@ -23,10 +26,14 @@
 #include "party_member.h"
 #include "perk.h"
 #include "platform_compat.h"
+#include "presenter.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "queue.h"
 #include "random.h"
+#include "reaction.h"
+#include "scripts.h"
+#include "server_players.h" // playerActorIs — per-actor traits/perks
 #include "sfall_config.h"
 #include "skill.h"
 #include "stat.h"
@@ -498,7 +505,7 @@ static int _item_move_func(Object* source, Object* target, Object* item, int qua
             if (owner->tile != -1) {
                 Rect updatedRect;
                 _obj_connect(item, owner->tile, owner->elevation, &updatedRect);
-                tileWindowRefreshRect(&updatedRect, gElevation);
+                presenter()->worldInvalidateRect(&updatedRect, gElevation);
             }
         }
         return -1;
@@ -637,7 +644,7 @@ int itemDropAll(Object* critter, int tile)
         int fid = buildFid(OBJ_TYPE_CRITTER, frmId, FID_ANIM_TYPE(critter->fid), 0, (critter->fid & 0x70000000) >> 28);
         objectSetFid(critter, fid, &updatedRect);
         if (FID_ANIM_TYPE(critter->fid) == ANIM_STAND) {
-            tileWindowRefreshRect(&updatedRect, gElevation);
+            presenter()->worldInvalidateRect(&updatedRect, gElevation);
         }
     }
 
@@ -1152,7 +1159,12 @@ int weaponGetAttackTypeForHitMode(Object* weapon, int hitMode)
     }
 
     Proto* proto;
-    protoGetProto(weapon->pid, &proto);
+    // MP hardening: honor protoGetProto (a wire-loaded weapon's pid may not resolve),
+    // and bound the attack-table index — extendedFlags gives a nibble (0-15) but the
+    // table is 9 wide, and a non-weapon / corrupt proto can drive it out of range.
+    if (protoGetProto(weapon->pid, &proto) == -1 || proto == nullptr) {
+        return ATTACK_TYPE_UNARMED;
+    }
 
     int index;
     if (hitMode == HIT_MODE_LEFT_WEAPON_PRIMARY || hitMode == HIT_MODE_RIGHT_WEAPON_PRIMARY) {
@@ -1161,6 +1173,9 @@ int weaponGetAttackTypeForHitMode(Object* weapon, int hitMode)
         index = (proto->item.extendedFlags & 0xF0) >> 4;
     }
 
+    if (index < 0 || index >= (int)(sizeof(_attack_subtype) / sizeof(_attack_subtype[0]))) {
+        return ATTACK_TYPE_UNARMED;
+    }
     return _attack_subtype[index];
 }
 
@@ -1172,7 +1187,10 @@ int weaponGetSkillForHitMode(Object* weapon, int hitMode)
     }
 
     Proto* proto;
-    protoGetProto(weapon->pid, &proto);
+    // MP hardening: see weaponGetAttackTypeForHitMode.
+    if (protoGetProto(weapon->pid, &proto) == -1 || proto == nullptr) {
+        return SKILL_UNARMED;
+    }
 
     int index;
     if (hitMode == HIT_MODE_LEFT_WEAPON_PRIMARY || hitMode == HIT_MODE_RIGHT_WEAPON_PRIMARY) {
@@ -1181,6 +1199,9 @@ int weaponGetSkillForHitMode(Object* weapon, int hitMode)
         index = (proto->item.extendedFlags & 0xF0) >> 4;
     }
 
+    if (index < 0 || index >= (int)(sizeof(_attack_skill) / sizeof(_attack_skill[0]))) {
+        return SKILL_UNARMED;
+    }
     int skill = _attack_skill[index];
 
     if (skill == SKILL_SMALL_GUNS) {
@@ -1265,9 +1286,9 @@ int weaponGetDamage(Object* critter, int hitMode)
 
             // SFALL: Bonus HtH Damage fix.
             if (damageModGetBonusHthDamageFix()) {
-                if (critter == gDude) {
+                if (playerActorIs(critter)) {
                     // See explanation below.
-                    minDamage += 2 * perkGetRank(gDude, PERK_BONUS_HTH_DAMAGE);
+                    minDamage += 2 * perkGetRank(critter, PERK_BONUS_HTH_DAMAGE);
                 }
             }
         }
@@ -1278,11 +1299,11 @@ int weaponGetDamage(Object* critter, int hitMode)
 
         // SFALL: Bonus HtH Damage fix.
         if (damageModGetBonusHthDamageFix()) {
-            if (critter == gDude) {
+            if (playerActorIs(critter)) {
                 // Increase only min damage. Max damage should not be changed.
                 // It is calculated later by adding `meleeDamage` which already
                 // includes damage bonus (via `perkAddEffect`).
-                minDamage += 2 * perkGetRank(gDude, PERK_BONUS_HTH_DAMAGE);
+                minDamage += 2 * perkGetRank(critter, PERK_BONUS_HTH_DAMAGE);
             }
         }
     }
@@ -1342,7 +1363,10 @@ int weaponGetAnimationForHitMode(Object* weapon, int hitMode)
     }
 
     Proto* proto;
-    protoGetProto(weapon->pid, &proto);
+    // MP hardening: see weaponGetAttackTypeForHitMode.
+    if (protoGetProto(weapon->pid, &proto) == -1 || proto == nullptr) {
+        return ANIM_THROW_PUNCH;
+    }
 
     int index;
     if (hitMode == HIT_MODE_LEFT_WEAPON_PRIMARY || hitMode == HIT_MODE_RIGHT_WEAPON_PRIMARY) {
@@ -1351,6 +1375,9 @@ int weaponGetAnimationForHitMode(Object* weapon, int hitMode)
         index = (proto->item.extendedFlags & 0xF0) >> 4;
     }
 
+    if (index < 0 || index >= (int)(sizeof(_attack_anim) / sizeof(_attack_anim[0]))) {
+        return ANIM_THROW_PUNCH;
+    }
     return _attack_anim[index];
 }
 
@@ -1511,7 +1538,7 @@ bool weaponCanBeReloadedWith(Object* weapon, Object* ammo)
         // There is not enough light to recharge this item.
         MessageListItem messageListItem;
         char* msg = getmsg(&gItemsMessageList, &messageListItem, 500);
-        displayMonitorAddMessage(msg);
+        presenter()->consoleMessage(msg);
 
         return false;
     }
@@ -1675,8 +1702,8 @@ int weaponGetActionPointCost(Object* critter, int hitMode, bool aiming)
                 actionPoints = weaponGetSecondaryActionPointCost(weapon);
             }
 
-            if (critter == gDude) {
-                if (traitIsSelected(TRAIT_FAST_SHOT)) {
+            if (playerActorIs(critter)) {
+                if (traitIsSelected(TRAIT_FAST_SHOT, critter)) {
                     if (weaponGetRange(critter, hitMode) > 2) {
                         actionPoints--;
                     }
@@ -1687,16 +1714,20 @@ int weaponGetActionPointCost(Object* critter, int hitMode, bool aiming)
         }
     }
 
-    if (critter == gDude) {
+    // Every player actor pays its OWN action-point discount. Behind the old
+    // `== gDude` gate an extra was charged full price for an attack its perks
+    // had discounted, which is the most visible kind of wrong: the action
+    // economy is what a turn is made of.
+    if (playerActorIs(critter)) {
         int attackType = weaponGetAttackTypeForHitMode(weapon, hitMode);
 
-        if (perkHasRank(gDude, PERK_BONUS_HTH_ATTACKS)) {
+        if (perkHasRank(critter, PERK_BONUS_HTH_ATTACKS)) {
             if (attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) {
                 actionPoints -= 1;
             }
         }
 
-        if (perkHasRank(gDude, PERK_BONUS_RATE_OF_FIRE)) {
+        if (perkHasRank(critter, PERK_BONUS_RATE_OF_FIRE)) {
             if (attackType == ATTACK_TYPE_RANGED) {
                 actionPoints -= 1;
             }
@@ -1822,7 +1853,7 @@ char weaponGetSoundId(Object* weapon)
 // 0x478E5C
 bool critterCanAim(Object* critter, int hitMode)
 {
-    if (critter == gDude && traitIsSelected(TRAIT_FAST_SHOT)) {
+    if (playerActorIs(critter) && traitIsSelected(TRAIT_FAST_SHOT, critter)) {
         return false;
     }
 
@@ -2271,7 +2302,7 @@ int _item_m_use_charged_item(Object* critter, Object* miscItem)
                 char text[80];
                 const char* itemName = objectGetName(miscItem);
                 snprintf(text, sizeof(text), messageListItem.text, itemName);
-                displayMonitorAddMessage(text);
+                presenter()->consoleMessage(text);
             }
         }
     }
@@ -2317,7 +2348,7 @@ int miscItemTrickleEventProcess(Object* item, void* data)
                 char text[80];
                 const char* itemName = objectGetName(item);
                 snprintf(text, sizeof(text), messageListItem.text, itemName);
-                displayMonitorAddMessage(text);
+                presenter()->consoleMessage(text);
             }
         }
         miscItemTurnOff(item);
@@ -2353,7 +2384,7 @@ int miscItemTurnOn(Object* item)
         // This item can only be used from the interface bar.
         messageListItem.num = 9;
         if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
 
         return -1;
@@ -2366,7 +2397,7 @@ int miscItemTurnOn(Object* item)
             if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
                 char* name = objectGetName(item);
                 snprintf(text, sizeof(text), messageListItem.text, name);
-                displayMonitorAddMessage(text);
+                presenter()->consoleMessage(text);
             }
         }
 
@@ -2392,7 +2423,7 @@ int miscItemTurnOn(Object* item)
         if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
             char* name = objectGetName(item);
             snprintf(text, sizeof(text), messageListItem.text, name);
-            displayMonitorAddMessage(text);
+            presenter()->consoleMessage(text);
         }
 
         if (item->pid == PROTO_ID_GEIGER_COUNTER_II) {
@@ -2401,7 +2432,7 @@ int miscItemTurnOn(Object* item)
             if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
                 int radiation = critterGetRadiation(critter);
                 snprintf(text, sizeof(text), messageListItem.text, radiation);
-                displayMonitorAddMessage(text);
+                presenter()->consoleMessage(text);
             }
         }
     }
@@ -2429,7 +2460,7 @@ int miscItemTurnOff(Object* item)
     }
 
     if (owner == gDude) {
-        interfaceUpdateItems(false, INTERFACE_ITEM_ACTION_DEFAULT, INTERFACE_ITEM_ACTION_DEFAULT);
+        presenter()->hudItems(false, INTERFACE_ITEM_ACTION_DEFAULT, INTERFACE_ITEM_ACTION_DEFAULT);
     }
 
     if (owner == gDude) {
@@ -2440,7 +2471,7 @@ int miscItemTurnOff(Object* item)
             const char* name = objectGetName(item);
             char text[80];
             snprintf(text, sizeof(text), messageListItem.text, name);
-            displayMonitorAddMessage(text);
+            presenter()->consoleMessage(text);
         }
     }
 
@@ -2467,7 +2498,7 @@ static int stealthBoyTurnOn(Object* object)
 
     Rect rect;
     objectGetRect(object, &rect);
-    tileWindowRefreshRect(&rect, object->elevation);
+    presenter()->worldInvalidateRect(&rect, object->elevation);
 
     return 0;
 }
@@ -2493,7 +2524,7 @@ static int stealthBoyTurnOff(Object* critter, Object* item)
 
     Rect rect;
     objectGetRect(critter, &rect);
-    tileWindowRefreshRect(&rect, critter->elevation);
+    presenter()->worldInvalidateRect(&rect, critter->elevation);
 
     return 0;
 }
@@ -2621,8 +2652,8 @@ static int _insert_drug_effect(Object* critter, Object* item, int duration, int*
     }
 
     int delay = 600 * duration;
-    if (critter == gDude) {
-        if (traitIsSelected(TRAIT_CHEM_RESISTANT)) {
+    if (playerActorIs(critter)) {
+        if (traitIsSelected(TRAIT_CHEM_RESISTANT, critter)) {
             delay /= 2;
         }
     }
@@ -2692,7 +2723,7 @@ static void _perform_drug_effect(Object* critter, int* stats, int* mods, bool is
 
         if (critter == gDude) {
             if (stat == STAT_CURRENT_HIT_POINTS) {
-                interfaceRenderHitPoints(true);
+                presenter()->hudHitPoints(true);
             }
 
             int after = critterGetStat(critter, stat);
@@ -2703,7 +2734,7 @@ static void _perform_drug_effect(Object* critter, int* stats, int* mods, bool is
                 if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
                     char* statName = statGetName(stat);
                     snprintf(msgBuf, sizeof(msgBuf), messageListItem.text, after < before ? before - after : after - before, statName);
-                    displayMonitorAddMessage(msgBuf);
+                    presenter()->consoleMessage(msgBuf);
                     statsChanged = true;
                 }
             }
@@ -2715,7 +2746,7 @@ static void _perform_drug_effect(Object* critter, int* stats, int* mods, bool is
             // Nothing happens.
             messageListItem.num = 10;
             if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
-                displayMonitorAddMessage(messageListItem.text);
+                presenter()->consoleMessage(messageListItem.text);
             }
         }
     } else {
@@ -2815,22 +2846,22 @@ int _item_d_take_drug(Object* critter, Object* item)
             MessageListItem messageListItem;
             // That didn't seem to do that much.
             char* msg = getmsg(&gItemsMessageList, &messageListItem, 50);
-            displayMonitorAddMessage(msg);
+            presenter()->consoleMessage(msg);
         }
     }
 
     if (!dudeIsAddicted(item->pid)) {
         int addictionChance = proto->item.data.drug.addictionChance;
-        if (critter == gDude) {
-            if (traitIsSelected(TRAIT_CHEM_RELIANT)) {
+        if (playerActorIs(critter)) {
+            if (traitIsSelected(TRAIT_CHEM_RELIANT, critter)) {
                 addictionChance *= 2;
             }
 
-            if (traitIsSelected(TRAIT_CHEM_RESISTANT)) {
+            if (traitIsSelected(TRAIT_CHEM_RESISTANT, critter)) {
                 addictionChance /= 2;
             }
 
-            if (perkGetRank(gDude, PERK_FLOWER_CHILD)) {
+            if (perkGetRank(critter, PERK_FLOWER_CHILD)) {
                 addictionChance /= 2;
             }
         }
@@ -3049,13 +3080,13 @@ static void performWithdrawalStart(Object* obj, int perk, int pid)
         char* description = perkGetDescription(perk);
         // SFALL: Fix crash when description is missing.
         if (description != nullptr) {
-            displayMonitorAddMessage(description);
+            presenter()->consoleMessage(description);
         }
     }
 
     int duration = 10080;
-    if (obj == gDude) {
-        if (traitIsSelected(TRAIT_CHEM_RELIANT)) {
+    if (playerActorIs(obj)) {
+        if (traitIsSelected(TRAIT_CHEM_RELIANT, obj)) {
             duration /= 2;
         }
 
@@ -3082,7 +3113,7 @@ static void performWithdrawalEnd(Object* obj, int perk)
         MessageListItem messageListItem;
         messageListItem.num = 3;
         if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
     }
 }
@@ -3150,6 +3181,703 @@ static bool dudeIsAddicted(int drugPid)
 
 // item_caps_total
 // 0x47A6A8
+// Ledger H-3 (extracted from the inventory UI's _setup_inventory): detach a
+// critter's equipped hand/armor items into staged slots for editing. The
+// items are removed from the inventory; commit them back with equipmentApply.
+void equipmentDetach(Object* critter, Object** leftHandPtr, Object** rightHandPtr, Object** armorPtr)
+{
+    Inventory* inventory = &(critter->data.inventory);
+    Object* leftHand = nullptr;
+    Object* rightHand = nullptr;
+    Object* armor = nullptr;
+
+    for (int index = 0; index < inventory->length; index++) {
+        Object* item = inventory->items[index].item;
+        if ((item->flags & OBJECT_IN_LEFT_HAND) != 0) {
+            if ((item->flags & OBJECT_IN_RIGHT_HAND) != 0) {
+                rightHand = item;
+            }
+            leftHand = item;
+        } else if ((item->flags & OBJECT_IN_RIGHT_HAND) != 0) {
+            rightHand = item;
+        } else if ((item->flags & OBJECT_WORN) != 0) {
+            armor = item;
+        }
+    }
+
+    if (leftHand != nullptr) {
+        itemRemove(critter, leftHand, 1);
+    }
+
+    if (rightHand != nullptr && rightHand != leftHand) {
+        itemRemove(critter, rightHand, 1);
+    }
+
+    if (armor != nullptr) {
+        itemRemove(critter, armor, 1);
+    }
+
+    *leftHandPtr = leftHand;
+    *rightHandPtr = rightHand;
+    *armorPtr = armor;
+}
+
+// Ledger H-4 (extracted from the inventory UI's _exit_inventory): commit
+// staged hand/armor items back onto the critter — THE equip mechanic.
+void equipmentApply(Object* critter, Object* leftHand, Object* rightHand, Object* armor)
+{
+    if (leftHand != nullptr) {
+        leftHand->flags |= OBJECT_IN_LEFT_HAND;
+        if (leftHand == rightHand) {
+            leftHand->flags |= OBJECT_IN_RIGHT_HAND;
+        }
+
+        itemAdd(critter, leftHand, 1);
+    }
+
+    if (rightHand != nullptr && rightHand != leftHand) {
+        rightHand->flags |= OBJECT_IN_RIGHT_HAND;
+        itemAdd(critter, rightHand, 1);
+    }
+
+    if (armor != nullptr) {
+        armor->flags |= OBJECT_WORN;
+        itemAdd(critter, armor, 1);
+    }
+}
+
+// Batch-6 split (extracted from the inventory UI's _move_inventory): the
+// loot/steal transfer rules. isPlanting: true = dude plants item onto target,
+// false = dude takes from target. isSteal resolves the Steal skill first.
+LootTransferResult lootTransferItem(Object* dude, Object* target, Object* item, int quantity, bool isPlanting, bool isSteal)
+{
+    if (isSteal) {
+        if (skillsPerformStealing(dude, target, item, isPlanting) == 0) {
+            return LOOT_TRANSFER_CAUGHT_STEALING;
+        }
+    }
+
+    if (isPlanting) {
+        if (itemMove(dude, target, item, quantity) == -1) {
+            return LOOT_TRANSFER_NO_ROOM;
+        }
+
+        return LOOT_TRANSFER_OK;
+    }
+
+    if (itemMove(target, dude, item, quantity) != 0) {
+        return LOOT_TRANSFER_NO_ROOM;
+    }
+
+    if ((item->flags & OBJECT_IN_RIGHT_HAND) != 0) {
+        target->fid = buildFid(FID_TYPE(target->fid), target->fid & 0xFFF, FID_ANIM_TYPE(target->fid), 0, target->rotation + 1);
+    }
+
+    // NOTE: vanilla clears equip flags on the looted critter object (not the
+    // item) — preserved verbatim.
+    target->flags &= ~OBJECT_EQUIPPED;
+
+    return LOOT_TRANSFER_OK;
+}
+
+// Ledger H-1 (extracted from the inventory UI's inventoryOpen): AP cost to
+// open inventory in combat — Quick Pockets reduces it. Returns false when the
+// critter lacks the required AP (nothing deducted).
+bool inventoryApCostApply(Object* critter)
+{
+    // Policy switch, combat_ap.h: charging off → the screen is always affordable
+    // and always free. One of the three interaction charge points.
+    if (!kCombatApChargeEnabled) {
+        return true;
+    }
+
+    int actionPointsRequired = 4 - 2 * perkGetRank(critter, PERK_QUICK_POCKETS);
+    if (actionPointsRequired > 0 && actionPointsRequired > critter->data.critter.combat.ap) {
+        return false;
+    }
+
+    if (actionPointsRequired > 0) {
+        if (actionPointsRequired > critter->data.critter.combat.ap) {
+            critter->data.critter.combat.ap = 0;
+        } else {
+            critter->data.critter.combat.ap -= actionPointsRequired;
+        }
+
+        presenter()->hudActionPoints(critter->data.critter.combat.ap, _combat_free_move);
+    }
+
+    return true;
+}
+
+// Batch-6 split (extracted from the inventory UI's context menu): drop
+// `quantity` of an inventory stack onto the owner's tile, applying the money
+// consolidation and live-explosive rules. Returns true when a live explosive
+// hit the ground (the caller schedules its resolution when the session ends).
+//
+// itemRemove replaces a partially-removed stack's head object in place, so
+// the head is re-resolved by inventory index between drops — this mirrors the
+// inventory UI's per-drop button re-fetch (same array slot, same length).
+bool itemDropStack(Object* owner, Object* item, int quantity)
+{
+    Inventory* inventory = &(owner->data.inventory);
+
+    int stackIndex = -1;
+    for (int index = 0; index < inventory->length; index++) {
+        if (inventory->items[index].item == item) {
+            stackIndex = index;
+            break;
+        }
+    }
+
+    // Bound by what this stack actually holds, so a caller asking for more than the
+    // stack can give cannot walk past it into its neighbours. Computed BEFORE the
+    // money branch because that branch has the same hazard in a nastier form: asking
+    // for one more than the stack holds makes its itemRemove empty the slot, and the
+    // stackIndex it then re-reads addresses whatever _item_compact shifted down —
+    // a DIFFERENT stack, which it would set money on and drop.
+    int available = (stackIndex != -1 && stackIndex < inventory->length)
+        ? inventory->items[stackIndex].quantity
+        : 0;
+    if (quantity > available) {
+        quantity = available;
+    }
+
+    if (item->pid == PROTO_ID_MONEY) {
+        if (quantity > 0) {
+            if (quantity == 1) {
+                itemSetMoney(item, 1);
+                _obj_drop(owner, item);
+            } else {
+                // Money is the one item kind whose amount rides ONE object: N caps in
+                // an inventory are a slot QUANTITY, but on the ground they are a single
+                // object carrying the amount in misc.charges (_obj_pickup reads it back
+                // out). So fold N-1 units away, stamp the amount on the last one and
+                // drop that. The clamp above guarantees quantity-1 < available, so this
+                // itemRemove always takes the partial path and the slot survives —
+                // stackIndex still addresses OUR stack when it is re-read.
+                if (itemRemove(owner, item, quantity - 1) == 0) {
+                    Object* remainder = stackIndex != -1 && stackIndex < inventory->length
+                        ? inventory->items[stackIndex].item
+                        : nullptr;
+                    if (remainder != nullptr && remainder->pid == PROTO_ID_MONEY) {
+                        itemSetMoney(remainder, quantity);
+                        _obj_drop(owner, remainder);
+                        // DESTROY THE EMPTIED CARRIER. itemRemove's partial path copies a
+                        // fresh object into the slot and hands the ORIGINAL back; its value
+                        // now lives in the amount stamped on `remainder`, so it owns nothing
+                        // and belongs to no inventory, no world tile and no owner. Left
+                        // alive it is an orphan holding an object id for the life of the
+                        // process — visibly so: drop a stack and the next one you get is
+                        // numbered two higher, not one.
+                        objectDestroy(item, nullptr);
+                    } else {
+                        itemAdd(owner, item, quantity - 1);
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    if (explosiveIsActiveExplosive(item->pid)) {
+        _obj_drop(owner, item);
+        return true;
+    }
+
+    for (int index = 0; index < quantity; index++) {
+        if (stackIndex < 0 || stackIndex >= inventory->length) {
+            break;
+        }
+
+        // RE-READ the slot every pass -- this is not redundant. itemRemove's partial
+        // path _obj_copy's a FRESH object into the slot and hands the removed one
+        // back, so the slot's representative legitimately changes each time; that is
+        // how the engine peels a stack into separate objects.
+        Object* head = inventory->items[stackIndex].item;
+        if (head == nullptr) {
+            break;
+        }
+
+        // ...but the INDEX must still be ours. When the stack finally empties,
+        // _item_compact shifts the array down and this index addresses a DIFFERENT
+        // stack -- which is how dropping a stack used to take the WIELDED item of the
+        // same type with it (owner-reported: 5 spears, equip 1, drop the loose ones,
+        // the wielded one goes too). Bounding the loop above stops the overrun; this
+        // is the belt-and-braces that keeps an equipped item out of a drop no matter
+        // what slid underneath.
+        if ((head->flags & (OBJECT_IN_ANY_HAND | OBJECT_WORN)) != 0) {
+            break;
+        }
+
+        _obj_drop(owner, head);
+    }
+
+    return false;
+}
+
+// Batch-6 split: take a drug from an inventory (or, when inventoryResident is
+// false, from a detached equipment slot — the caller owns that slot's state).
+// Returns true when the drug was consumed.
+bool itemUseDrug(Object* user, Object* owner, Object* item, bool inventoryResident)
+{
+    bool taken = _item_d_take_drug(user, item) != 0;
+    if (taken) {
+        if (inventoryResident) {
+            itemRemove(owner, item, 1);
+        }
+
+        _obj_connect(item, gDude->tile, gDude->elevation, nullptr);
+        _obj_destroy(item);
+    }
+
+    presenter()->hudHitPoints(true);
+
+    return taken;
+}
+
+// Batch-6 split: use a weapon/misc item from an inventory (or a detached
+// equipment slot). Returns the _protinst_use_item result; 1 means the item
+// was consumed and the caller must forget its reference.
+int itemUseFromInventory(Object* user, Object* owner, Object* item, bool inventoryResident)
+{
+    if (inventoryResident) {
+        itemRemove(owner, item, 1);
+    }
+
+    int useResult;
+    if (_obj_action_can_use(item)) {
+        useResult = _protinst_use_item(user, item);
+    } else {
+        useResult = _protinst_use_item_on(user, user, item);
+    }
+
+    if (useResult == 1) {
+        _obj_connect(item, gDude->tile, gDude->elevation, nullptr);
+        _obj_destroy(item);
+    } else {
+        if (inventoryResident) {
+            itemAdd(owner, item, 1);
+        }
+    }
+
+    return useResult;
+}
+
+// Batch-6 split: unload a weapon, returning every ammo pack to the owner's
+// inventory.
+void weaponUnloadIntoInventory(Object* owner, Object* item, bool inventoryResident)
+{
+    if (inventoryResident) {
+        itemRemove(owner, item, 1);
+    }
+
+    for (;;) {
+        Object* ammo = weaponUnload(item);
+        if (ammo == nullptr) {
+            break;
+        }
+
+        Rect rect;
+        _obj_disconnect(ammo, &rect);
+        itemAdd(owner, ammo, 1);
+    }
+
+    if (inventoryResident) {
+        itemAdd(owner, item, 1);
+    }
+}
+
+// Ledger H-6 (extracted from the inventory UI's _drop_into_container): move
+// `quantityToMove` of an item into a container, rolling the removal back when
+// the container can't take it (SFALL overload fix preserved). When the item
+// comes from a detached equipment slot (inventoryResident false) the caller
+// owns that slot's state. Returns the itemAttemptAdd result (0 = stored).
+int containerStoreItem(Object* critter, Object* container, Object* item, int quantityToMove, bool inventoryResident)
+{
+    if (inventoryResident) {
+        if (itemRemove(critter, item, quantityToMove) == -1) {
+            return -1;
+        }
+    }
+
+    int rc = itemAttemptAdd(container, item, quantityToMove);
+    if (rc != 0) {
+        if (inventoryResident) {
+            itemAdd(critter, item, quantityToMove);
+        }
+    }
+
+    return rc;
+}
+
+// Ledger H-6 (extracted from the inventory UI's _drop_ammo_into_weapon): load
+// a weapon from up to `quantityToMove` ammo packs. A fully-consumed pack is
+// destroyed and the next pack is re-resolved at the same display position
+// (length - index - 1), mirroring the UI's per-pack button re-fetch across the
+// compaction; a staged (non-resident) pack stops the loop when consumed, and
+// firstPackConsumedPtr tells the caller to clear its slot. Returns 0 when at
+// least one round was loaded.
+// Finds the inventory that directly contains [item], walking nested
+// containers in the same order as itemRemove.
+static Inventory* inventoryFindDirectParent(Inventory* inventory, Object* item)
+{
+    for (int index = 0; index < inventory->length; index++) {
+        InventoryItem* inventoryItem = &(inventory->items[index]);
+        if (inventoryItem->item == item) {
+            return inventory;
+        }
+
+        if (itemGetType(inventoryItem->item) == ITEM_TYPE_CONTAINER) {
+            Inventory* parent = inventoryFindDirectParent(&(inventoryItem->item->data.inventory), item);
+            if (parent != nullptr) {
+                return parent;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+int weaponLoadAmmo(Object* critter, Object* weapon, Object* ammo, int quantityToMove, bool ammoInventoryResident, bool* firstPackConsumedPtr)
+{
+    if (firstPackConsumedPtr != nullptr) {
+        *firstPackConsumedPtr = false;
+    }
+
+    // The ammo may live inside a nested container (dragging within a bag) —
+    // the positional re-fetch below must use its direct parent inventory.
+    Inventory* inventory = nullptr;
+    int displayIndex = -1;
+    if (ammoInventoryResident) {
+        inventory = inventoryFindDirectParent(&(critter->data.inventory), ammo);
+        if (inventory != nullptr) {
+            for (int index = 0; index < inventory->length; index++) {
+                if (inventory->items[index].item == ammo) {
+                    displayIndex = inventory->length - index - 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    Object* sourceItem = ammo;
+    bool isReloaded = false;
+    int rc = itemRemove(critter, weapon, 1);
+    for (int index = 0; index < quantityToMove; index++) {
+        int rcReload = weaponReload(weapon, sourceItem);
+        if (rcReload == 0) {
+            if (index == 0 && firstPackConsumedPtr != nullptr) {
+                *firstPackConsumedPtr = true;
+            }
+
+            _obj_destroy(sourceItem);
+
+            isReloaded = true;
+
+            sourceItem = displayIndex != -1 && displayIndex < inventory->length
+                ? inventory->items[inventory->length - displayIndex - 1].item
+                : nullptr;
+            if (sourceItem == nullptr) {
+                break;
+            }
+        }
+        if (rcReload != -1) {
+            isReloaded = true;
+        }
+        if (rcReload != 0) {
+            break;
+        }
+    }
+
+    if (rc != -1) {
+        itemAdd(critter, weapon, 1);
+    }
+
+    if (!isReloaded) {
+        return -1;
+    }
+
+    const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_READY, weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY, nullptr);
+    presenter()->sfxPlay(sfx);
+
+    return 0;
+}
+
+// Ledger H-9 (extracted from the inventory UI's looting screen): entry gates
+// for opening a loot/steal session. Runs the target's PICKUP script hook
+// (non-steal only), so this is not a pure predicate. LOOT_OPEN_NO_STEAL means
+// the "can't find anything to take" feedback; LOOT_OPEN_BLOCKED is a silent
+// refusal (closed multi-frame container, script override).
+LootOpenResult lootOpenCheck(Object* looter, Object* target, bool isSteal)
+{
+    if (FID_TYPE(target->fid) == OBJ_TYPE_CRITTER) {
+        if (_critter_flag_check(target->pid, CRITTER_NO_STEAL)) {
+            return LOOT_OPEN_NO_STEAL;
+        }
+    }
+
+    if (FID_TYPE(target->fid) == OBJ_TYPE_ITEM) {
+        if (itemGetType(target) == ITEM_TYPE_CONTAINER) {
+            if (target->frame == 0) {
+                CacheEntry* handle;
+                Art* frm = artLock(target->fid, &handle);
+                if (frm != nullptr) {
+                    int frameCount = artGetFrameCount(frm);
+                    artUnlock(handle);
+                    if (frameCount > 1) {
+                        return LOOT_OPEN_BLOCKED;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!isSteal) {
+        int sid = -1;
+        if (_obj_sid(target, &sid) != -1) {
+            scriptSetObjects(sid, looter, nullptr);
+            scriptExecProc(sid, SCRIPT_PROC_PICKUP);
+
+            Script* script;
+            if (scriptGetScript(sid, &script) != -1) {
+                if (script->scriptOverrides) {
+                    return LOOT_OPEN_BLOCKED;
+                }
+            }
+        }
+    }
+
+    return LOOT_OPEN_OK;
+}
+
+// Ledger H-9: stage a loot target — hidden items are moved into a freshly
+// created hidden box (Jesse's container), and in steal mode the target's
+// equipped items are detached so they can't be seen or taken. Returns the
+// hidden box, or nullptr when it can't be created (session must not open).
+Object* lootTargetDetach(Object* target, bool isSteal, Object** item1Ptr, Object** item2Ptr, Object** armorPtr)
+{
+    Object* hiddenBox = nullptr;
+    if (objectCreateWithFidPid(&hiddenBox, 0, PROTO_ID_JESSE_CONTAINER) == -1) {
+        return nullptr;
+    }
+
+    itemMoveAllHidden(target, hiddenBox);
+
+    Object* item1 = nullptr;
+    Object* item2 = nullptr;
+    Object* armor = nullptr;
+
+    if (isSteal) {
+        item1 = critterGetItem1(target);
+        if (item1 != nullptr) {
+            itemRemove(target, item1, 1);
+        }
+
+        item2 = critterGetItem2(target);
+        if (item2 != nullptr) {
+            itemRemove(target, item2, 1);
+        }
+
+        armor = critterGetArmor(target);
+        if (armor != nullptr) {
+            itemRemove(target, armor, 1);
+        }
+    }
+
+    *item1Ptr = item1;
+    *item2Ptr = item2;
+    *armorPtr = armor;
+
+    return hiddenBox;
+}
+
+// Ledger H-9: undo lootTargetDetach — re-equip the detached items and return
+// the hidden items to the target, destroying the hidden box.
+void lootTargetReattach(Object* target, Object* hiddenBox, Object* item1, Object* item2, Object* armor)
+{
+    if (item1 != nullptr) {
+        item1->flags |= OBJECT_IN_LEFT_HAND;
+        itemAdd(target, item1, 1);
+    }
+
+    if (item2 != nullptr) {
+        item2->flags |= OBJECT_IN_RIGHT_HAND;
+        itemAdd(target, item2, 1);
+    }
+
+    if (armor != nullptr) {
+        armor->flags |= OBJECT_WORN;
+        itemAdd(target, armor, 1);
+    }
+
+    itemMoveAll(hiddenBox, target);
+    objectDestroy(hiddenBox, nullptr);
+}
+
+// Ledger H-9: a caught thief triggers the target's PICKUP script hook.
+void lootCaughtStealingReact(Object* looter, Object* target)
+{
+    int sid = -1;
+    if (_obj_sid(target, &sid) != -1) {
+        scriptSetObjects(sid, looter, nullptr);
+        scriptExecProc(sid, SCRIPT_PROC_PICKUP);
+
+        // TODO: Looks like inlining, script is not used.
+        Script* script;
+        scriptGetScript(sid, &script);
+    }
+}
+
+// Ledger H-7 (extracted from the inventory UI's looting screen): take
+// everything from the target, gated by the looter's carry weight. Returns
+// false (nothing moved) when the loot doesn't fit.
+bool lootTakeAll(Object* looter, Object* target)
+{
+    int maxCarryWeight = critterGetStat(looter, STAT_CARRY_WEIGHT);
+    int currentWeight = objectGetInventoryWeight(looter);
+    int newInventoryWeight = objectGetInventoryWeight(target);
+    if (newInventoryWeight > maxCarryWeight - currentWeight) {
+        return false;
+    }
+
+    itemMoveAll(target, looter);
+    return true;
+}
+
+// Ledger H-8 (extracted from the inventory UI's looting screen): award the
+// accumulated steal XP, capped by the looter's Steal skill. Returns false
+// when no award happens (stealing from a party member); otherwise the XP
+// actually received is stored in xpGainedPtr.
+bool lootStealExperience(Object* looter, Object* target, int stealingXp, int* xpGainedPtr)
+{
+    if (objectIsPartyMember(target)) {
+        return false;
+    }
+
+    stealingXp = std::min(300 - skillGetValue(looter, SKILL_STEAL), stealingXp);
+    debugPrint("\n[[[%d]]]", 300 - skillGetValue(looter, SKILL_STEAL));
+
+    // `looter` was already a parameter and was already ignored — the same
+    // one-line class as the skill-use site (PLAYER_SHEET_DESIGN.md §4).
+    pcAddExperience(stealingXp, xpGainedPtr, looter);
+    return true;
+}
+
+// Ledger H-10 (extracted from the inventory UI's barter screen): barter
+// price modifier from the NPC's current reaction.
+int barterReactionModifier(Object* critter)
+{
+    int npcReactionValue = reactionGetValue(critter);
+    int npcReactionType = reactionTranslateValue(npcReactionValue);
+    switch (npcReactionType) {
+    case NPC_REACTION_BAD:
+        return 25;
+    case NPC_REACTION_NEUTRAL:
+        return 0;
+    case NPC_REACTION_GOOD:
+        return -15;
+    default:
+        assert(false && "Should be unreachable");
+    }
+
+    return 0;
+}
+
+// Ledger H-10/H-11 (extracted from the inventory UI's _barter_compute_value):
+// what the NPC demands for the contents of barterTable. For party members
+// this is the table's weight (companions carry, they don't sell). barterMod
+// is the accumulated modifier (script + reaction).
+//
+// barter_compute_value
+// 0x474B2C
+int barterComputeValue(Object* dude, Object* npc, Object* barterTable, int barterMod, bool speakerIsPartyMember)
+{
+    if (speakerIsPartyMember) {
+        return objectGetInventoryWeight(barterTable);
+    }
+
+    int cost = objectGetCost(barterTable);
+    int caps = itemGetTotalCaps(barterTable);
+    int costWithoutCaps = cost - caps;
+
+    double perkBonus = 0.0;
+    if (dude == gDude) {
+        if (perkHasRank(gDude, PERK_MASTER_TRADER)) {
+            perkBonus = 25.0;
+        }
+    }
+
+    int partyBarter = partyGetBestSkillValue(SKILL_BARTER);
+    int npcBarter = skillGetValue(npc, SKILL_BARTER);
+
+    // VERIFIED against fallout2.exe 1.02d @ 0x474B2C: the literal constants
+    // (160.0, 100.0, 2.0, 0.01) are doubles, but the original spills every
+    // intermediate as a 32-bit float (fstp dword) — (float)cost, (float)caps,
+    // their difference, the skill ratio, the multiplier and the product are
+    // each rounded to float precision between steps. This double-precision
+    // version can differ by ±1 cap when a float-rounded product lands near an
+    // integer boundary. Final conversion is round-toward-zero (helper
+    // 0x4D9B64 sets RC=11 before frndint), so the (int) cast is faithful.
+    double barterModMult = (barterMod + 100.0 - perkBonus) * 0.01;
+    double balancedCost = (160.0 + npcBarter) / (160.0 + partyBarter) * (costWithoutCaps * 2.0);
+    if (barterModMult < 0) {
+        // VERIFIED: the clamp fallback is float 0.01f (0x3C23D70A) in the
+        // original, hence this double spelling of it.
+        barterModMult = 0.0099999998;
+    }
+
+    int rounded = (int)(barterModMult * balancedCost + caps);
+    return rounded;
+}
+
+// Ledger H-11 (extracted from the inventory UI's _barter_attempt_transaction):
+// the barter transaction rule — carry-weight gates, offer valuation (with the
+// geiger-counter turn-off quirk), and the two-way table transfer on success.
+//
+// barter_attempt_transaction
+// 0x474C50
+BarterResult barterAttemptTransaction(Object* dude, Object* offerTable, Object* npc, Object* barterTable, int barterMod, bool speakerIsPartyMember)
+{
+    int weightAvailable = critterGetStat(dude, STAT_CARRY_WEIGHT) - objectGetInventoryWeight(dude);
+    if (objectGetInventoryWeight(barterTable) > weightAvailable) {
+        return BARTER_RESULT_TOO_HEAVY;
+    }
+
+    if (speakerIsPartyMember) {
+        int npcWeightAvailable = critterGetStat(npc, STAT_CARRY_WEIGHT) - objectGetInventoryWeight(npc);
+        if (objectGetInventoryWeight(offerTable) > npcWeightAvailable) {
+            return BARTER_RESULT_NPC_TOO_HEAVY;
+        }
+    } else {
+        bool badOffer = false;
+        if (offerTable->data.inventory.length == 0) {
+            badOffer = true;
+        } else {
+            if (itemIsQueued(offerTable)) {
+                if (offerTable->pid != PROTO_ID_GEIGER_COUNTER_I || miscItemTurnOff(offerTable) == -1) {
+                    badOffer = true;
+                }
+            }
+        }
+
+        if (!badOffer) {
+            int cost = objectGetCost(offerTable);
+            if (barterComputeValue(dude, npc, barterTable, barterMod, speakerIsPartyMember) > cost) {
+                badOffer = true;
+            }
+        }
+
+        if (badOffer) {
+            return BARTER_RESULT_BAD_OFFER;
+        }
+    }
+
+    itemMoveAll(barterTable, dude);
+    itemMoveAll(offerTable, npc);
+    return BARTER_RESULT_OK;
+}
+
 int itemGetTotalCaps(Object* obj)
 {
     int amount = 0;

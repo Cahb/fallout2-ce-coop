@@ -90,6 +90,13 @@ void gmouse_set_mapper_mode(int mode);
 void gameMouseSetMode(int a1);
 int gameMouseGetMode();
 void gameMouseCycleMode();
+
+// Resolve the object currently under the mouse (same primitive vanilla's in-window
+// handlers use). Exposed for the wire viewer's crosshair click, which mirrors the
+// vanilla CROSSHAIR-mode selection (objectType OBJ_TYPE_CRITTER, then -1 fallback)
+// without dispatching the sim-mutating _gmouse_handle_event. `a2` matches the
+// vanilla arg (whether the dude itself is selectable).
+Object* gameMouseGetObjectUnderCursor(int objectType, bool a2, int elevation);
 void _gmouse_3d_refresh();
 void gameMouseResetBouncingCursorFid();
 void gameMouseObjectsShow();
@@ -99,6 +106,17 @@ int gameMouseRenderPrimaryAction(int x, int y, int menuItem, int width, int heig
 int _gmouse_3d_pick_frame_hot(int* a1, int* a2);
 int gameMouseRenderActionMenuItems(int x, int y, const int* menuItems, int menuItemsCount, int width, int height);
 int gameMouseHighlightActionMenuItemAtIndex(int menuItemIndex);
+// The vanilla ARROW-mode action menu, factored out of _gmouse_handle_event so the
+// legacy input path and the network wire viewer share ONE menu-contents source
+// (INTERACTION_UX_DESIGN.md §3.2). Build fills `actionMenuItems` (room for 6) with
+// the valid GAME_MOUSE_ACTION_MENU_ITEM_* for `target` and returns the count (pure
+// reads on the object/proto). Run shows the menu at (x,y), spins the vanilla hold/
+// highlight/release loop, and returns the selected item (CANCEL=0), or -1 if the
+// menu could not be shown; the caller performs the action (legacy: the local switch;
+// viewer: map to a wire verb). `actionMenuItems` is force-cancelled on a quit
+// request mid-hold, so it is non-const.
+int gameMouseBuildActionMenu(Object* target, int* actionMenuItems);
+int gameMouseRunActionMenu(int x, int y, int* actionMenuItems, int actionMenuItemsCount);
 void gameMouseLoadItemHighlight();
 void _gmouse_remove_item_outline(Object* object);
 

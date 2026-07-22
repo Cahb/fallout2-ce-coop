@@ -243,7 +243,6 @@ static const int gAutomapFrmIds[AUTOMAP_FRM_COUNT] = {
 };
 
 // 0x5108C4
-static int gAutomapFlags = 0;
 
 // 0x56CB18
 static AutomapHeader gAutomapHeader;
@@ -274,18 +273,6 @@ void automapExit()
     char path[COMPAT_MAX_PATH];
     snprintf(path, sizeof(path), "%s\\%s\\%s", settings.system.master_patches_path.c_str(), "MAPS", AUTOMAP_DB);
     compat_remove(path);
-}
-
-// 0x41B87C
-int automapLoad(File* stream)
-{
-    return fileReadInt32(stream, &gAutomapFlags);
-}
-
-// 0x41B898
-int automapSave(File* stream)
-{
-    return fileWriteInt32(stream, gAutomapFlags);
 }
 
 // 0x41B8B4

@@ -29,6 +29,10 @@ void (*_scr_blit)(unsigned char* src, int src_pitch, int a3, int src_x, int src_
 void (*_zero_mem)() = nullptr;
 
 SDL_Window* gSdlWindow = nullptr;
+
+// True when the window was created windowed (not fullscreen) — the mouse is grabbed
+// to the window in that case, and re-grabbed on focus gain (input.cc).
+bool gSdlWindowedMode = false;
 SDL_Surface* gSdlSurface = nullptr;
 SDL_Renderer* gSdlRenderer = nullptr;
 SDL_Texture* gSdlTexture = nullptr;
@@ -142,6 +146,14 @@ int _GNW95_init_mode_ex(int width, int height, int bpp)
         configFree(&resolutionConfig);
     }
 
+    // F2_WINDOWED=1/0 overrides f2_res.ini's WINDOWED without editing the user's
+    // config — the N-viewer demo needs several windowed clients side by side
+    // (scripts/viewer_live.sh VIEWERS=N). Unset = config/default behavior.
+    const char* windowedOverride = getenv("F2_WINDOWED");
+    if (windowedOverride != nullptr) {
+        fullscreen = atoi(windowedOverride) == 0;
+    }
+
     if (_GNW95_init_window(width, height, fullscreen, scale) == -1) {
         return -1;
     }
@@ -183,7 +195,14 @@ int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
 
         gSdlWindow = SDL_CreateWindow(gProgramWindowTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, width * scale, height * scale, windowFlags);
         if (gSdlWindow == nullptr) {
-            return -1;
+            // Fall back for video drivers without OpenGL support (notably
+            // SDL's "dummy" driver used for headless runs).
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+            windowFlags &= ~SDL_WINDOW_OPENGL;
+            gSdlWindow = SDL_CreateWindow(gProgramWindowTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, width * scale, height * scale, windowFlags);
+            if (gSdlWindow == nullptr) {
+                return -1;
+            }
         }
 
         if (!createRenderer(width, height)) {
@@ -194,6 +213,14 @@ int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
 
             return -1;
         }
+
+        // Confine the mouse to the window in WINDOWED mode — the game positions the
+        // cursor in absolute coords over a small window, so without a grab the
+        // pointer slips off the edge and clicks land outside (fullscreen already
+        // confines). SDL releases the confine while the window is unfocused, so
+        // alt-tab still works; input.cc re-applies it on focus gain.
+        gSdlWindowedMode = !fullscreen;
+        SDL_SetWindowGrab(gSdlWindow, gSdlWindowedMode ? SDL_TRUE : SDL_FALSE);
     }
 
     return 0;

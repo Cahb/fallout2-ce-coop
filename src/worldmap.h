@@ -239,6 +239,17 @@ extern unsigned char* circleBlendTable;
 
 int wmWorldMap_init();
 void wmWorldMap_exit();
+void wmTransitionSaveMap();
+void wmTransitionSuspendScripts();
+void wmEncounterStagingClear();
+void wmTransitionResumeScripts();
+void worldmapTravelStep(int worldX, int worldY);
+bool worldmapTravelRestHeal(unsigned int now, unsigned int partyHealTime);
+void worldmapTravelMarkVisited();
+bool worldmapTravelClockTick();
+bool worldmapTravelEncounterCheck();
+void wmPartyInitWalking(int x, int y);
+bool wmPartyIsWalking();
 int wmWorldMap_reset();
 int wmWorldMap_save(File* stream);
 int wmWorldMap_load(File* stream);

@@ -1,6 +1,7 @@
 #include "proto.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "art.h"
@@ -17,6 +18,7 @@
 #include "memory.h"
 #include "object.h"
 #include "perk.h"
+#include "server_players.h" // kMaxPlayerActors — per-actor sheet rows
 #include "settings.h"
 #include "skill.h"
 #include "stat.h"
@@ -84,6 +86,16 @@ static const size_t _proto_sizes[11] = {
 
 // 0x51C36C
 static int _protos_been_initialized = 0;
+
+// Character-sheet rows for EXTRA player actors, slots 1..kMaxPlayerActors-1
+// (index = slot - 1). Slot 0 is gDudeProto below and is NOT stored here — see
+// the dispatch comment in protoGetProto for why that aliasing is load-bearing.
+//
+// Seeded from gDudeProto by protoPlayerActorSheetsSeed (co-op v1 is N bodies
+// sharing ONE authored sheet); an actor reaches its row by carrying pid
+// kPlayerActorSheetPidBase+slot. Nothing carries such a pid until an extra is
+// spawned, so with an empty registry these rows are unreachable.
+static CritterProto gPlayerActorProtos[kMaxPlayerActors - 1];
 
 // obj_dude_proto
 // 0x51C370
@@ -359,7 +371,101 @@ char* protoGetName(int pid)
         return critterGetName(gDude);
     }
 
+    // Extra player actors. Their pids are NOT in protos/critters.lst, so without
+    // this they fall into protoGetMessage with a messageId copied off the dude
+    // proto and read the WRONG entry (or none) — a nameless body on every hover
+    // and combat line.
+    //
+    // ⚠ Read the name ROW directly. Forwarding to critterGetName(playerActorAt
+    // (slot)) is the obvious-looking version and it recurses forever whenever the
+    // row lookup misses: an extra has no script, so critterGetName's fallback is
+    // protoGetName(obj->pid) — straight back into here. critterGetNameForSlot is
+    // the storage accessor precisely so this site never re-enters that path.
+    if (playerActorIsSheetPid(pid)) {
+        return critterGetNameForSlot(pid - kPlayerActorSheetPidBase);
+    }
+
     return protoGetMessage(pid, PROTOTYPE_MESSAGE_NAME);
+}
+
+// Seed every extra actor's sheet row from the host's (PLAYER_SHEET_DESIGN.md
+// stage 2). Co-op v1 is N bodies sharing ONE authored character, so a copy of
+// gDudeProto is the correct starting sheet; what stage 2 buys is that a later
+// write to one actor's skills or SPECIAL no longer lands on all of them.
+//
+// The whole struct is copied, not just critter.data: fid, messageId, flags and
+// the AI packet are read off the proto too, and a row holding zeros for those
+// renders an invisible, nameless actor. The pid is then stamped per row, which
+// is also what makes protoGetProto's dispatch assert meaningful.
+//
+// Idempotent, and callable only once the dude proto is real: on the server that
+// is after _proto_dude_init, on the viewer after the join blob's dude load.
+void protoPlayerActorSheetsSeed()
+{
+    for (int slot = 1; slot < kMaxPlayerActors; slot++) {
+        protoPlayerActorSheetSeedSlot(slot);
+    }
+}
+
+// ONE slot, for the dynamic spawn-at-login path (ACCOUNT_IDENTITY_DESIGN.md §3).
+// ⚠ The bulk seeder above must never run once players are live: it rewrites EVERY
+// extra's row from the host, silently resetting the SPECIAL/skills of players who
+// have been diverging all session (trap 1). Slot 0 is gDudeProto itself and is
+// never seeded — a write there is the host-corruption case.
+void protoPlayerActorSheetSeedSlot(int slot)
+{
+    if (slot < 1 || slot >= kMaxPlayerActors) {
+        return;
+    }
+
+    CritterProto* sheet = &(gPlayerActorProtos[slot - 1]);
+    memcpy(sheet, &gDudeProto, sizeof(*sheet));
+    sheet->pid = playerActorSheetPid(slot);
+}
+
+// The SHEET half of a player actor's proto row: skills + base/bonus SPECIAL,
+// i.e. exactly the CritterProtoData blob critterSave already serializes for the
+// dude (critter.cc:219). PLAYER_SHEET_DESIGN.md §5.
+//
+// Only critter.data travels. fid / messageId / flags / the AI packet are also
+// read off the row, but they are identical for every player actor and already
+// arrive via protoPlayerActorSheetsSeed — so the reader SEEDS FIRST and then
+// overwrites the sheet, and a row that never gets a wire update still renders a
+// visible body instead of the nameless fid-0 chimera an all-zero row produces.
+//
+// Slot 0 resolves to gDudeProto verbatim (never a copy) — the aliasing the whole
+// degeneracy argument rests on (§2).
+static CritterProtoData* protoPlayerActorSheetData(int slot)
+{
+    if (slot == 0) {
+        return &(gDudeProto.data);
+    }
+
+    if (slot < 1 || slot >= kMaxPlayerActors) {
+        return nullptr;
+    }
+
+    return &(gPlayerActorProtos[slot - 1].data);
+}
+
+int protoPlayerActorRowWrite(File* stream, int slot)
+{
+    CritterProtoData* data = protoPlayerActorSheetData(slot);
+    if (data == nullptr) {
+        return -1;
+    }
+
+    return protoCritterDataWrite(stream, data);
+}
+
+int protoPlayerActorRowRead(File* stream, int slot)
+{
+    CritterProtoData* data = protoPlayerActorSheetData(slot);
+    if (data == nullptr) {
+        return -1;
+    }
+
+    return protoCritterDataRead(stream, data);
 }
 
 // 0x49EB1C
@@ -878,6 +984,59 @@ int _proto_dude_update_gender()
     proto->fid = buildFid(OBJ_TYPE_CRITTER, _art_vault_guy_num, 0, 0, 0);
 
     return 0;
+}
+
+// Re-derive the co-op EXTRA player actors' native (unarmored) look — the N-actor
+// generalization of the gDude tail of _proto_dude_update_gender above. The
+// vault-suit look is a WORLD fact (the single MOVIE_VSUIT flag: everyone who left
+// the Temple wears the suit), but the base-art FID is gender-specific, so each
+// extra re-derives from its OWN gender against its OWN sheet proto row
+// (playerActorSheetPid). Vanilla's derive re-fids gDude alone, which is why only
+// the host got the suit ([[vault-suit-appearance-gap]]).
+//
+// This is a DERIVE, not a one-time event: idempotent (same flag + gender + armor
+// state -> same fid), so it is driven from serverEmitBaseline — the one choke
+// every map switch / load / restart / join / reconnect funnels through — and a
+// body always re-materializes with the correct look no matter which of those
+// rebuilt it. Server-authoritative by construction (serverEmitBaseline is
+// server-only) and golden-inert: the headless probe registers no extras, so the
+// loop is empty and every golden stays byte-identical.
+//
+// Deliberately leaves the _art_vault_guy_num GLOBAL alone (it stays the host's):
+// the mixed-skin / script-refid / inventory-refid reads of that global are a
+// separate, still-open facet of the same bug, banked not fixed here.
+void protoPlayerActorsUpdateLook()
+{
+    int nativeLook = gameMovieIsSeen(MOVIE_VSUIT) ? DUDE_NATIVE_LOOK_JUMPSUIT : DUDE_NATIVE_LOOK_TRIBAL;
+
+    for (int slot = 1; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor == nullptr) {
+            continue;
+        }
+
+        Proto* proto;
+        if (protoGetProto(actor->pid, &proto) == -1) {
+            continue;
+        }
+
+        int gender = critterGetStat(actor, STAT_GENDER) == GENDER_MALE ? GENDER_MALE : GENDER_FEMALE;
+        int frmId = _art_vault_person_nums[nativeLook][gender];
+
+        if (critterGetArmor(actor) == nullptr) {
+            int weaponCode = 0;
+            if (critterGetItem2(actor) != nullptr || critterGetItem1(actor) != nullptr) {
+                weaponCode = (actor->fid & 0xF000) >> 12;
+            }
+            objectSetFid(actor, buildFid(OBJ_TYPE_CRITTER, frmId, 0, weaponCode, 0), nullptr);
+            // frame-index-render-gotcha: objectSetFid does NOT reset obj->frame; a
+            // tribal->jumpsuit swap can leave frame >= the new art's frame count,
+            // which renders NOTHING (the "invisible after equip/load" symptom).
+            objectSetFrame(actor, 0, nullptr);
+        }
+
+        proto->fid = buildFid(OBJ_TYPE_CRITTER, frmId, 0, 0, 0);
+    }
 }
 
 // proto_dude_init
@@ -2135,7 +2294,62 @@ int protoGetProto(int pid, Proto** protoPtr)
         return 0;
     }
 
-    ProtoList* protoList = &(_protoLists[PID_TYPE(pid)]);
+    // Extra player actors' character sheets (PLAYER_SHEET_DESIGN.md §2): skills
+    // and base/bonus SPECIAL live in the dude proto, so N actors sharing one pid
+    // means N actors sharing one sheet. Slot k > 0 gets pid kPlayerActorSheetPidBase+k
+    // and its own row here.
+    //
+    // ⚠ SLOT 0 IS DELIBERATELY NOT IN THIS ARRAY — it is gDudeProto itself, the
+    // same static struct at the same address, matched by the branch above which
+    // is left VERBATIM. That aliasing is the degeneracy argument (an empty
+    // registry can never reach this branch, so single-player / the client / the
+    // golden probe are byte-identical), and it is also risk #1 in the design: a
+    // dispatch bug that lets an extra fall through to gDudeProto corrupts the
+    // HOST's live character, silently. So the slot is derived from the pid and
+    // nothing else — pid arithmetic is stateless and cannot go stale the way a
+    // cached Proto* can.
+    if (playerActorIsSheetPid(pid)) {
+        CritterProto* sheet = &(gPlayerActorProtos[pid - kPlayerActorSheetPidBase - 1]);
+
+        // Risk #1's mitigation, made real rather than argued: the row must be
+        // the one this pid names. A zero here means the row was never seeded and
+        // the actor is about to read an all-zero sheet (no name, fid 0, every
+        // stat 0); any other mismatch means the dispatch itself is off by a slot,
+        // which is the silent host-corruption case. Neither is survivable state
+        // to continue from.
+        //
+        // NOT assert(): every build this project actually runs is NDEBUG
+        // (check.sh gates RelWithDebInfo, for golden-timeout reasons), so an
+        // assert here would be a comment. Same reason it is not debugPrint —
+        // that too compiles to nothing without a registered proc. The
+        // serverStubAbort idiom is what stays audible.
+        if (sheet->pid != pid) {
+            fprintf(stderr, "FATAL — player-actor sheet row for pid 0x%X holds pid 0x%X "
+                            "(row unseeded, or the slot dispatch is off by one).\n",
+                pid, sheet->pid);
+            abort();
+        }
+
+        *protoPtr = (Proto*)sheet;
+        return 0;
+    }
+
+    // Bounds-check the object type BEFORE indexing the fixed _protoLists[11] array.
+    // PID_TYPE is the top byte of a pid, and pids reach here from wire/blob-loaded
+    // objects (onSpawn, the inventory reconcile, blob object load) — a trust boundary.
+    // A corrupt/out-of-range type byte (or a negative pid, since PID_TYPE is an
+    // arithmetic >>24) would index _protoLists out of bounds and then walk a garbage
+    // extent chain. This is the twin of the scriptGetScript guard and the ROOT under
+    // critterGetStat and the item.cc weapon/ammo/armor getters — they all already
+    // honor a -1 return, so one check here hardens the whole family. *protoPtr is
+    // nullptr from the top of the function. Valid pids always carry an in-range type,
+    // so SP/golden paths never trip this.
+    int protoType = PID_TYPE(pid);
+    if (protoType < 0 || protoType >= OBJ_TYPE_COUNT) {
+        return -1;
+    }
+
+    ProtoList* protoList = &(_protoLists[protoType]);
     ProtoListExtent* protoListExtent = protoList->head;
     while (protoListExtent != nullptr) {
         for (int index = 0; index < protoListExtent->length; index++) {

@@ -62,6 +62,14 @@ int main(int argc, char* argv[])
 
     SDL_ShowCursor(SDL_DISABLE);
 
+    // Keep a real-fullscreen (SDL_WINDOW_FULLSCREEN) window from MINIMIZING when it
+    // loses focus — SDL's default does, which mode-switches the display so alt-tab
+    // brings the window back as a broken borderless frame, and the minimize stalls
+    // in-flight movie playback (no video/sound until refocus, if at all). A network
+    // viewer in particular must keep rendering/playing while unfocused so an operator
+    // can alt-tab to a terminal mid-cutscene. Set before any window is created.
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+
     gProgramIsActive = true;
     rc = falloutMain(argc, argv);
 

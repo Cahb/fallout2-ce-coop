@@ -31,6 +31,8 @@ typedef enum Elevator {
     ELEVATOR_COUNT,
 } Elevator;
 
+int elevatorResolveStartLevel(int elevator, int map, int elevation);
+void elevatorResolveDestination(int elevator, int level, int* mapPtr, int* elevationPtr, int* tilePtr);
 int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr);
 
 void elevatorsInit();

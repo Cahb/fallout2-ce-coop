@@ -1,0 +1,13 @@
+[t=1100] delta id=42 Brahmin: rot=4
+[t=4100] delta id=46 Brahmin: rot=1
+[t=5100] delta id=42 Brahmin: rot=1
+[t=6100] delta id=50 Brahmin: rot=3
+[t=7100] delta id=54 Brahmin: rot=3
+[t=9100] delta id=50 Brahmin: rot=1
+[t=9100] delta id=46 Brahmin: rot=3
+[t=10100] maptrans map=6 elev=0
+[t=14000] delta id=55 Door: flags=0xA0000010
+[t=14000] delta id=55 Townsperson: rot=1
+[t=14000] delta id=20 Door: flags=0xA0000010
+[t=14900] delta id=20 Guard: flags=0x20002000
+[t=24200] delta id=86 Anna: rot=3

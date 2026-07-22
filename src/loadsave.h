@@ -15,13 +15,12 @@ typedef enum LoadSaveMode {
 } LoadSaveMode;
 
 void _InitLoadSave();
-void _ResetLoadSave();
 int lsgSaveGame(int mode);
 int lsgLoadGame(int mode);
 bool _isLoadingGame();
-void lsgInit();
 int MapDirErase(const char* path, const char* extension);
-int _MapDirEraseFile_(const char* a1, const char* a2);
+
+// `_ResetLoadSave` and `lsgInit` now live in savegame.h (core).
 
 } // namespace fallout
 

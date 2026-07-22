@@ -31,10 +31,81 @@ Object* aiInfoGetLastItem(Object* obj);
 int aiInfoSetLastItem(Object* obj, Object* a2);
 void _combat_update_critter_outline_for_los(Object* critter, bool a2);
 void _combat_over_from_load();
-void _combat_give_exps(int exp_points);
+// `earner` is the player actor the XP belongs to; nullptr means gDude (vanilla
+// behavior). Pass one wherever the caller knows who made the kill
+// (PLAYER_SHEET_DESIGN.md §4).
+void _combat_give_exps(int exp_points, Object* earner = nullptr);
+bool combatPlayerTurnShouldBreak();
+bool combatPlayerTurnOutOfAp();
+int combatPlayerTurnResolve();
 void _combat_turn_run();
+
+// Why a single-beat intent drain stopped (P2 resumable combat). kEndTurn = a
+// turn-ending authority tripped (combatPlayerTurnShouldBreak/OutOfAp, an
+// explicit END_TURN, or an unexecutable attack); kQueueDrained = ran out of
+// queued intents with no turn-ending reason (the legacy auto-end-turn case, and
+// the point where the resumable session WAITS across beats instead).
+enum class CombatPumpStop {
+    kEndTurn,
+    kQueueDrained,
+};
+
+struct CombatPumpOutcome {
+    CombatPumpStop stop;
+    int consumed; // intents successfully consumed this call (idle-timer reset)
+};
+
+// Drain the currently-queued dude combat intents for THIS beat, calling the same
+// core entry points the AI uses (combat_intent.h). The extracted body of the
+// server branch of _combat_input — shared so the legacy path stays byte-identical
+// and the resumable session (combat.cc) reuses it verbatim (do NOT duplicate the
+// serverResolveTarget/serverDudeHitMode logic). Legacy _combat_input ignores the
+// outcome (empty queue ends the turn); the session inspects it to decide whether
+// to wait for more intents across beats.
+//
+// `actorSlot` names WHOSE turn is being pumped: only that player's intents are
+// consumed (MP_PROPOSAL Ch 8.4). The caller must already hold a ServerActorScope
+// for that actor — the body reads gDude deep inside the core attack/move entry
+// points, and the scope is what makes those reads mean "the acting player".
+// Slot 0 (the host) is the default and the only value the legacy path uses.
+CombatPumpOutcome combatServerPumpIntents(int actorSlot = 0);
+
+// Resumable server-combat session (P2; F2_SERVER_RESUMABLE_COMBAT, default OFF).
+// When enabled, _combat() sets up a session and returns instead of draining the
+// fight inside one scriptsHandleRequests call; serverTick advances it one beat at
+// a time. combatSessionActive() is false on every gate-off/client/golden path.
+bool combatSessionActive();
+
+// Rearm the resumable-combat player-turn idle timer. For player activity that
+// does NOT arrive as a combat intent and so never reaches the pump that normally
+// rearms it — today: OPENING the in-combat inventory screen, so the player gets
+// a full budget to browse in rather than inheriting whatever was left of it.
+//
+// Called once at open, NOT per action inside the screen: those actions are free,
+// so rearming on each would let a player hold the whole fight open indefinitely.
+// The budget from the open is the hard bound; when it expires the turn ends and
+// the screen is revoked (presenter inventoryRevoke).
+void combatSessionRearmIdleTimer();
+void combatSessionAdvance();
 void _combat(CombatStartData* csd);
+
+// Install the wire-viewer attack-commit hook (COMBAT_CLIENT_DESIGN.md §3.b). The
+// SDL viewer registers a function that forwards a fully-selected attack upstream as
+// a `cattack` verb; _combat_attack_this calls it at the commit point instead of
+// _combat_attack when clientViewerActive(). Null (and thus inert) everywhere else.
+void combatSetViewerAttackHook(void (*hook)(Object* target, int hitMode, int hitLocation));
 void attackInit(Attack* attack, Object* attacker, Object* defender, int hitMode, int hitLocation);
+
+// True iff an in-combat MOVE bracket should record its walk over the presentation record
+// channel (COMBAT_MOVE_RECORD_DESIGN.md). Used by combat_ai/combat_drain to wrap the
+// reg_anim move brackets in an ambient record section. False off the record backend / SP /
+// out of combat → today's EVENT_MOVE glide path.
+bool combatMoveRecorded();
+
+// Close a MOVE record bracket: end the ambient section, ship the actor's presSeq, commit the
+// deferred authoritative walk. No-op when !recording. See combat.cc.
+void combatMoveRecordClose(bool recording, Object* actor);
+
 int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocation);
 int _combat_bullet_start(const Object* attacker, const Object* target);
 void _compute_explosion_on_extras(Attack* attack, bool isFromAttacker, bool isGrenade, bool noDamage);

@@ -1,7 +1,9 @@
 #include "perk.h"
 
 #include <stdio.h>
+#include <string.h>
 
+#include "critter.h"
 #include "debug.h"
 #include "game.h"
 #include "memory.h"
@@ -9,6 +11,7 @@
 #include "object.h"
 #include "party_member.h"
 #include "platform_compat.h"
+#include "server_players.h" // playerActorSlotOf / kMaxPlayerActors
 #include "skill.h"
 #include "stat.h"
 
@@ -48,9 +51,20 @@ typedef struct PerkRankData {
     int ranks[PERK_COUNT];
 } PerkRankData;
 
+// Perk ranks for EXTRA player actors, slots 1..kMaxPlayerActors-1 (index =
+// slot - 1); slot 0 uses gPartyMemberPerkRanks, unchanged.
+//
+// ⚠ DELIBERATELY SEPARATE FROM gPartyMemberPerkRanks, do not "simplify" them
+// together: that table is malloc'd to gPartyMemberDescriptionsLength for REAL
+// COMPANIONS (Sulik, Cassidy, …), and a player actor is not a party-roster row.
+// Storing players there would both overflow a companion-sized table and bake in
+// the party-membership-equals-identity assumption the actor model rejects.
+static PerkRankData gPlayerActorPerkRanks[kMaxPlayerActors - 1];
+
 static PerkRankData* perkGetRankData(Object* critter);
 static bool perkCanAdd(Object* critter, int perk);
 static void perkResetRanks();
+static PerkRankData* perkPlayerActorRow(int slot);
 
 // 0x519DCC
 static PerkDescription gPerkDescriptions[PERK_COUNT] = {
@@ -287,6 +301,18 @@ static PerkRankData* perkGetRankData(Object* critter)
         return gPartyMemberPerkRanks;
     }
 
+    // Extra player actors, BEFORE the party-member pid scan below — which they
+    // would otherwise fall straight through, because an extra is not gDude and
+    // its pid is the DUDE pid, which the scan skips (it starts at index 1). The
+    // fallthrough then returned gPartyMemberPerkRanks, i.e. the HOST's row, so
+    // every extra silently read AND WROTE P1's perks. That looked harmless only
+    // while the rows were identical; the first perk granted to one actor
+    // corrupted the host's sheet. See PLAYER_SHEET_DESIGN.md §1.
+    int playerSlot = playerActorSlotOf(critter);
+    if (playerSlot > 0) {
+        return &(gPlayerActorPerkRanks[playerSlot - 1]);
+    }
+
     for (int index = 1; index < gPartyMemberDescriptionsLength; index++) {
         if (critter->pid == gPartyMemberPids[index]) {
             return gPartyMemberPerkRanks + index;
@@ -428,6 +454,113 @@ static void perkResetRanks()
             ranksData->ranks[perk] = 0;
         }
     }
+
+    // Extra player actors reset with everyone else — a new game must not inherit
+    // the previous one's perks (these are file statics, not malloc'd per run).
+    for (int slot = 0; slot < kMaxPlayerActors - 1; slot++) {
+        for (int perk = 0; perk < PERK_COUNT; perk++) {
+            gPlayerActorPerkRanks[slot].ranks[perk] = 0;
+        }
+    }
+}
+
+// Seed every extra player actor's perk row from the host's
+// (PLAYER_SHEET_DESIGN.md stage 2), the perk half of protoPlayerActorSheetsSeed.
+//
+// Without this, stage 1 is a REGRESSION for a host who already has perks: before
+// the slot check, extras read gPartyMemberPerkRanks (the host's row) by accident;
+// after it they read their own, which starts empty. That silently drops Toughness,
+// Bonus HtH Damage, Awareness and friends off every extra's combat math. Co-op v1
+// is one authored character, so the host's perks are what an extra should have.
+void perkPlayerActorSeedRanks()
+{
+    for (int slot = 1; slot < kMaxPlayerActors; slot++) {
+        perkPlayerActorSeedRanksSlot(slot);
+    }
+}
+
+// ONE slot, for the dynamic spawn-at-login path (ACCOUNT_IDENTITY_DESIGN.md §3).
+// ⚠ Never call the bulk seeder above with players live — it would reset every
+// extra's earned perks to the host's row (trap 1).
+void perkPlayerActorSeedRanksSlot(int slot)
+{
+    if (gPartyMemberPerkRanks == nullptr || slot < 1 || slot >= kMaxPlayerActors) {
+        return;
+    }
+
+    memcpy(&(gPlayerActorPerkRanks[slot - 1]), gPartyMemberPerkRanks, sizeof(PerkRankData));
+}
+
+// Zero ONE slot's perk row: a CREATED character starts with no perks, and the
+// spawn path seeds from the host first (for the non-sheet parts of the row), so
+// the host's perks have to be taken back off before the creation spec lands.
+//
+// Slot 0 included, and deliberately: the first player to log in by name takes the
+// HOST slot (server_control.cc), so creation has to be able to clear the premade's
+// perks off gPartyMemberPerkRanks[0] exactly as it clears an extra's own row.
+void perkPlayerActorClearRanksSlot(int slot)
+{
+    PerkRankData* ranksData = perkPlayerActorRow(slot);
+    if (ranksData == nullptr) {
+        return;
+    }
+
+    for (int perk = 0; perk < PERK_COUNT; perk++) {
+        ranksData->ranks[perk] = 0;
+    }
+}
+
+// One actor's perk ranks (PLAYER_SHEET_DESIGN.md §5). Slot 0 is
+// gPartyMemberPerkRanks[0] — the same row perkGetRankData hands gDude, so the
+// host's perks travel through the identical path as an extra's.
+//
+// The COMPANION rows (indices 1..gPartyMemberDescriptionsLength) are NOT here:
+// they are perksSave's business and belong to the party roster, not to any
+// player actor. Keeping the two streams apart is the same separation the storage
+// itself is built on — see gPlayerActorPerkRanks' declaration.
+static PerkRankData* perkPlayerActorRow(int slot)
+{
+    if (slot == 0) {
+        return gPartyMemberPerkRanks; // may be null before perksInit
+    }
+
+    if (slot < 1 || slot >= kMaxPlayerActors) {
+        return nullptr;
+    }
+
+    return &(gPlayerActorPerkRanks[slot - 1]);
+}
+
+int perkPlayerActorRowWrite(File* stream, int slot)
+{
+    PerkRankData* ranksData = perkPlayerActorRow(slot);
+    if (ranksData == nullptr) {
+        return -1;
+    }
+
+    for (int perk = 0; perk < PERK_COUNT; perk++) {
+        if (fileWriteInt32(stream, ranksData->ranks[perk]) == -1) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int perkPlayerActorRowRead(File* stream, int slot)
+{
+    PerkRankData* ranksData = perkPlayerActorRow(slot);
+    if (ranksData == nullptr) {
+        return -1;
+    }
+
+    for (int perk = 0; perk < PERK_COUNT; perk++) {
+        if (fileReadInt32(stream, &(ranksData->ranks[perk])) == -1) {
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 // 0x496A5C
@@ -491,6 +624,41 @@ int perkRemove(Object* critter, int perk)
     ranksData->ranks[perk] -= 1;
 
     perkRemoveEffect(critter, perk);
+
+    return 0;
+}
+
+// Ledger H-44 (extracted from the character editor's perk dialog): commit a
+// chosen perk and apply the instantaneous special-perk effects — Lifegiver
+// grants +4 maximum hit points (and heals 4), Educated grants +2 unspent
+// skill points. Tag! and Mutate! need a follow-up pick (a 4th tag skill /
+// a trait swap); those are reported via `pendingChoicePtr` and committed by
+// the caller through skillsTagPerkApply (H-48) / traitsMutateDrop+Gain
+// (H-47). `perksBackup` is the caller's snapshot of perk ranks taken when
+// its session opened (the editor's gCharacterEditorPerksBackup); the
+// newly-gained checks compare current ranks against it, preserving the
+// original chain (which keys off rank deltas, not the perk just picked).
+// Returns -1 when the perk could not be added (requirements not met).
+int perkChoiceApply(Object* critter, int perk, const int* perksBackup, int* pendingChoicePtr)
+{
+    *pendingChoicePtr = PERK_CHOICE_PENDING_NONE;
+
+    if (perkAdd(critter, perk) == -1) {
+        return -1;
+    }
+
+    if (perkGetRank(critter, PERK_TAG) != 0 && perksBackup[PERK_TAG] == 0) {
+        *pendingChoicePtr = PERK_CHOICE_PENDING_TAG;
+    } else if (perkGetRank(critter, PERK_MUTATE) != 0 && perksBackup[PERK_MUTATE] == 0) {
+        *pendingChoicePtr = PERK_CHOICE_PENDING_MUTATE;
+    } else if (perkGetRank(critter, PERK_LIFEGIVER) != perksBackup[PERK_LIFEGIVER]) {
+        int maxHp = critterGetBonusStat(critter, STAT_MAXIMUM_HIT_POINTS);
+        critterSetBonusStat(critter, STAT_MAXIMUM_HIT_POINTS, maxHp + 4);
+        critterAdjustHitPoints(critter, 4);
+    } else if (perkGetRank(critter, PERK_EDUCATED) != perksBackup[PERK_EDUCATED]) {
+        int sp = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS);
+        pcSetStat(PC_STAT_UNSPENT_SKILL_POINTS, sp + 2);
+    }
 
     return 0;
 }

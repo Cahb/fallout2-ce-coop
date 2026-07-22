@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <unordered_map>
+#include <vector>
+
 #include "db.h"
 #include "debug.h"
 #include "export.h"
@@ -156,6 +159,59 @@ static int _cpuBurstSize = 10;
 
 // 0x59E230
 static OpcodeHandler* gInterpreterOpcodeHandlers[OPCODE_MAX_COUNT];
+
+// Opcode hook seam (interpreter.h). Kept as maps rather than parallel arrays
+// because hooks are rare and sparse; gInterpreterHooksActive is the ONE branch
+// the dispatch loop pays when nothing is registered.
+static bool gInterpreterHooksActive = false;
+static std::unordered_map<int, std::vector<OpcodeHookFn>> gInterpreterPreHooks;
+static std::unordered_map<int, std::vector<OpcodeHookFn>> gInterpreterPostHooks;
+static std::vector<OpcodeHookFn> gInterpreterPreHooksAll;
+static std::vector<OpcodeHookFn> gInterpreterPostHooksAll;
+
+static void interpreterFireHooks(std::unordered_map<int, std::vector<OpcodeHookFn>>& byOpcode,
+    std::vector<OpcodeHookFn>& forAll, int opcodeIndex, int opcode, Program* program)
+{
+    for (auto& hook : forAll) {
+        hook(opcode, program);
+    }
+
+    auto it = byOpcode.find(opcodeIndex);
+    if (it != byOpcode.end()) {
+        for (auto& hook : it->second) {
+            hook(opcode, program);
+        }
+    }
+}
+
+void interpreterAddOpcodePreHook(int opcode, OpcodeHookFn hook)
+{
+    if (opcode < 0) {
+        gInterpreterPreHooksAll.push_back(std::move(hook));
+    } else {
+        gInterpreterPreHooks[opcode & 0x3FF].push_back(std::move(hook));
+    }
+    gInterpreterHooksActive = true;
+}
+
+void interpreterAddOpcodePostHook(int opcode, OpcodeHookFn hook)
+{
+    if (opcode < 0) {
+        gInterpreterPostHooksAll.push_back(std::move(hook));
+    } else {
+        gInterpreterPostHooks[opcode & 0x3FF].push_back(std::move(hook));
+    }
+    gInterpreterHooksActive = true;
+}
+
+void interpreterClearOpcodeHooks()
+{
+    gInterpreterPreHooks.clear();
+    gInterpreterPostHooks.clear();
+    gInterpreterPreHooksAll.clear();
+    gInterpreterPostHooksAll.clear();
+    gInterpreterHooksActive = false;
+}
 
 // 0x59E78C
 static Program* gInterpreterCurrentProgram;
@@ -2688,7 +2744,15 @@ void _interpret(Program* program, int a2)
             programFatalError(err);
         }
 
-        handler(program);
+        // The ONE dispatch site, hence the one place hooks fire (interpreter.h).
+        // Guarded by a single bool so an un-hooked build keeps its original path.
+        if (gInterpreterHooksActive) {
+            interpreterFireHooks(gInterpreterPreHooks, gInterpreterPreHooksAll, opcodeIndex, opcode, program);
+            handler(program);
+            interpreterFireHooks(gInterpreterPostHooks, gInterpreterPostHooksAll, opcodeIndex, opcode, program);
+        } else {
+            handler(program);
+        }
     }
 
     if ((program->flags & PROGRAM_FLAG_EXITED) != 0) {
@@ -3151,6 +3215,21 @@ void programStackPushPointer(Program* program, void* value)
     programValue.opcode = VALUE_TYPE_PTR;
     programValue.pointerValue = value;
     programStackPushValue(program, programValue);
+}
+
+bool programStackPeekValue(Program* program, int depth, ProgramValue* out)
+{
+    // Non-destructive read for pre-hooks: no pop, and deliberately no string
+    // ref-count adjustment (that belongs to whoever actually consumes the value).
+    if (program == nullptr || program->stackValues == nullptr || out == nullptr) {
+        return false;
+    }
+    if (depth < 0 || (size_t)depth >= program->stackValues->size()) {
+        return false;
+    }
+
+    *out = (*program->stackValues)[program->stackValues->size() - 1 - (size_t)depth];
+    return true;
 }
 
 ProgramValue programStackPopValue(Program* program)

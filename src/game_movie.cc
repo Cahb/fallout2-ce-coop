@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "audio_engine.h" // audioEngineResume — a movie needs a running audio device even if unfocused
 #include "color.h"
 #include "cycle.h"
 #include "debug.h"
@@ -15,6 +16,7 @@
 #include "movie_effect.h"
 #include "palette.h"
 #include "platform_compat.h"
+#include "server_loop.h"
 #include "settings.h"
 #include "svga.h"
 #include "text_font.h"
@@ -79,9 +81,6 @@ static bool gGameMovieIsPlaying = false;
 // 0x518E2C
 static bool gGameMovieFaded = false;
 
-// 0x596C78
-static unsigned char gGameMoviesSeen[MOVIE_COUNT];
-
 // 0x596C89
 static char gGameMovieSubtitlesFilePath[COMPAT_MAX_PATH];
 
@@ -98,7 +97,7 @@ int gameMoviesInit()
 
     movieSetBuildSubtitleFilePathProc(gameMovieBuildSubtitlesFilePath);
 
-    memset(gGameMoviesSeen, 0, sizeof(gGameMoviesSeen));
+    gameMoviesResetSeen();
 
     gGameMovieIsPlaying = false;
     gGameMovieFaded = false;
@@ -109,37 +108,45 @@ int gameMoviesInit()
 // 0x44E60C
 void gameMoviesReset()
 {
-    memset(gGameMoviesSeen, 0, sizeof(gGameMoviesSeen));
+    gameMoviesResetSeen();
 
     gGameMovieIsPlaying = false;
     gGameMovieFaded = false;
-}
-
-// 0x44E638
-int gameMoviesLoad(File* stream)
-{
-    if (fileRead(gGameMoviesSeen, sizeof(*gGameMoviesSeen), MOVIE_COUNT, stream) != MOVIE_COUNT) {
-        return -1;
-    }
-
-    return 0;
-}
-
-// 0x44E664
-int gameMoviesSave(File* stream)
-{
-    if (fileWrite(gGameMoviesSeen, sizeof(*gGameMoviesSeen), MOVIE_COUNT, stream) != MOVIE_COUNT) {
-        return -1;
-    }
-
-    return 0;
 }
 
 // gmovie_play
 // 0x44E690
 int gameMoviePlay(int movie, int flags)
 {
+    // The viewer plays movies by a wire-supplied index (onMoviePlay) — a trust
+    // boundary. Reject out-of-range before it reaches gMovieFileNames[movie] (OOB
+    // read) or gameMovieMarkSeen (OOB write). SP passes MOVIE_* constants only.
+    if (movie < 0 || movie >= MOVIE_COUNT) {
+        return -1;
+    }
+
+    // Headless server: no playback pipeline (no frame/audio sync -> the
+    // _movieRun / _MVE_sndSync loop spins forever). Preserve the only
+    // sim-visible side effect -- gameMovieIsSeen is savegame state queried by
+    // scripts (H-30) -- and skip the window/movie/palette machinery. Never
+    // leaves gGameMovieIsPlaying set (script critter cadence gates on it).
+    if (serverLoopActive()) {
+        gameMovieMarkSeen(movie);
+        return 0;
+    }
+
     gGameMovieIsPlaying = true;
+
+    // Guarantee a RUNNING audio device for the movie's whole duration, even on a
+    // viewer that was ALREADY unfocused when the movie started. The MVE player is
+    // slaved to the audio play cursor (audio_engine.cc), and a window that lost
+    // focus BEFORE the movie began already paused its device (input.cc FOCUS_LOST,
+    // gameMovieIsPlaying() was still false then) — so the callback never fires, the
+    // cursor never advances, and the decoder stalls at frame 0 (a black window that
+    // only "unsticks" if you focus it). Resume unconditionally here; audioEngineMixin
+    // keeps the OUTPUT muted while unfocused, so this plays the cutscene through
+    // silently rather than not at all. [[movie-playback-coop]]
+    audioEngineResume();
 
     const char* movieFileName = gMovieFileNames[movie];
     debugPrint("\nPlaying movie: %s\n", movieFileName);
@@ -170,6 +177,16 @@ int gameMoviePlay(int movie, int flags)
         gGameMovieFaded = true;
     }
 
+    // On a viewer running larger than the movie's 640x480, the movie window is
+    // centered and its border is exposed. _zero_vid_mem blacks the raw surface, but
+    // the GNW compositor can repaint stale window content (the tactical view) into
+    // that border mid-playback, which the movie's OWN palette then renders as colour
+    // noise (the "messed up background"). A full-screen black window BEHIND the movie
+    // paints the border black through the compositor itself, so it survives every
+    // repaint. Created before the movie window so it sits below it; destroyed just
+    // before the post-movie windowRefreshAll. color 0 = filled with the black index.
+    int movieBackdropWin = windowCreate(0, 0, screenGetWidth(), screenGetHeight(), 0, 0);
+
     int gameMovieWindowX = (screenGetWidth() - GAME_MOVIE_WINDOW_WIDTH) / 2;
     int gameMovieWindowY = (screenGetHeight() - GAME_MOVIE_WINDOW_HEIGHT) / 2;
     int win = windowCreate(gameMovieWindowX,
@@ -179,6 +196,9 @@ int gameMoviePlay(int movie, int flags)
         0,
         WINDOW_MODAL);
     if (win == -1) {
+        if (movieBackdropWin != -1) {
+            windowDestroy(movieBackdropWin);
+        }
         gGameMovieIsPlaying = false;
         return -1;
     }
@@ -267,7 +287,7 @@ int gameMoviePlay(int movie, int flags)
     _movieUpdate();
     paletteSetEntries(gPaletteBlack);
 
-    gGameMoviesSeen[movie] = 1;
+    gameMovieMarkSeen(movie);
 
     colorCycleEnable();
 
@@ -289,6 +309,9 @@ int gameMoviePlay(int movie, int flags)
     }
 
     windowDestroy(win);
+    if (movieBackdropWin != -1) {
+        windowDestroy(movieBackdropWin);
+    }
 
     // CE: Destroying a window redraws only content it was covering (centered
     // 640x480). This leads to everything outside this rect to remain black.
@@ -318,12 +341,6 @@ void gameMovieFadeOut()
         paletteFadeTo(_cmap);
         gGameMovieFaded = false;
     }
-}
-
-// 0x44EB04
-bool gameMovieIsSeen(int movie)
-{
-    return gGameMoviesSeen[movie] == 1;
 }
 
 // 0x44EB14

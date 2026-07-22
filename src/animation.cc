@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "animation_scheduler.h"
 #include "art.h"
 #include "color.h"
 #include "combat.h"
@@ -20,9 +21,11 @@
 #include "kb.h"
 #include "map.h"
 #include "mouse.h"
+#include "movement.h"
 #include "object.h"
 #include "party_member.h"
 #include "perk.h"
+#include "presenter.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "random.h"
@@ -224,15 +227,6 @@ typedef struct AnimationSequence {
     AnimationDescription animations[ANIMATION_DESCRIPTION_LIST_CAPACITY];
 } AnimationSequence;
 
-typedef struct PathNode {
-    int tile;
-    int from;
-    // actual type is likely char
-    int rotation;
-    int estimate;
-    int cost;
-} PathNode;
-
 // TODO: I don't know what `sad` means, but it's definitely better than
 // `STRUCT_530014`. Find a better name.
 typedef struct AnimationSad {
@@ -265,9 +259,6 @@ static int _check_registry(Object* obj);
 static int animationRunSequence(int a1);
 static int _anim_set_continue(int a1, int a2);
 static int _anim_set_end(int a1);
-static bool canUseDoor(Object* critter, Object* door);
-static int _idist(int a1, int a2, int a3, int a4);
-static int _tile_idistance(int tile1, int tile2);
 static int animateMoveObjectToObject(Object* from, Object* to, int actionPoints, int anim, int animationSequenceIndex);
 static int animateMoveObjectToTile(Object* obj, int tile, int elev, int actionPoints, int anim, int animationSequenceIndex);
 static int _anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, int animationSequenceIndex);
@@ -304,17 +295,8 @@ static bool _anim_in_bk = false;
 // 0x530014
 static AnimationSad gAnimationSads[ANIMATION_SAD_LIST_CAPACITY];
 
-// 0x542FD4
-static PathNode gClosedPathNodeList[2000];
-
 // 0x54CC14
 static AnimationSequence gAnimationSequences[32];
-
-// 0x561814
-static unsigned char gPathfinderProcessedTiles[5000];
-
-// 0x562B9C
-static PathNode gOpenPathNodeList[2000];
 
 // 0x56C7DC
 static int gAnimationDescriptionCurrentIndex;
@@ -1586,9 +1568,25 @@ static int _anim_set_end(int animationSequenceIndex)
         animationDescription = &(animationSequence->animations[i]);
         if (animationDescription->kind == ANIM_KIND_HIDE && ((i < animationSequence->animationIndex) || (animationDescription->extendedFlags & ANIMATION_SEQUENCE_FORCED))) {
             Rect rect;
-            int elevation = animationDescription->owner->elevation;
-            objectDestroy(animationDescription->owner, &rect);
+            Object* deadOwner = animationDescription->owner;
+            int elevation = deadOwner->elevation;
+            objectDestroy(deadOwner, &rect);
             tileWindowRefreshRect(&rect, elevation);
+            // objectDestroy FREES the Object, but the reaper loop below re-reads
+            // owner->fid for every descriptor — and a presentation-replay transient
+            // (create → move → HIDE_FORCED, all with the same owner) leaves several
+            // descriptors pointing at the block just freed. Vanilla got away with the
+            // stale read (freed bytes stay intact for the microseconds between the two
+            // loops → a non-CRITTER fid → skipped); an ASAN viewer poisons the region
+            // and it becomes a hard use-after-free. Scrub every descriptor that shares
+            // this owner so the loop below sees nullptr, not a dangling pointer. Nothing
+            // between the loops allocates an Object, so the pointer-identity match is
+            // sound (_obj_remove only churns ObjectListNodes).
+            for (int j = 0; j < animationSequence->length; j++) {
+                if (animationSequence->animations[j].owner == deadOwner) {
+                    animationSequence->animations[j].owner = nullptr;
+                }
+            }
         }
     }
 
@@ -1602,7 +1600,10 @@ static int _anim_set_end(int animationSequenceIndex)
             // TODO: Check.
             if (animationDescription->kind != ANIM_KIND_PING) {
                 Object* owner = animationDescription->owner;
-                if (FID_TYPE(owner->fid) == OBJ_TYPE_CRITTER) {
+                // nullptr = owner was force-destroyed in the loop above (scrubbed there).
+                // A destroyed HIDE owner is never a live critter that needs _dude_stand,
+                // so skipping it is correct, not just crash-avoidance.
+                if (owner != nullptr && FID_TYPE(owner->fid) == OBJ_TYPE_CRITTER) {
                     int j = 0;
                     for (; j < i; j++) {
                         AnimationDescription* ad = &(animationSequence->animations[j]);
@@ -1661,479 +1662,6 @@ static int _anim_set_end(int animationSequenceIndex)
     }
 
     return 0;
-}
-
-// 0x415E24
-static bool canUseDoor(Object* critter, Object* door)
-{
-    if (critter == gDude) {
-        if (!_obj_portal_is_walk_thru(door)) {
-            return false;
-        }
-    }
-
-    if (FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
-        return false;
-    }
-
-    if (FID_TYPE(door->fid) != OBJ_TYPE_SCENERY) {
-        return false;
-    }
-
-    int bodyType = critterGetBodyType(critter);
-    if (bodyType != BODY_TYPE_BIPED && bodyType != BODY_TYPE_ROBOTIC) {
-        return false;
-    }
-
-    Proto* proto;
-    if (protoGetProto(door->pid, &proto) == -1) {
-        return false;
-    }
-
-    if (proto->scenery.type != SCENERY_TYPE_DOOR) {
-        return false;
-    }
-
-    if (objectIsLocked(door)) {
-        return false;
-    }
-
-    if (critterGetKillType(critter) == KILL_TYPE_GECKO) {
-        return false;
-    }
-
-    return true;
-}
-
-// 0x415EE8
-int _make_path(Object* object, int from, int to, unsigned char* rotations, int a5)
-{
-    return pathfinderFindPath(object, from, to, rotations, a5, _obj_blocking_at);
-}
-
-// TODO: move pathfinding into another unit
-// 0x415EFC
-int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback)
-{
-    if (a5) {
-        if (callback(object, to, object->elevation) != nullptr) {
-            return 0;
-        }
-    }
-
-    bool isCritter = false;
-    int critterType = 0;
-    if (PID_TYPE(object->pid) == OBJ_TYPE_CRITTER) {
-        isCritter = true;
-        critterType = critterGetKillType(object);
-    }
-
-    bool isNotInCombat = !isInCombat();
-
-    memset(gPathfinderProcessedTiles, 0, sizeof(gPathfinderProcessedTiles));
-
-    gPathfinderProcessedTiles[from / 8] |= 1 << (from & 7);
-
-    gOpenPathNodeList[0].tile = from;
-    gOpenPathNodeList[0].from = -1;
-    gOpenPathNodeList[0].rotation = 0;
-    gOpenPathNodeList[0].estimate = _tile_idistance(from, to);
-    gOpenPathNodeList[0].cost = 0;
-
-    for (int index = 1; index < 2000; index += 1) {
-        gOpenPathNodeList[index].tile = -1;
-    }
-
-    int toScreenX;
-    int toScreenY;
-    tileToScreenXY(to, &toScreenX, &toScreenY, object->elevation);
-
-    int closedPathNodeListLength = 0;
-    int openPathNodeListLength = 1;
-    PathNode temp;
-
-    while (1) {
-        int v63 = -1;
-
-        PathNode* prev = nullptr;
-        int v12 = 0;
-        for (int index = 0; v12 < openPathNodeListLength; index += 1) {
-            PathNode* curr = &(gOpenPathNodeList[index]);
-            if (curr->tile != -1) {
-                v12++;
-                if (v63 == -1 || (curr->estimate + curr->cost) < (prev->estimate + prev->cost)) {
-                    prev = curr;
-                    v63 = index;
-                }
-            }
-        }
-
-        PathNode* curr = &(gOpenPathNodeList[v63]);
-
-        memcpy(&temp, curr, sizeof(temp));
-
-        openPathNodeListLength -= 1;
-
-        curr->tile = -1;
-
-        if (temp.tile == to) {
-            if (openPathNodeListLength == 0) {
-                openPathNodeListLength = 1;
-            }
-            break;
-        }
-
-        PathNode* curr1 = &(gClosedPathNodeList[closedPathNodeListLength]);
-        memcpy(curr1, &temp, sizeof(temp));
-
-        closedPathNodeListLength += 1;
-
-        if (closedPathNodeListLength == 2000) {
-            return 0;
-        }
-
-        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
-            int tile = tileGetTileInDirection(temp.tile, rotation, 1);
-            int bit = 1 << (tile & 7);
-            if ((gPathfinderProcessedTiles[tile / 8] & bit) != 0) {
-                continue;
-            }
-
-            if (tile != to) {
-                Object* v24 = callback(object, tile, object->elevation);
-                if (v24 != nullptr) {
-                    if (!canUseDoor(object, v24)) {
-                        continue;
-                    }
-                }
-            }
-
-            int v25 = 0;
-            for (; v25 < 2000; v25++) {
-                if (gOpenPathNodeList[v25].tile == -1) {
-                    break;
-                }
-            }
-
-            openPathNodeListLength += 1;
-
-            if (openPathNodeListLength == 2000) {
-                return 0;
-            }
-
-            gPathfinderProcessedTiles[tile / 8] |= bit;
-
-            PathNode* v27 = &(gOpenPathNodeList[v25]);
-            v27->tile = tile;
-            v27->from = temp.tile;
-            v27->rotation = rotation;
-
-            int newX;
-            int newY;
-            tileToScreenXY(tile, &newX, &newY, object->elevation);
-
-            v27->estimate = _idist(newX, newY, toScreenX, toScreenY);
-            v27->cost = temp.cost + 50;
-
-            if (isNotInCombat && temp.rotation != rotation) {
-                v27->cost += 10;
-            }
-
-            if (isCritter) {
-                Object* o = objectFindFirstAtLocation(object->elevation, v27->tile);
-                while (o != nullptr) {
-                    if (o->pid >= FIRST_RADIOACTIVE_GOO_PID && o->pid <= LAST_RADIOACTIVE_GOO_PID) {
-                        break;
-                    }
-                    o = objectFindNextAtLocation();
-                }
-
-                if (o != nullptr) {
-                    if (critterType == KILL_TYPE_GECKO) {
-                        v27->cost += 100;
-                    } else {
-                        v27->cost += 400;
-                    }
-                }
-            }
-        }
-
-        if (openPathNodeListLength == 0) {
-            break;
-        }
-    }
-
-    if (openPathNodeListLength != 0) {
-        unsigned char* v39 = rotations;
-        int index = 0;
-        for (; index < 800; index++) {
-            if (temp.tile == from) {
-                break;
-            }
-
-            if (v39 != nullptr) {
-                *v39 = temp.rotation & 0xFF;
-                v39 += 1;
-            }
-
-            int j = 0;
-            while (gClosedPathNodeList[j].tile != temp.from) {
-                j++;
-            }
-
-            PathNode* v36 = &(gClosedPathNodeList[j]);
-            memcpy(&temp, v36, sizeof(temp));
-        }
-
-        if (rotations != nullptr) {
-            // Looks like array resevering, probably because A* finishes it's path from end to start,
-            // this probably reverses it start-to-end.
-            unsigned char* beginning = rotations;
-            unsigned char* ending = rotations + index - 1;
-            int middle = index / 2;
-            for (int index = 0; index < middle; index++) {
-                unsigned char rotation = *ending;
-                *ending = *beginning;
-                *beginning = rotation;
-
-                ending -= 1;
-                beginning += 1;
-            }
-        }
-
-        return index;
-    }
-
-    return 0;
-}
-
-// 0x41633C
-static int _idist(int x1, int y1, int x2, int y2)
-{
-    int dx = x2 - x1;
-    if (dx < 0) {
-        dx = -dx;
-    }
-
-    int dy = y2 - y1;
-    if (dy < 0) {
-        dy = -dy;
-    }
-
-    int dm = (dx <= dy) ? dx : dy;
-
-    return dx + dy - (dm / 2);
-}
-
-// 0x416360
-static int _tile_idistance(int tile1, int tile2)
-{
-    int x1;
-    int y1;
-    tileToScreenXY(tile1, &x1, &y1, gElevation);
-
-    int x2;
-    int y2;
-    tileToScreenXY(tile2, &x2, &y2, gElevation);
-
-    return _idist(x1, y1, x2, y2);
-}
-
-// 0x4163AC
-int _make_straight_path(Object* obj, int from, int to, StraightPathNode* straightPathNodeList, Object** obstaclePtr, int a6)
-{
-    return _make_straight_path_func(obj, from, to, straightPathNodeList, obstaclePtr, a6, _obj_blocking_at);
-}
-
-// TODO: Rather complex, but understandable, needs testing.
-//
-// 0x4163C8
-int _make_straight_path_func(Object* obj, int from, int to, StraightPathNode* straightPathNodeList, Object** obstaclePtr, int a6, PathBuilderCallback* callback)
-{
-    if (obstaclePtr != nullptr) {
-        Object* obstacle = callback(obj, from, obj->elevation);
-        if (obstacle != nullptr) {
-            if (obstacle != *obstaclePtr && (a6 != 32 || (obstacle->flags & OBJECT_SHOOT_THRU) == 0)) {
-                *obstaclePtr = obstacle;
-                return 0;
-            }
-        }
-    }
-
-    int fromX;
-    int fromY;
-    tileToScreenXY(from, &fromX, &fromY, obj->elevation);
-    fromX += 16;
-    fromY += 8;
-
-    int toX;
-    int toY;
-    tileToScreenXY(to, &toX, &toY, obj->elevation);
-    toX += 16;
-    toY += 8;
-
-    int stepX;
-    int deltaX = toX - fromX;
-    if (deltaX > 0) {
-        stepX = 1;
-    } else if (deltaX < 0) {
-        stepX = -1;
-    } else {
-        stepX = 0;
-    }
-
-    int stepY;
-    int deltaY = toY - fromY;
-    if (deltaY > 0) {
-        stepY = 1;
-    } else if (deltaY < 0) {
-        stepY = -1;
-    } else {
-        stepY = 0;
-    }
-
-    int ddx = 2 * abs(toX - fromX);
-    int ddy = 2 * abs(toY - fromY);
-
-    int tileX = fromX;
-    int tileY = fromY;
-
-    int pathNodeIndex = 0;
-    int prevTile = from;
-    int v22 = 0;
-    int tile;
-
-    if (ddx <= ddy) {
-        int middle = ddx - ddy / 2;
-        while (true) {
-            tile = tileFromScreenXY(tileX, tileY, obj->elevation);
-
-            v22 += 1;
-            if (v22 == a6) {
-                if (pathNodeIndex >= 200) {
-                    return 0;
-                }
-
-                if (straightPathNodeList != nullptr) {
-                    StraightPathNode* pathNode = &(straightPathNodeList[pathNodeIndex]);
-                    pathNode->tile = tile;
-                    pathNode->elevation = obj->elevation;
-
-                    tileToScreenXY(tile, &fromX, &fromY, obj->elevation);
-                    pathNode->x = tileX - fromX - 16;
-                    pathNode->y = tileY - fromY - 8;
-                }
-
-                v22 = 0;
-                pathNodeIndex++;
-            }
-
-            if (tileY == toY) {
-                if (obstaclePtr != nullptr) {
-                    *obstaclePtr = nullptr;
-                }
-                break;
-            }
-
-            if (middle >= 0) {
-                tileX += stepX;
-                middle -= ddy;
-            }
-
-            tileY += stepY;
-            middle += ddx;
-
-            if (tile != prevTile) {
-                if (obstaclePtr != nullptr) {
-                    Object* obstacle = callback(obj, tile, obj->elevation);
-                    if (obstacle != nullptr) {
-                        if (obstacle != *obstaclePtr && (a6 != 32 || (obstacle->flags & OBJECT_SHOOT_THRU) == 0)) {
-                            *obstaclePtr = obstacle;
-                            break;
-                        }
-                    }
-                }
-                prevTile = tile;
-            }
-        }
-    } else {
-        int middle = ddy - ddx / 2;
-        while (true) {
-            tile = tileFromScreenXY(tileX, tileY, obj->elevation);
-
-            v22 += 1;
-            if (v22 == a6) {
-                if (pathNodeIndex >= 200) {
-                    return 0;
-                }
-
-                if (straightPathNodeList != nullptr) {
-                    StraightPathNode* pathNode = &(straightPathNodeList[pathNodeIndex]);
-                    pathNode->tile = tile;
-                    pathNode->elevation = obj->elevation;
-
-                    tileToScreenXY(tile, &fromX, &fromY, obj->elevation);
-                    pathNode->x = tileX - fromX - 16;
-                    pathNode->y = tileY - fromY - 8;
-                }
-
-                v22 = 0;
-                pathNodeIndex++;
-            }
-
-            if (tileX == toX) {
-                if (obstaclePtr != nullptr) {
-                    *obstaclePtr = nullptr;
-                }
-                break;
-            }
-
-            if (middle >= 0) {
-                tileY += stepY;
-                middle -= ddx;
-            }
-
-            tileX += stepX;
-            middle += ddy;
-
-            if (tile != prevTile) {
-                if (obstaclePtr != nullptr) {
-                    Object* obstacle = callback(obj, tile, obj->elevation);
-                    if (obstacle != nullptr) {
-                        if (obstacle != *obstaclePtr && (a6 != 32 || (obstacle->flags & OBJECT_SHOOT_THRU) == 0)) {
-                            *obstaclePtr = obstacle;
-                            break;
-                        }
-                    }
-                }
-                prevTile = tile;
-            }
-        }
-    }
-
-    if (v22 != 0) {
-        if (pathNodeIndex >= 200) {
-            return 0;
-        }
-
-        if (straightPathNodeList != nullptr) {
-            StraightPathNode* pathNode = &(straightPathNodeList[pathNodeIndex]);
-            pathNode->tile = tile;
-            pathNode->elevation = obj->elevation;
-
-            tileToScreenXY(tile, &fromX, &fromY, obj->elevation);
-            pathNode->x = tileX - fromX - 16;
-            pathNode->y = tileY - fromY - 8;
-        }
-
-        pathNodeIndex += 1;
-    } else {
-        if (pathNodeIndex > 0 && straightPathNodeList != nullptr) {
-            straightPathNodeList[pathNodeIndex - 1].elevation = obj->elevation;
-        }
-    }
-
-    return pathNodeIndex;
 }
 
 // 0x4167F8
@@ -2606,24 +2134,13 @@ static void _object_move(int index)
 
             bool cannotMove = false;
             if (isInCombat() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
-                int actionPointsRequired = critterGetMovementPointCostAdjustedForCrippledLegs(object, 1);
-                if (actionPointsRequired > _combat_free_move) {
-                    actionPointsRequired -= _combat_free_move;
-                    _combat_free_move = 0;
-                    if (actionPointsRequired > object->data.critter.combat.ap) {
-                        object->data.critter.combat.ap = 0;
-                    } else {
-                        object->data.critter.combat.ap -= actionPointsRequired;
-                    }
-                } else {
-                    _combat_free_move -= actionPointsRequired;
-                }
+                // REWRITE_PLAN 2.2: the per-step movement AP charge is a core
+                // sim rule (movement.cc); the HUD update stays client-side.
+                cannotMove = movementChargeApForStep(object);
 
                 if (object == gDude) {
                     interfaceRenderActionPoints(gDude->data.critter.combat.ap, _combat_free_move);
                 }
-
-                cannotMove = (object->data.critter.combat.ap + _combat_free_move) <= 0;
             }
 
             sad->field_20 += 1;
@@ -2736,14 +2253,14 @@ static int _anim_animate(Object* obj, int anim, int animationSequenceIndex, int 
     return 0;
 }
 
-// 0x417B30
-void _object_animate()
+// One round-robin pass over the live sads, advancing each by at most one frame;
+// returns whether any sad advanced. REWRITE_PLAN 2.3: the per-frame gate is
+// owned by the AnimationScheduler (base = real-time one-frame-per-pump, original
+// behavior; instant = advance every terminating sad). _object_animate drains
+// passes for the instant scheduler.
+static bool _object_animate_pass()
 {
-    if (gAnimationCurrentSad == 0) {
-        return;
-    }
-
-    _anim_in_bk = true;
+    bool progressed = false;
 
     for (int index = 0; index < gAnimationCurrentSad; index++) {
         AnimationSad* sad = &(gAnimationSads[index]);
@@ -2754,11 +2271,13 @@ void _object_animate()
         Object* object = sad->obj;
 
         unsigned int time = getTicks();
-        if (getTicksBetween(time, sad->animationTimestamp) < sad->ticksPerFrame) {
+        bool looping = (sad->flags & ANIM_SAD_FOREVER) != 0;
+        if (!animationScheduler()->frameReady(sad->animationTimestamp, sad->ticksPerFrame, time, looping)) {
             continue;
         }
 
         sad->animationTimestamp = time;
+        progressed = true;
 
         if (animationRunSequence(sad->animationSequenceIndex) == -1) {
             continue;
@@ -2897,6 +2416,30 @@ void _object_animate()
 
             tileWindowRefreshRect(&dirtyRect, gElevation);
         }
+    }
+
+    return progressed;
+}
+
+// 0x417B30
+void _object_animate()
+{
+    if (gAnimationCurrentSad == 0) {
+        return;
+    }
+
+    _anim_in_bk = true;
+
+    // REWRITE_PLAN 2.3: the base (client) scheduler runs a single pass — one
+    // frame per pump, the original behavior. The instant scheduler (headless /
+    // f2_server) repeats passes until none advances, draining all animations
+    // within this pump; completion callbacks still fire through the unchanged
+    // animationRunSequence/_anim_set_end path in the same registered order.
+    // drainGuard is a runaway backstop.
+    int drainGuard = 100000;
+    bool progressed = _object_animate_pass();
+    while (progressed && animationScheduler()->drainWithinPump() && --drainGuard > 0) {
+        progressed = _object_animate_pass();
     }
 
     _anim_in_bk = 0;
@@ -3109,91 +2652,12 @@ void _dude_fidget()
     nextTime = randomBetween(0, 3000) + 1000 * delayInSeconds;
 }
 
-// 0x418378
-void _dude_stand(Object* obj, int rotation, int fid)
-{
-    Rect rect;
-
-    objectSetRotation(obj, rotation, &rect);
-
-    int x = 0;
-    int y = 0;
-
-    int weaponAnimationCode = (obj->fid & 0xF000) >> 12;
-    if (weaponAnimationCode != 0) {
-        if (fid == -1) {
-            int takeOutFid = buildFid(FID_TYPE(obj->fid), obj->fid & 0xFFF, ANIM_TAKE_OUT, weaponAnimationCode, obj->rotation + 1);
-            CacheEntry* takeOutFrmHandle;
-            Art* takeOutFrm = artLock(takeOutFid, &takeOutFrmHandle);
-            if (takeOutFrm != nullptr) {
-                int frameCount = artGetFrameCount(takeOutFrm);
-                for (int frame = 0; frame < frameCount; frame++) {
-                    int offsetX;
-                    int offsetY;
-                    artGetFrameOffsets(takeOutFrm, frame, obj->rotation, &offsetX, &offsetY);
-                    x += offsetX;
-                    y += offsetY;
-                }
-                artUnlock(takeOutFrmHandle);
-
-                CacheEntry* standFrmHandle;
-                int standFid = buildFid(FID_TYPE(obj->fid), obj->fid & 0xFFF, ANIM_STAND, 0, obj->rotation + 1);
-                Art* standFrm = artLock(standFid, &standFrmHandle);
-                if (standFrm != nullptr) {
-                    int offsetX;
-                    int offsetY;
-                    if (artGetRotationOffsets(standFrm, obj->rotation, &offsetX, &offsetY) == 0) {
-                        x += offsetX;
-                        y += offsetY;
-                    }
-                    artUnlock(standFrmHandle);
-                }
-            }
-        }
-    }
-
-    if (fid == -1) {
-        int anim;
-        if (FID_ANIM_TYPE(obj->fid) == ANIM_FIRE_DANCE) {
-            anim = ANIM_FIRE_DANCE;
-        } else {
-            anim = ANIM_STAND;
-        }
-        fid = buildFid(FID_TYPE(obj->fid), (obj->fid & 0xFFF), anim, (obj->fid & 0xF000) >> 12, obj->rotation + 1);
-    }
-
-    Rect temp;
-    objectSetFid(obj, fid, &temp);
-    rectUnion(&rect, &temp, &rect);
-
-    objectSetLocation(obj, obj->tile, obj->elevation, &temp);
-    rectUnion(&rect, &temp, &rect);
-
-    objectSetFrame(obj, 0, &temp);
-    rectUnion(&rect, &temp, &rect);
-
-    _obj_offset(obj, x, y, &temp);
-    rectUnion(&rect, &temp, &rect);
-
-    tileWindowRefreshRect(&rect, obj->elevation);
-}
-
-// 0x418574
-void _dude_standup(Object* a1)
-{
-    reg_anim_begin(ANIMATION_REQUEST_RESERVED);
-
-    int anim;
-    if (FID_ANIM_TYPE(a1->fid) == ANIM_FALL_BACK) {
-        anim = ANIM_BACK_TO_STANDING;
-    } else {
-        anim = ANIM_PRONE_TO_STANDING;
-    }
-
-    animationRegisterAnimate(a1, anim, 0);
-    reg_anim_end();
-    a1->data.critter.combat.results &= ~DAM_KNOCKED_DOWN;
-}
+// NOTE: _dude_stand and _dude_standup were relocated to critter.cc (f2_core):
+// both are pure sim-state mutators (rotation/fid/frame/location; knocked-down
+// clear) driven from core map/inventory/party/combat paths, and the headless
+// server needs them. _dude_stand's only client tie was the tileWindowRefreshRect
+// tail — which now resolves per target (the real refresh in this client build,
+// a benign no-op in f2_server). See the P5 server de-stub cut-list, category C.
 
 // 0x4185EC
 static int actionRotate(Object* obj, int delta, int animationSequenceIndex)
@@ -3346,7 +2810,7 @@ static void reportOverloaded(Object* critter)
             critterGetName(critter));
     }
 
-    displayMonitorAddMessage(formattedText);
+    presenter()->consoleMessage(formattedText);
 }
 
 } // namespace fallout
