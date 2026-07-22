@@ -3,6 +3,7 @@
 
 #include "combat_defs.h"
 #include "obj_types.h"
+#include "path.h"
 
 namespace fallout {
 
@@ -100,15 +101,6 @@ typedef int(AnimationCallback)(void* a1, void* a2);
 // Signature of animation callback accepting 3 parameters.
 typedef int(AnimationCallback3)(void* a1, void* a2, void* a3);
 
-typedef struct StraightPathNode {
-    int tile;
-    int elevation;
-    int x;
-    int y;
-} StraightPathNode;
-
-typedef Object* PathBuilderCallback(Object* object, int tile, int elevation);
-
 void animationInit();
 void animationReset();
 void animationExit();
@@ -143,10 +135,6 @@ int animationRegisterToggleOutline(Object* object, bool outline, int delay);
 int animationRegisterPlaySoundEffect(Object* owner, const char* soundEffectName, int delay);
 int animationRegisterAnimateForever(Object* owner, int anim, int delay);
 int animationRegisterPing(int flags, int delay);
-int _make_path(Object* object, int from, int to, unsigned char* a4, int a5);
-int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback);
-int _make_straight_path(Object* object, int from, int to, StraightPathNode* straightPathNodeList, Object** obstaclePtr, int a6);
-int _make_straight_path_func(Object* object, int from, int to, StraightPathNode* straightPathNodeList, Object** obstaclePtr, int a6, PathBuilderCallback* callback);
 void _object_animate();
 int _check_move(int* actionPointsPtr);
 int _dude_move(int actionPoints);

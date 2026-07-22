@@ -1,8 +1,12 @@
+#include "client_net.h"
+#include "msg_channel.h"
 #include "game_dialog.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <functional>
 
 #include "actions.h"
 #include "animation.h"
@@ -15,6 +19,7 @@
 #include "debug.h"
 #include "delay.h"
 #include "dialog.h"
+#include "dialog_intent.h"
 #include "display_monitor.h"
 #include "draw.h"
 #include "game.h"
@@ -30,9 +35,11 @@
 #include "object.h"
 #include "party_member.h"
 #include "perk.h"
+#include "presenter.h"
 #include "proto.h"
 #include "random.h"
 #include "scripts.h"
+#include "server_loop.h"
 #include "sfall_config.h"
 #include "skill.h"
 #include "stat.h"
@@ -147,6 +154,17 @@ static int _Dogs[3] = {
 
 // 0x5186D4
 static int _dialog_state_fix = 0;
+
+// Live dialog block-and-pump seam (DIALOG_STREAMING_PLAN.md Stage 2). Installed by
+// the dedicated server (server_main.cc). nullptr everywhere else (client, golden
+// harness), where the barrier keeps its original headless behavior. See
+// gameDialogSetServerPump.
+static std::function<bool()> gDialogServerPump;
+
+// > 0 while _gdProcess is running a conversation that can consume a dialog
+// intent. See the long note at the increment site — this, NOT _gdialogActive(),
+// is what the server's dsay/dend gate must ask.
+static int gDialogServerNodeDepth = 0;
 
 // 0x5186D8
 static int gGameDialogOptionEntriesLength = 0;
@@ -310,6 +328,11 @@ bool gGameDialogSpeakerIsPartyMember = false;
 
 // 0x518850
 int gGameDialogHeadFid = 0;
+
+// The script-supplied reaction/fidget level for the live conversation (FIDGET_GOOD /
+// NEUTRAL / BAD). Drives the talking head's idle animation. Set by
+// _gdialogInitFromScript, streamed by dialogEmitNode.
+int gGameDialogFidget = FIDGET_NEUTRAL;
 
 // 0x518854
 int gGameDialogSid = -1;
@@ -514,6 +537,10 @@ static int gDialogReplyMessageId;
 // 0x58F4E0
 static int dword_58F4E0;
 
+// Audio filename pending for the current dialog node (set by _scr_get_msg_str_speech,
+// consumed by dialogEmitNode). Empty string = no audio for this node.
+char gDialogPendingAudio[16];
+
 // NOTE: The is something odd about this variable. There are 2700 bytes, which
 // is 3 x 900, but anywhere in the app only 900 characters is used. The length
 // of text in [DialogOptionEntry] is definitely 900 bytes. There are two
@@ -687,7 +714,11 @@ void gameDialogEnter(Object* speaker, int a2)
         return;
     }
 
-    if (PID_TYPE(speaker->pid) != OBJ_TYPE_ITEM && SID_TYPE(speaker->sid) != SCRIPT_TYPE_SPATIAL) {
+    // Under the server loop the dude is not walked into talk range first (the
+    // approach locomotion is dropped, same accepted class as the door/pickup/
+    // skill-on-target decouples), so skip the LOS/range gate — the conversation
+    // itself does not depend on the dude's exact tile.
+    if (!serverLoopActive() && PID_TYPE(speaker->pid) != OBJ_TYPE_ITEM && SID_TYPE(speaker->sid) != SCRIPT_TYPE_SPATIAL) {
         MessageListItem messageListItem;
 
         int rc = _action_can_talk_to(gDude, speaker);
@@ -827,6 +858,10 @@ void _gdialogSystemEnter()
 // 0x445050
 void gameDialogStartLips(const char* audioFileName)
 {
+    if (serverLoopActive()) {
+        return;
+    }
+
     if (audioFileName == nullptr) {
         debugPrint("\nGDialog: Bleep!");
         soundPlayFile("censor");
@@ -877,11 +912,35 @@ int gameDialogDisable()
 // 0x44510C
 int _gdialogInitFromScript(int headFid, int reaction)
 {
+    // The conversation's AUTHORITATIVE head + mood, captured for the wire. Both come
+    // from the script's start_gdialog(..., headId, ...) args (interpreter_extra.cc),
+    // NOT from the critter proto — proto head_fid is unset for most critters, which
+    // is why a viewer deriving the head from the proto renders NO head and falls back
+    // to showing the world in the upper panel (owner-found on the Arroyo Elder, whose
+    // script passes headId=3). Captured before the headless early-outs below so the
+    // server records them even though it builds no window.
+    gGameDialogFidget = reaction;
+
     if (_dialogue_state == 1) {
         return -1;
     }
 
     if (_gdialog_state == 1) {
+        return 0;
+    }
+
+    // Headless server (A2): the dialog runs authoritatively but has NO window,
+    // head, tickers or fidget — the _gdProcess barrier drives node transitions off
+    // the intent queue, and the node's reply/option state is populated by the
+    // gsay_* opcodes, not by this window choreography. Skip the entire renderer
+    // setup (windows/highlights/red buttons/head/lips/mouse/music) and keep only
+    // the _gdialog_state latch the gsay_start/gsay_end state machine checks.
+    // Pairs with the matching guard in _gdialogExitFromScript. The window build
+    // still runs normally on the viewer (serverLoopActive() is false there — the
+    // A3 render path reuses this exact function).
+    if (serverLoopActive()) {
+        _gdialog_state = 1;
+        _gdDialogWentOff = true;
         return 0;
     }
 
@@ -944,6 +1003,13 @@ int _gdialogExitFromScript()
     }
 
     if (_gdialog_state == 0) {
+        return 0;
+    }
+
+    // Headless server (A2): mirror the _gdialogInitFromScript guard — no window,
+    // head, tickers or lips were ever created, so tear down only the state latch.
+    if (serverLoopActive()) {
+        _gdialog_state = 0;
         return 0;
     }
 
@@ -1133,6 +1199,7 @@ int gameDialogAddTextOptionWithProc(int messageListId, const char* text, int pro
 // 0x445640
 int gameDialogSetMessageReply(Program* program, int messageListId, int messageId)
 {
+    gDialogPendingAudio[0] = '\0';
     gameDialogAddReviewMessage(messageListId, messageId);
 
     gDialogReplyProgram = program;
@@ -1725,6 +1792,13 @@ int gameDialogSetReviewOptionText(const char* string)
 // 0x446288
 int _gdProcessInit()
 {
+    // Headless: create no reply/options windows or scroll buttons. The server
+    // _gdProcess branch reads gDialogOptionEntries directly and never renders,
+    // so the -1 windows are never touched.
+    if (serverLoopActive()) {
+        return 0;
+    }
+
     int upBtn;
     int downBtn;
     int optionsWindowX;
@@ -1809,6 +1883,13 @@ void _gdProcessCleanup()
 // 0x446498
 int _gdProcessExit()
 {
+    // Headless server (A2): mirror the serverLoopActive() guard in _gdProcessInit —
+    // no reply/options windows or option buttons were ever created, so there is
+    // nothing to clean up or destroy. Skipping avoids the windowDestroy abort.
+    if (serverLoopActive()) {
+        return 0;
+    }
+
     _gdProcessCleanup();
 
     // CE: Move red buttons exit to `_gdialogExitFromScript`.
@@ -1852,6 +1933,45 @@ void gameDialogRenderCaps()
     fontSetCurrent(oldFont);
 }
 
+void gameDialogSetServerPump(std::function<bool()> pump)
+{
+    gDialogServerPump = std::move(pump);
+}
+
+bool gameDialogServerNodeActive()
+{
+    return gDialogServerNodeDepth > 0;
+}
+
+// Ship the CURRENT dialog node (reply + resolved option texts) to viewers over the
+// presentation seam. Called at the top of each live server-barrier iteration, after
+// the node's reply/options have been populated (_gdProcessUpdate at entry, then
+// _gdProcessChoice after each selection). Options resolve through the SAME
+// gameDialogGetOptionText the renderer uses (Stage 0), so server and viewer can never
+// drift. `driver` is the talking actor (gDude in v1; the barrier stays actor-agnostic
+// otherwise). `reaction` carries the script's real fidget level and `headFid` the
+// script's real head — the viewer cannot derive either (proto head_fid is unset). Pure reads + local buffers → no sim mutation, no RNG.
+static void dialogEmitNode()
+{
+    static char optionText[DIALOG_OPTION_ENTRIES_CAPACITY][900];
+    const char* optionPtrs[DIALOG_OPTION_ENTRIES_CAPACITY];
+
+    int count = gGameDialogOptionEntriesLength;
+    if (count < 0) count = 0;
+    if (count > DIALOG_OPTION_ENTRIES_CAPACITY) count = DIALOG_OPTION_ENTRIES_CAPACITY;
+
+    for (int i = 0; i < count; i++) {
+        optionText[i][0] = '\0';
+        gameDialogGetOptionText(i, optionText[i], sizeof(optionText[i]));
+        optionPtrs[i] = optionText[i];
+    }
+
+    presenter()->dialogNode(gGameDialogSpeaker, gDude, gGameDialogFidget,
+        gDialogReplyText, optionPtrs, count,
+        gDialogPendingAudio[0] != '\0' ? gDialogPendingAudio : nullptr,
+        gGameDialogHeadFid);
+}
+
 // 0x4465C0
 int _gdProcess()
 {
@@ -1862,6 +1982,34 @@ int _gdProcess()
     }
 
     _gdReenterLevel += 1;
+
+    // ►► THE dsay/dend GATE'S GROUND TRUTH. Raised for exactly as long as this
+    // conversation can consume a dialog intent.
+    //
+    // It exists because _gdialogActive() (i.e. _dialog_state_fix) is the WRONG
+    // question and answering it caused a hard deadlock. That flag is set only by
+    // gameDialogEnter — the engine's "player used TALK on an NPC" path. But a
+    // script can run a whole conversation through gsay_start/gsay_end, which
+    // reaches _gdProcess via _gdialogGo() with gameDialogEnter never involved and
+    // _dialog_state_fix still 0. denbus2/Sheila's paid path does exactly that for
+    // its SECOND conversation (the one after the teleport + game_time_advance).
+    //
+    // Vanilla never noticed: _gdProcess reads the keyboard directly. Our server
+    // gate did notice — it rejected every dsay/dend as "no active dialog" while
+    // this very function sat parked in the barrier waiting for one. The client
+    // showed a node whose buttons did nothing and the world stayed frozen.
+    //
+    // Depth-counted, not a bool: conversations nest (_gdReenterLevel).
+    gDialogServerNodeDepth++;
+
+    // Conversation lifecycle bracket. Pairs with the "[dialog] LEAVE" line at the
+    // teardown below, so a log shows exactly which conversation a stranded node
+    // belonged to and whether the server ever left it — the "server is parked in a
+    // dialog the client is not showing" limbo is invisible without this.
+    if (gDialogServerPump != nullptr) {
+        fprintf(stderr, "f2_server: [dialog] ENTER _gdProcess reenter=%d inCombat=%d\n",
+            _gdReenterLevel, isInCombat() ? 1 : 0);
+    }
 
     _gdProcessUpdate();
 
@@ -1877,6 +2025,182 @@ int _gdProcess()
     int pageOffsets[10];
     pageOffsets[0] = 0;
     for (;;) {
+        if (serverLoopActive()) {
+            // Headless: no keyboard/render/fps loop. Drain the dialog intent
+            // queue, calling _gdProcessChoice directly — the same core path a
+            // numeric-key press drives at line ~1992 below. The initial node's
+            // options are already registered (gDialogOptionEntries, populated by
+            // the gsay_option opcodes before gsay_end reached _gdProcess).
+            if (getenv("F2_DIALOG_TRACE") != nullptr) {
+                debugPrint("\n[dtrace] node: %d options; reply=\"%.80s\"\n",
+                    gGameDialogOptionEntriesLength, gDialogReplyText);
+                for (int oi = 0; oi < gGameDialogOptionEntriesLength; oi++) {
+                    debugPrint("[dtrace]   opt %d: \"%.70s\"\n", oi, gDialogOptionEntries[oi].text);
+                }
+            }
+            // LIVE (dedicated server, pump installed): ship the current node to the
+            // viewers so the OWNER renders it editable and spectators read-only.
+            // Inert on the golden/headless path (pump == nullptr).
+            if (gDialogServerPump != nullptr) {
+                dialogEmitNode();
+            }
+
+            DialogIntent intent;
+            bool haveIntent = dialogIntentPeek(&intent);
+            if (gDialogServerPump != nullptr) {
+                // Block-and-pump: park the server tick here for the whole node and
+                // service the control channel until the owner's dsay/dend lands, or
+                // the pump signals a bail (owner disconnect / combat start / quit).
+                // MP_PROTOCOL §1: a dialog choice is an accepted input barrier, and
+                // vanilla freezes the world during dialog anyway.
+                while (!haveIntent) {
+                    if (!gDialogServerPump()) {
+                        break;
+                    }
+                    haveIntent = dialogIntentPeek(&intent);
+                }
+            }
+            if (!haveIntent) {
+                // Empty queue with no live pump = the original headless behavior (a
+                // well-formed golden fixture pre-queues one intent per node plus a
+                // terminating choice); OR a live bail. Either way, end the
+                // conversation — dialogEnd is emitted in the reenter==0 teardown.
+                //
+                // ►► LIVE, this is the bug path: dialogEmitNode() above already
+                // shipped this node to the viewer, which is now rendering options
+                // the server will never read. The pump logs WHY it bailed.
+                if (gDialogServerPump != nullptr) {
+                    fprintf(stderr, "f2_server: [dialog] ABANDONED a node the client "
+                                    "is already showing (%d options, reenter=%d)\n",
+                        gGameDialogOptionEntriesLength, _gdReenterLevel);
+                }
+                break;
+            }
+            dialogIntentPop();
+
+            if (intent.kind == DIALOG_INTENT_END) {
+                break;
+            }
+
+            int choiceResult = 0;
+            if (intent.kind == DIALOG_INTENT_BARTER) {
+                // The routed Barter button (server_control dbarter). WHETHER this
+                // speaker barters is ours to decide, exactly as the interactive
+                // button handler does it (gameDialogBarterButtonUpMouseUp): a
+                // CRITTER_BARTER critter opens the trade; anyone else gets the
+                // "will not barter" refusal and the conversation continues. We set
+                // mode 2 directly rather than calling the button handler, which
+                // also does gdHide()/lip teardown that has no headless meaning.
+                bool willBarter = false;
+                if (PID_TYPE(gGameDialogSpeaker->pid) == OBJ_TYPE_CRITTER) {
+                    Proto* sproto = nullptr;
+                    if (protoGetProto(gGameDialogSpeaker->pid, &sproto) != -1
+                        && (sproto->critter.data.flags & CRITTER_BARTER) != 0) {
+                        willBarter = true;
+                    }
+                }
+                if (willBarter) {
+                    _dialogue_switch_mode = 2;
+                    _dialogue_state = 4;
+                    // falls into the mode==2 barter block below
+                } else {
+                    // proto msg 903 "This person will not barter with you." Answer
+                    // the driver only — it is a refusal, nothing happened for anyone
+                    // else. gDude is the driver here (the pump's ServerActorScope).
+                    MessageListItem m;
+                    m.num = gGameDialogSpeakerIsPartyMember ? 913 : 903;
+                    if (messageListGetItem(&gProtoMessageList, &m)) {
+                        presenter()->consoleMessageStyled(
+                            gDude != nullptr ? gDude->netId : 0, kMsgChannelRefusal, m.text);
+                    }
+                    continue; // stay in the conversation
+                }
+            } else {
+                // DIALOG_INTENT_SELECT: bounds-check against the current node's
+                // option count (mirrors the `v11 < gGameDialogOptionEntriesLength`
+                // guard on the keyboard path).
+                if (intent.arg < 0 || intent.arg >= gGameDialogOptionEntriesLength) {
+                    debugPrint("\nserver dialog: option %d out of range [0,%d) - ending\n",
+                        intent.arg, gGameDialogOptionEntriesLength);
+                    break;
+                }
+
+                choiceResult = _gdProcessChoice(intent.arg);
+            }
+
+            // A choice's proc can switch into a nested blocking mode: barter
+            // (2), party control (8/9), or party customization (11/12). Barter
+            // is driven headless; the party modes are UI-button-only and remain
+            // unsupported here. This MUST be tested before the choiceResult == -1
+            // end check below: the barter option's proc registers no new dialog
+            // options (barter replaces them), so _gdProcessChoice returns -1 even
+            // though barter must still run — breaking first would skip it.
+            if (_dialogue_switch_mode == 2) {
+                // Headless barter. The interactive path runs this across two
+                // steps: gameDialogTicker case 2 (mode 2->3: enterGameMode +
+                // _gdialog_barter_create_win) then the mode==3 branch below
+                // (exitGameMode + inventoryOpenTrade + cleanup + destroy). We
+                // BYPASS the ticker (a client-tick callback that would build the
+                // SDL barter window) and drive create -> trade -> destroy inline.
+                // The create/destroy win fns are serverLoopActive-guarded to
+                // allocate/free ONLY the three hidden table objects (no SDL), so
+                // the enterGameMode/exitGameMode(kSpecial) pair — a no-op round
+                // trip here — is elided.
+                _gdialog_barter_create_win();
+                inventoryOpenTrade(gGameDialogWindow, gGameDialogSpeaker, _peon_table_obj, _barterer_table_obj, gGameDialogBarterModifier);
+                _gdialog_barter_cleanup_tables();
+                _gdialog_barter_destroy_win();
+
+                // inventoryOpenTrade's DONE path already ran _barter_end_to_talk_to
+                // (which closed the dialog programs and set mode=1, state=1). A
+                // CANCEL/empty-queue path leaves mode==2 and state==4. Normalize
+                // BOTH — mirroring the interactive mode==3 branch, which always
+                // ends barter at state==1 (see the `if (v5 == 4)` block). mode=0
+                // so the subsequent _gdialogExitFromScript teardown does NOT
+                // short-circuit (it returns early for modes 2/8/11); state=1 so a
+                // leftover state==4 can't misroute _gdDestroyHeadWindow /
+                // gameDialogEnter teardown into the barter-recovery path.
+                _dialogue_switch_mode = 0;
+                _dialogue_state = 1;
+
+                // ►► CONTINUE, NOT BREAK. Leaving a trade RETURNS YOU TO THE
+                // CONVERSATION -- that is what the 'T' button means, and what
+                // _barter_end_to_talk_to is named after. The interactive path says
+                // so explicitly: its barter branch ends in `continue` (:2189), and
+                // this one used to end in `break`, hanging up on the merchant the
+                // moment a trade closed. Owner-reported: "trade -> back should pop
+                // the same dialog as the initial one".
+                //
+                // Looping also re-emits the node (dialogEmitNode runs at the top of
+                // each iteration), which is what repopulates every viewer's option
+                // list -- without it the viewer holds an empty dialog window that
+                // no node will ever fill.
+                continue;
+            }
+
+            if (_dialogue_switch_mode != 0) {
+                debugPrint("\nserver dialog: option requested nested mode %d (party) - aborting\n",
+                    _dialogue_switch_mode);
+                // Reset the pending switch mode BEFORE breaking: otherwise the
+                // subsequent end_dialogue -> _gdialogExitFromScript short-circuits
+                // (it returns early when mode is 2/8/11), leaving gameDialogTicker
+                // registered — which would then try to build a party SDL window
+                // on the next server tick. Clearing it lets the normal teardown
+                // (tickersRemove + GameMode pop) run.
+                _dialogue_switch_mode = 0;
+                break;
+            }
+
+            if (choiceResult == -1) {
+                // The option's proc registered no new options and switched into
+                // no nested mode: conversation ended (same semantics as the
+                // keyboard path's break at ~1992).
+                break;
+            }
+
+            continue;
+        }
+
         sharedFpsLimiter.mark();
 
         int keyCode = inputGetInput();
@@ -2011,7 +2335,29 @@ int _gdProcess()
 
     _gdReenterLevel -= 1;
 
+    if (gDialogServerNodeDepth > 0) {
+        gDialogServerNodeDepth--;
+    }
+
+    if (gDialogServerPump != nullptr) {
+        fprintf(stderr, "f2_server: [dialog] LEAVE _gdProcess reenter=%d inCombat=%d\n",
+            _gdReenterLevel, isInCombat() ? 1 : 0);
+    }
+
     if (_gdReenterLevel == 0) {
+        // Headless: a conversation may end (natural -1, explicit END, or nested-
+        // mode abort) with unconsumed intents still queued. Drop them so they
+        // can't bleed into a later dialog in the same server run (the queue is
+        // otherwise cleared only once per serverRun).
+        if (serverLoopActive()) {
+            dialogIntentClear();
+            // Tell every viewer the conversation is over (tear the window down; a
+            // spectator can't dismiss early). Only when a live pump drove it — inert
+            // on the golden/headless path.
+            if (gDialogServerPump != nullptr) {
+                presenter()->dialogEnd(gDude);
+            }
+        }
         if (_gdProcessExit() == -1) {
             return -1;
         }
@@ -2066,12 +2412,18 @@ int _gdProcessChoice(int a1)
         break;
     }
 
-    _demo_copy_title(gGameDialogReplyWindow);
-    _demo_copy_options(gGameDialogOptionsWindow);
-    windowRefresh(gGameDialogReplyWindow);
-    windowRefresh(gGameDialogOptionsWindow);
+    // Headless: skip the render/hover-highlight of the -1 reply/options
+    // windows (gameDialogOptionOnMouseEnter would hit the invalid options
+    // window). The reaction update below still runs (its fidget/transition
+    // calls self-neutralize on the -1 head window).
+    if (!serverLoopActive()) {
+        _demo_copy_title(gGameDialogReplyWindow);
+        _demo_copy_options(gGameDialogOptionsWindow);
+        windowRefresh(gGameDialogReplyWindow);
+        windowRefresh(gGameDialogOptionsWindow);
 
-    gameDialogOptionOnMouseEnter(a1);
+        gameDialogOptionOnMouseEnter(a1);
+    }
     _talk_to_critter_reacts(v1);
 
     gGameDialogOptionEntriesLength = 0;
@@ -2219,6 +2571,179 @@ void gameDialogRenderReply()
     windowRefresh(gGameDialogReplyWindow);
 }
 
+// Resolve option `index`'s final display text (including the SFALL number/bullet
+// prefix, exactly as the render loop bakes it) into `out`. Shared by the render
+// loop and the dialog-streaming emitter so the two can never drift on how an
+// option reads. Returns false when a synthetic continuation/done message can't
+// be found (the caller aborts the node); a genuinely corrupt script message
+// (messageListId >= 0 resolving to null) is fatal, mirroring the render path.
+//
+// For script text options (messageListId == -4) the text was already baked at
+// add time (gameDialogAddTextOption): if `out` aliases the entry's own buffer
+// (the render loop passes &entry->text) it is left untouched; otherwise it is
+// copied out for the emitter.
+bool gameDialogGetOptionText(int index, char* out, size_t size)
+{
+    GameDialogOptionEntry* dialogOptionEntry = &(gDialogOptionEntries[index]);
+
+    if (dialogOptionEntry->messageListId >= 0) {
+        char* text = _scr_get_msg_str_speech(dialogOptionEntry->messageListId, dialogOptionEntry->messageId, 0);
+        if (text == nullptr) {
+            showMesageBox("\nGDialog::Error Grabbing text message!");
+            exit(1);
+        }
+
+        // SFALL
+        if (gNumberOptions) {
+            snprintf(out, size, "%d. %s", index + 1, text);
+        } else {
+            snprintf(out, size, "%c %s", '\x95', text);
+        }
+    } else if (dialogOptionEntry->messageListId == -1) {
+        MessageListItem messageListItem;
+        if (index == 0) {
+            // Go on
+            messageListItem.num = 655;
+            if (critterGetStat(gDude, STAT_INTELLIGENCE) < 4) {
+                if (messageListGetItem(&gProtoMessageList, &messageListItem)) {
+                    // SFALL
+                    if (gNumberOptions) {
+                        snprintf(out, size, "%d. %s", index + 1, messageListItem.text);
+                    } else {
+                        snprintf(out, size, "%s", messageListItem.text);
+                    }
+                } else {
+                    debugPrint("\nError...can't find message!");
+                    return false;
+                }
+            }
+        } else {
+            // TODO: Why only space?
+            // SFALL
+            if (gNumberOptions) {
+                snprintf(out, size, "%d. %s", index + 1, " ");
+            } else {
+                strcpy(out, " ");
+            }
+        }
+    } else if (dialogOptionEntry->messageListId == -2) {
+        // [Done]
+        MessageListItem messageListItem;
+        messageListItem.num = 650;
+        if (messageListGetItem(&gProtoMessageList, &messageListItem)) {
+            // SFALL
+            if (gNumberOptions) {
+                snprintf(out, size, "%d. %s", index + 1, messageListItem.text);
+            } else {
+                snprintf(out, size, "%c %s", '\x95', messageListItem.text);
+            }
+        } else {
+            debugPrint("\nError...can't find message!");
+            return false;
+        }
+    } else if (out != dialogOptionEntry->text) {
+        // Script text option (messageListId == -4): already baked. Copy for a
+        // non-aliasing caller (the emitter); the render loop passes its own
+        // buffer and needs no copy.
+        snprintf(out, size, "%s", dialogOptionEntry->text);
+    }
+
+    return true;
+}
+
+void gameDialogSetReplyText(const char* text)
+{
+    snprintf(gDialogReplyText, sizeof(gDialogReplyText), "%s", text != nullptr ? text : "");
+}
+
+void gameDialogClearOptions()
+{
+    gGameDialogOptionEntriesLength = 0;
+}
+
+void gameDialogRenderNode()
+{
+    if (serverLoopActive() || gGameDialogReplyWindow == -1 || _gdialog_state != 1) {
+        return;
+    }
+    _gdProcessUpdate();
+}
+
+int gameDialogInitNodeWindows()
+{
+    return _gdProcessInit();
+}
+
+void gameDialogExitNodeWindows()
+{
+    _gdProcessExit();
+}
+
+// Viewer-side barter window lifecycle, the barter twin of the two above and for
+// the same reason: on the viewer we bypass _gdProcess entirely (it would execute
+// scripts locally), so the mode switch that normally builds and tears down the
+// trade window never runs. The server tells us a trade opened; these put the
+// vanilla window on screen so there is something to render the mirrored tables
+// into. Also exposes the backing window handle, which inventory_ui needs as
+// `_barter_back_win` and which is otherwise a file-static here.
+int gameDialogInitBarterWindows()
+{
+    return _gdialog_barter_create_win();
+}
+
+void gameDialogExitBarterWindows()
+{
+    _gdialog_barter_destroy_win();
+}
+
+// The normal-flavor twin of the barter pair above. gGameDialogWindow is a single
+// handle: _gdialog_barter_create_win overwrites it and _gdialog_barter_destroy_win
+// sets it to -1, so on the viewer (which has no _gdProcess mode machine to swap the
+// flavors) the barter boundary must destroy/recreate the normal control explicitly.
+int gameDialogInitControlWindow()
+{
+    int rc = _gdialog_window_create();
+    // _gdialog_window_create (unlike _gdCreateHeadWindow) does not set the flavor
+    // latch. Restore it to NORMAL so _gdDestroyHeadWindow at conversation end frees
+    // this window via _gdialog_window_destroy, not _gdialog_barter_destroy_win.
+    _dialogue_state = 1;
+    return rc;
+}
+
+void gameDialogExitControlWindow()
+{
+    _gdialog_window_destroy();
+}
+
+int gameDialogGetWindow()
+{
+    return gGameDialogWindow;
+}
+
+// True when the dialog SESSION (background/head) window is up. The viewer's trade
+// screen is always nested in a live conversation — it reuses this window as its
+// backing and _gdialog_barter_create_win blits from its buffer — so opening barter
+// with this window gone (a viewer that dropped its dialog out of sync) dereferences
+// a dead handle. inventoryOpenTradeViewer checks this and refuses rather than fault.
+bool gameDialogBackgroundActive()
+{
+    return gGameDialogBackgroundWindow != -1;
+}
+
+void gameDialogOptionHoverEnter(int index)
+{
+    if (!serverLoopActive()) {
+        gameDialogOptionOnMouseEnter(index);
+    }
+}
+
+void gameDialogOptionHoverExit(int index)
+{
+    if (!serverLoopActive()) {
+        gameDialogOptionOnMouseExit(index);
+    }
+}
+
 // 0x446D30
 void _gdProcessUpdate()
 {
@@ -2232,8 +2757,10 @@ void _gdProcessUpdate()
     _optionRect.right = 388;
     _optionRect.bottom = 112;
 
-    _demo_copy_title(gGameDialogReplyWindow);
-    _demo_copy_options(gGameDialogOptionsWindow);
+    if (!serverLoopActive()) {
+        _demo_copy_title(gGameDialogReplyWindow);
+        _demo_copy_options(gGameDialogOptionsWindow);
+    }
 
     if (gDialogReplyMessageListId > 0) {
         char* s = _scr_get_msg_str_speech(gDialogReplyMessageListId, gDialogReplyMessageId, 1);
@@ -2246,6 +2773,13 @@ void _gdProcessUpdate()
         *(gDialogReplyText + sizeof(gDialogReplyText) - 1) = '\0';
     }
 
+    // Headless: the reply text is now in gDialogReplyText (available to a
+    // narrating presenter); skip all rendering, which would dereference the
+    // -1 reply/options window buffers.
+    if (serverLoopActive()) {
+        return;
+    }
+
     gameDialogRenderReply();
 
     int color = _colorTable[992] | 0x2000000;
@@ -2253,8 +2787,6 @@ void _gdProcessUpdate()
     bool hasEmpathy = perkGetRank(gDude, PERK_EMPATHY) != 0;
 
     int width = _optionRect.right - _optionRect.left - 4;
-
-    MessageListItem messageListItem;
 
     int v21 = 0;
 
@@ -2278,59 +2810,8 @@ void _gdProcessUpdate()
             }
         }
 
-        if (dialogOptionEntry->messageListId >= 0) {
-            char* text = _scr_get_msg_str_speech(dialogOptionEntry->messageListId, dialogOptionEntry->messageId, 0);
-            if (text == nullptr) {
-                showMesageBox("\nGDialog::Error Grabbing text message!");
-                exit(1);
-            }
-
-            // SFALL
-            if (gNumberOptions) {
-                snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%d. %s", index + 1, text);
-            } else {
-                snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%c %s", '\x95', text);
-            }
-        } else if (dialogOptionEntry->messageListId == -1) {
-            if (index == 0) {
-                // Go on
-                messageListItem.num = 655;
-                if (critterGetStat(gDude, STAT_INTELLIGENCE) < 4) {
-                    if (messageListGetItem(&gProtoMessageList, &messageListItem)) {
-                        // SFALL
-                        if (gNumberOptions) {
-                            snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%d. %s", index + 1, messageListItem.text);
-                        } else {
-                            snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%s", messageListItem.text);
-                        }
-                    } else {
-                        debugPrint("\nError...can't find message!");
-                        return;
-                    }
-                }
-            } else {
-                // TODO: Why only space?
-                // SFALL
-                if (gNumberOptions) {
-                    snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%d. %s", index + 1, " ");
-                } else {
-                    strcpy(dialogOptionEntry->text, " ");
-                }
-            }
-        } else if (dialogOptionEntry->messageListId == -2) {
-            // [Done]
-            messageListItem.num = 650;
-            if (messageListGetItem(&gProtoMessageList, &messageListItem)) {
-                // SFALL
-                if (gNumberOptions) {
-                    snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%d. %s", index + 1, messageListItem.text);
-                } else {
-                    snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text), "%c %s", '\x95', messageListItem.text);
-                }
-            } else {
-                debugPrint("\nError...can't find message!");
-                return;
-            }
+        if (!gameDialogGetOptionText(index, dialogOptionEntry->text, sizeof(dialogOptionEntry->text))) {
+            return;
         }
 
         int estimate = _text_num_lines(dialogOptionEntry->text, _optionRect.right - _optionRect.left) * fontGetLineHeight() + _optionRect.top + 2;
@@ -2380,6 +2861,13 @@ void _gdProcessUpdate()
 int _gdCreateHeadWindow()
 {
     _dialogue_state = 1;
+
+    // Headless: keep the dialog-active state but create no SDL window/buffers.
+    // Leaving gGameDialogWindow == -1 turns the fidget/transition pumps and the
+    // ticker's render tail into free no-ops (all guarded on window/frm state).
+    if (serverLoopActive()) {
+        return 0;
+    }
 
     int windowWidth = GAME_DIALOG_WINDOW_WIDTH;
 
@@ -2446,6 +2934,16 @@ void _gdDestroyHeadWindow()
 void _gdSetupFidget(int headFrmId, int reaction)
 {
     gGameDialogFidgetFrmCurrentFrame = 0;
+
+    // Headless: the server never animates the talking head. Take the no-head
+    // path so the fidget-art lock and its randomBetween(1,100) fidget-variant
+    // RNG draw are skipped — otherwise a talking-head NPC would perturb the
+    // global RNG at dialog init (and the client's ongoing ticker fidget RNG,
+    // which the server drops, is itself wall-clock-nondeterministic). This
+    // keeps server dialog RNG-isolated for every NPC, not just head-fid -1 ones.
+    if (serverLoopActive()) {
+        headFrmId = -1;
+    }
 
     if (headFrmId == -1) {
         gGameDialogFidgetFid = -1;
@@ -2796,6 +3294,34 @@ void _gDialogRefreshOptionsRect(int win, Rect* drawRect)
 // 0x447A58
 void gameDialogTicker()
 {
+    // ►► THE MODE MACHINE IS INERT ON A CONNECTED VIEWER, AND THAT IS THE ROOT
+    // FIX FOR A WHOLE CLASS OF DEFECTS. On a wire viewer the conversation belongs
+    // to the SERVER; this switch is a third, uninvited owner of the same windows
+    // that client_dialog and the barter screen manage from stream state, and it
+    // acts with no knowledge of either.
+    //
+    // Concretely, this is the ghost trade screen: the dialog window builds a live
+    // Barter button, clicking it sets _dialogue_switch_mode = 2, case 2 below
+    // destroys the dialog window and builds a real but EMPTY local barter window,
+    // enters kSpecial and never leaves it, then hands off to mode 3 — whose
+    // handler lives inside _gdProcess, which never runs on a viewer. So the
+    // machine strands itself halfway and the server never hears a thing.
+    //
+    // Gated on clientViewerActive(), NOT on which binary this is: local
+    // single-player runs the same code in the same executable and must keep
+    // vanilla behavior exactly. The fidget/lips work below the switch KEEPS
+    // running — the viewer needs it — so this returns from the switch only.
+    //
+    // Loud rather than silent: reaching here with a nonzero mode means something
+    // still drives the machine, which is the bug, not the symptom.
+    if (clientViewerActive()) {
+        if (_dialogue_switch_mode != 0) {
+            fprintf(stderr, "game_dialog: viewer reached the mode machine (mode=%d) — "
+                            "something local is driving dialog state; forcing 0\n",
+                _dialogue_switch_mode);
+            _dialogue_switch_mode = 0;
+        }
+    } else
     switch (_dialogue_switch_mode) {
     case 2:
         _loop_cnt = -1;
@@ -3190,6 +3716,37 @@ int _gdialog_barter_create_win()
 {
     _dialogue_state = 4;
 
+    // Headless: allocate ONLY the three hidden barter table objects that
+    // inventoryOpenTrade needs (the player offer table, the barterer table, and
+    // the barterer temp object). Skip the barter.frm window, its two buttons,
+    // and all blitting — there is no SDL window here (gGameDialogWindow stays
+    // -1, exactly as _gdCreateHeadWindow leaves it). Object creation order and
+    // flags are identical to the SDL path below so the sim state matches.
+    if (serverLoopActive()) {
+        if (objectCreateWithFidPid(&_peon_table_obj, -1, -1) == -1) {
+            return -1;
+        }
+        _peon_table_obj->flags |= OBJECT_HIDDEN;
+
+        if (objectCreateWithFidPid(&_barterer_table_obj, -1, -1) == -1) {
+            objectDestroy(_peon_table_obj, nullptr);
+            _peon_table_obj = nullptr;
+            return -1;
+        }
+        _barterer_table_obj->flags |= OBJECT_HIDDEN;
+
+        if (objectCreateWithFidPid(&_barterer_temp_obj, gGameDialogSpeaker->fid, -1) == -1) {
+            objectDestroy(_barterer_table_obj, nullptr);
+            objectDestroy(_peon_table_obj, nullptr);
+            _barterer_table_obj = nullptr;
+            _peon_table_obj = nullptr;
+            return -1;
+        }
+        _barterer_temp_obj->flags |= OBJECT_HIDDEN | OBJECT_NO_SAVE;
+        _barterer_temp_obj->sid = -1;
+        return 0;
+    }
+
     int frmId;
     if (gGameDialogSpeakerIsPartyMember) {
         // trade.frm - party member barter/trade interface
@@ -3279,6 +3836,29 @@ int _gdialog_barter_create_win()
 // 0x44854C
 void _gdialog_barter_destroy_win()
 {
+    // Headless mirror of the SDL teardown's object destruction (there is no
+    // window or buttons to destroy). gGameDialogWindow stayed -1 the whole
+    // time, so the normal guard below would early-return and LEAK the three
+    // table objects. Null the statics so the second teardown call from
+    // _gdDestroyHeadWindow (_dialogue_state == 4 branch) is a no-op instead of
+    // a double free.
+    if (serverLoopActive()) {
+        objectDestroy(_barterer_temp_obj, nullptr);
+        objectDestroy(_barterer_table_obj, nullptr);
+        objectDestroy(_peon_table_obj, nullptr);
+        _barterer_temp_obj = nullptr;
+        _barterer_table_obj = nullptr;
+        _peon_table_obj = nullptr;
+        // The SDL teardown ends with this too (below). It is a real sim
+        // mutation — a weapon-carrying merchant tops up its right-hand weapon
+        // from loose ammo (and may destroy the emptied ammo object) — so it
+        // must run headless as well. Safe here: animate=0, and the reload sfx
+        // only fires for party members, which self-neutralizes on the null
+        // presenter. (Inert for denbus1's Tubby, who holds no weapon.)
+        aiAttemptWeaponReload(gGameDialogSpeaker, 0);
+        return;
+    }
+
     if (gGameDialogWindow == -1) {
         return;
     }
@@ -4271,6 +4851,21 @@ void _gdCustomUpdateSetting(int option, int value)
 // 0x44A52C
 void gameDialogBarterButtonUpMouseUp(int btn, int keyCode)
 {
+    // ►► ON A CONNECTED VIEWER THIS BUTTON MUST NOT TOUCH LOCAL STATE. Neutering
+    // the ticker was not enough: this CALLBACK runs first, and it both flips
+    // _dialogue_switch_mode = 2 and calls gdHide(), tearing down the dialog
+    // window -- after which the next server dialog node re-renders into a hidden
+    // window and segfaults (_gdProcessUpdate -> _talkToRefreshDialogWindowRect ->
+    // srcCopy on a freed buffer). The conversation belongs to the server, so the
+    // button is a REQUEST like any other input: send `dbarter` and let the
+    // authoritative _gdProcess open the trade (which streams EVENT_BARTER_BEGIN
+    // back). Spectators are refused server-side; only the driver's request lands.
+    // The CRITTER_BARTER "will not barter" check is the server's to make now.
+    if (clientViewerActive()) {
+        clientViewerBarterVerb("dbarter", -1, 0);
+        return;
+    }
+
     if (PID_TYPE(gGameDialogSpeaker->pid) != OBJ_TYPE_CRITTER) {
         return;
     }

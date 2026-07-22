@@ -32,6 +32,14 @@ void paletteInit()
     memset(gPaletteWhite, 63, 256 * 3);
     memcpy(gPalette, _cmap, 256 * 3);
 
+    // Synthetic clock (headless): the timing benchmark below is meaningless
+    // and would calibrate tens of thousands of real-throttled fade steps.
+    // Single-step fades make palette transitions effectively instant.
+    if (getTicksIsSynthetic()) {
+        gPaletteFadeSteps = 1;
+        return;
+    }
+
     unsigned int tick = getTicks();
     if (backgroundSoundIsEnabled() || speechIsEnabled()) {
         colorPaletteSetTransitionCallback(soundContinueAll);

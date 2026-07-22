@@ -24,6 +24,8 @@
 #include "object.h"
 #include "party_member.h"
 #include "platform_compat.h"
+#include "pres_record.h"
+#include "presenter.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "random.h"
@@ -943,7 +945,7 @@ static int _ai_magic_hands(Object* critter, Object* item, int num)
                 snprintf(text, sizeof(text), "%s %s.", critterName, messageListItem.text);
             }
 
-            displayMonitorAddMessage(text);
+            presenter()->consoleMessage(text);
         }
     }
 
@@ -1205,10 +1207,14 @@ static void _ai_run_away(Object* a1, Object* a2)
         }
 
         if (actionPoints > 0) {
+            bool recording = combatMoveRecorded();
+            if (recording) presRecordAmbientBegin();
             reg_anim_begin(ANIMATION_REQUEST_RESERVED);
             _combatai_msg(a1, nullptr, AI_MESSAGE_TYPE_RUN, 0);
             animationRegisterRunToTile(a1, destination, a1->elevation, combatData->ap, 0);
-            if (reg_anim_end() == 0) {
+            int rc = reg_anim_end();
+            combatMoveRecordClose(recording, a1);
+            if (rc == 0) {
                 _combat_turn_run();
             }
         }
@@ -1252,9 +1258,13 @@ static int _ai_move_away(Object* a1, Object* a2, int a3)
         }
 
         if (actionPoints > 0) {
+            bool recording = combatMoveRecorded();
+            if (recording) presRecordAmbientBegin();
             reg_anim_begin(ANIMATION_REQUEST_RESERVED);
             animationRegisterMoveToTile(a1, destination, a1->elevation, actionPoints, 0);
-            if (reg_anim_end() == 0) {
+            int rc = reg_anim_end();
+            combatMoveRecordClose(recording, a1);
+            if (rc == 0) {
                 _combat_turn_run();
             }
         }
@@ -2377,6 +2387,8 @@ static int _ai_move_steps_closer(Object* critter, Object* target, int actionPoin
         return -1;
     }
 
+    bool recording = combatMoveRecorded();
+    if (recording) presRecordAmbientBegin();
     reg_anim_begin(ANIMATION_REQUEST_RESERVED);
 
     if (taunt) {
@@ -2421,7 +2433,18 @@ static int _ai_move_steps_closer(Object* critter, Object* target, int actionPoin
         _cai_retargetTileFromFriendlyFire(critter, target, &tile);
     }
 
-    if (actionPoints >= critterGetStat(critter, STAT_MAXIMUM_ACTION_POINTS) / 2 && artCritterFidShouldRun(critter->fid)) {
+    // [DEBUG trace, F2_TRACE_EVENTS] the run-vs-walk fork: RUN iff AP budget >= half max AP
+    // AND the art supports running. Dumps the exact inputs so a walk-vs-run divergence
+    // (denbus2 "land ruler" guard) can be traced to distance/AP/placement. Behavior-identical.
+    int _aiMaxApHalf = critterGetStat(critter, STAT_MAXIMUM_ACTION_POINTS) / 2;
+    bool _aiShouldRun = artCritterFidShouldRun(critter->fid);
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        fprintf(stderr, "[aimove] net=%d fid=0x%X base=0x%X fromTile=%d toTile=%d ap=%d maxApHalf=%d artRun=%d => %s\n",
+            critter->netId, critter->fid, critter->fid & 0xFFF, critter->tile, tile,
+            actionPoints, _aiMaxApHalf, _aiShouldRun ? 1 : 0,
+            (actionPoints >= _aiMaxApHalf && _aiShouldRun) ? "RUN" : "WALK");
+    }
+    if (actionPoints >= _aiMaxApHalf && _aiShouldRun) {
         if ((target->flags & OBJECT_MULTIHEX) != 0) {
             animationRegisterRunToObject(critter, target, actionPoints, 0);
         } else {
@@ -2435,7 +2458,9 @@ static int _ai_move_steps_closer(Object* critter, Object* target, int actionPoin
         }
     }
 
-    if (reg_anim_end() != 0) {
+    int rc = reg_anim_end();
+    combatMoveRecordClose(recording, critter);
+    if (rc != 0) {
         return -1;
     }
 
@@ -2738,9 +2763,8 @@ static int _ai_try_attack(Object* attacker, Object* defender)
                 }
 
                 if (remainingAmmoQuantity != -1) {
-                    int volume = _gsound_compute_relative_volume(attacker);
                     const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_READY, weapon, hitMode, nullptr);
-                    _gsound_play_sfx_file_volume(sfx, volume);
+                    presenter()->sfxPlayAt(sfx, attacker);
                     _ai_magic_hands(attacker, weapon, 5002);
 
                     // SFALL: Fix incorrect AP cost when AI reloads a weapon.
@@ -2766,9 +2790,8 @@ static int _ai_try_attack(Object* attacker, Object* defender)
                         }
 
                         if (remainingAmmoQuantity != -1) {
-                            int volume = _gsound_compute_relative_volume(attacker);
                             const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_READY, weapon, hitMode, nullptr);
-                            _gsound_play_sfx_file_volume(sfx, volume);
+                            presenter()->sfxPlayAt(sfx, attacker);
                             _ai_magic_hands(attacker, weapon, 5002);
 
                             // SFALL: Fix incorrect AP cost when AI reloads a
@@ -2785,9 +2808,8 @@ static int _ai_try_attack(Object* attacker, Object* defender)
                         }
                     }
                 } else {
-                    int volume = _gsound_compute_relative_volume(attacker);
                     const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_OUT_OF_AMMO, weapon, hitMode, nullptr);
-                    _gsound_play_sfx_file_volume(sfx, volume);
+                    presenter()->sfxPlayAt(sfx, attacker);
                     _ai_magic_hands(attacker, weapon, 5001);
 
                     if (_inven_unwield(attacker, 1) == 0) {
@@ -2929,9 +2951,8 @@ void aiAttemptWeaponReload(Object* critter, int animate)
             }
 
             if (rc != -1 && objectIsPartyMember(critter)) {
-                int volume = _gsound_compute_relative_volume(critter);
                 const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_READY, weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY, nullptr);
-                _gsound_play_sfx_file_volume(sfx, volume);
+                presenter()->sfxPlayAt(sfx, critter);
 
                 if (animate) {
                     _ai_magic_hands(critter, weapon, 5002);
@@ -3021,9 +3042,13 @@ int _cai_perform_distance_prefs(Object* a1, Object* a2)
 
     int tile = a1->tile;
     if (_cai_retargetTileFromFriendlyFire(a1, a2, &tile) == 0 && tile != a1->tile) {
+        bool recording = combatMoveRecorded();
+        if (recording) presRecordAmbientBegin();
         reg_anim_begin(ANIMATION_REQUEST_RESERVED);
         animationRegisterMoveToTile(a1, tile, a1->elevation, a1->data.critter.combat.ap, 0);
-        if (reg_anim_end() != 0) {
+        int rc = reg_anim_end();
+        combatMoveRecordClose(recording, a1);
+        if (rc != 0) {
             return -1;
         }
         _combat_turn_run();
@@ -3269,7 +3294,7 @@ int critterSetTeam(Object* obj, int team)
         if (outlineWasEnabled) {
             Rect rect;
             objectEnableOutline(obj, &rect);
-            tileWindowRefreshRect(&rect, obj->elevation);
+            presenter()->worldInvalidateRect(&rect, obj->elevation);
         }
     }
 
@@ -3374,7 +3399,7 @@ int _combatai_msg(Object* critter, Attack* attack, int type, int delay)
     snprintf(string, AI_MESSAGE_SIZE, "%s", messageListItem.text);
 
     // TODO: Get rid of casts.
-    return animationRegisterCallback(critter, (void*)type, (AnimationCallback*)_ai_print_msg, delay);
+    return animationRegisterCallback(critter, (void*)(intptr_t)type, (AnimationCallback*)_ai_print_msg, delay);
 }
 
 // 0x42B80C
@@ -3397,10 +3422,7 @@ static int _ai_print_msg(Object* critter, int type)
 
     AiPacket* ai = aiGetPacket(critter);
 
-    Rect rect;
-    if (textObjectAdd(critter, string, ai->font, ai->color, ai->outline_color, &rect) == 0) {
-        tileWindowRefreshRect(&rect, critter->elevation);
-    }
+    presenter()->floatText(critter, string, ai->font, ai->color, ai->outline_color);
 
     return 0;
 }

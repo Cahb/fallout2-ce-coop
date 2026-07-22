@@ -687,6 +687,18 @@ void interfaceFree()
         _inventoryButtonPressedFrmImage.unlock();
         _inventoryButtonNormalFrmImage.unlock();
 
+        // Release the end-turn AND end-combat buttons here too. They are normally
+        // freed on combat EXIT (interfaceBarEndButtonsHide), but if the client quits
+        // while they are still shown — e.g. exit during/around combat, which a
+        // network viewer hits easily — their static FrmImages stay locked, and their
+        // dtors then run at process exit AFTER artExit() has freed the cache: a
+        // heap-use-after-free in cacheUnlock. interfaceBarEndButtonsShow creates BOTH
+        // buttons, so both must be released here (the end-turn one was the second
+        // instance of this crash). Freeing inside interface teardown (before the
+        // cache is torn down) closes it. No-op if never shown (both self-guard).
+        endTurnButtonFree();
+        endCombatButtonFree();
+
         if (gInterfaceBarWindow != -1) {
             windowDestroy(gInterfaceBarWindow);
             gInterfaceBarWindow = -1;

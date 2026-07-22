@@ -2,6 +2,7 @@
 
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "actions.h"
@@ -9,11 +10,14 @@
 #include "art.h"
 #include "color.h"
 #include "combat_ai.h"
+#include "combat_intent.h"
+#include "combat_ui.h"
 #include "critter.h"
 #include "db.h"
 #include "debug.h"
 #include "display_monitor.h"
 #include "draw.h"
+#include "client_net.h" // clientViewerActive — combat-attack commit fork (§3.b)
 #include "elevator.h"
 #include "game.h"
 #include "game_mouse.h"
@@ -31,11 +35,16 @@
 #include "perk.h"
 #include "pipboy.h"
 #include "platform_compat.h"
+#include "pres_record.h"
+#include "presenter.h"
 #include "proto.h"
 #include "queue.h"
 #include "random.h"
 #include "scripts.h"
+#include "server_loop.h"
+#include "server_players.h"
 #include "settings.h"
+#include "sim_clock.h"
 #include "sfall_config.h"
 #include "sfall_global_scripts.h"
 #include "skill.h"
@@ -47,10 +56,6 @@
 #include "window_manager.h"
 
 namespace fallout {
-
-#define CALLED_SHOT_WINDOW_Y (20)
-#define CALLED_SHOT_WINDOW_WIDTH (504)
-#define CALLED_SHOT_WINDOW_HEIGHT (309)
 
 typedef enum DamageCalculationType {
     DAMAGE_CALCULATION_TYPE_VANILLA = 0,
@@ -96,14 +101,13 @@ static int aiInfoCopy(int srcIndex, int destIndex);
 static int _combatAIInfoSetLastMove(Object* object, int move);
 static void _combat_begin(Object* attacker);
 static void _combat_begin_extra(Object* attacker);
-static void _combat_update_critters_in_los(bool a1);
+void _combat_update_critters_in_los(bool a1);
 static void _combat_over();
 static void _combat_add_noncoms();
 static int _compare_faster(const void* critter1Ptr, const void* critter2Ptr);
 static void _combat_sequence_init(Object* attacker, Object* defender);
 static void _combat_sequence();
-static void combatAttemptEnd();
-static int _combat_input();
+void combatAttemptEnd();
 static void _combat_set_move_all();
 static int _combat_turn(Object* a1, bool a2);
 static bool _combat_should_end();
@@ -121,15 +125,8 @@ static void attackComputeDamage(Attack* attack, int ammoQuantity, int a3);
 static void _check_for_death(Object* a1, int a2, int* a3);
 static void _set_new_results(Object* a1, int a2);
 static void _damage_object(Object* a1, int damage, bool animated, int a4, Object* a5);
-static void combatCopyDamageAmountDescription(char* dest, size_t size, Object* critter_obj, int damage);
-static void combatAddDamageFlagsDescription(char* a1, int flags, Object* a3);
+static void _combat_apply_attack_results(bool animated);
 static void _combat_standup(Object* a1);
-static void _print_tohit(unsigned char* dest, int dest_pitch, int a3);
-static char* hitLocationGetName(Object* critter, int hitLocation);
-static void _draw_loc_off(int a1, int a2);
-static void _draw_loc_on_(int a1, int a2);
-static void _draw_loc_(int eventCode, int color);
-static int calledShotSelectHitLocation(Object* critter, int* hitLocation, int hitMode);
 
 static void criticalsInit();
 static void criticalsReset();
@@ -145,11 +142,8 @@ static void damageModCalculateGlovz(DamageCalculationContext* context);
 static int damageModGlovzDivRound(int dividend, int divisor);
 static void damageModCalculateYaam(DamageCalculationContext* context);
 
-// 0x500B50
-static char _a_1[] = ".";
-
 // 0x51093C
-static int _combat_turn_running = 0;
+int _combat_turn_running = 0;
 
 // 0x510940
 int _combatNumTurns = 0;
@@ -1882,49 +1876,19 @@ static const int _cf_table[WEAPON_CRITICAL_FAILURE_TYPE_COUNT][WEAPON_CRITICAL_F
     { 0, DAM_LOSE_TURN, DAM_RANDOM_HIT, DAM_DESTROY, DAM_EXPLODE | DAM_LOSE_TURN | DAM_ON_FIRE },
 };
 
-// 0x51802C
-static const int _call_ty[4] = {
-    122,
-    188,
-    251,
-    316,
-};
-
-// 0x51803C
-static const int _hit_loc_left[4] = {
-    HIT_LOCATION_HEAD,
-    HIT_LOCATION_EYES,
-    HIT_LOCATION_RIGHT_ARM,
-    HIT_LOCATION_RIGHT_LEG,
-};
-
-// 0x51804C
-static const int _hit_loc_right[4] = {
-    HIT_LOCATION_TORSO,
-    HIT_LOCATION_GROIN,
-    HIT_LOCATION_LEFT_ARM,
-    HIT_LOCATION_LEFT_LEG,
-};
-
 // 0x56D2B0
 static Attack _main_ctd;
 
 // combat.msg
 //
 // 0x56D368
-static MessageList gCombatMessageList;
-
-// 0x56D370
-static Object* gCalledShotCritter;
-
-// 0x56D374
-static int gCalledShotWindow;
+MessageList gCombatMessageList;
 
 // 0x56D378
 static int _combat_elev;
 
 // 0x56D37C
-static int _list_total;
+int _list_total;
 
 // Probably last who_hit_me of obj_dude
 //
@@ -1943,15 +1907,21 @@ static Object* _combat_turn_obj;
 static int _combat_highlight;
 
 // 0x56D390
-static Object** _combat_list;
+Object** _combat_list;
 
 // 0x56D394
 static int _list_com;
 
-// Experience received for killing critters during current combat.
+// Experience received for killing critters during current combat, PER PLAYER
+// ACTOR (index = slot). Vanilla accrued one scalar here and paid it out at
+// combat end; with N players the kill credit has to survive to the payout, so
+// the accrual is bucketed by the slot of whoever landed the kill.
 //
-// 0x56D398
-static int _combat_exps;
+// ⚠ ACCRUAL AND PAYOUT MUST CHANGE TOGETHER (PLAYER_SHEET_DESIGN.md §7 risk 2):
+// a slot-index bug here misattributes or silently zeroes XP, and there is no
+// headless N>1 oracle to catch it. Slot 0 stays the vanilla bucket, so with an
+// empty registry this is one scalar with extra zeros beside it.
+static int _combat_exps[kMaxPlayerActors];
 
 // bonus action points from BONUS_MOVE perk.
 //
@@ -2109,7 +2079,11 @@ int combatLoad(File* stream)
 
     if (fileReadInt32(stream, &_combat_turn_running) == -1) return -1;
     if (fileReadInt32(stream, &_combat_free_move) == -1) return -1;
-    if (fileReadInt32(stream, &_combat_exps) == -1) return -1;
+    // Slot 0 ONLY, so the on-disk shape is byte-identical. Extras' PENDING
+    // in-combat XP is not persisted: a save taken mid-fight pays out the host's
+    // bucket and drops theirs. Acceptable only because co-op saves do not exist
+    // yet — N-actor-izing this record is stage 4 (PLAYER_SHEET_DESIGN.md §5).
+    if (fileReadInt32(stream, &_combat_exps[0]) == -1) return -1;
     if (fileReadInt32(stream, &_list_com) == -1) return -1;
     if (fileReadInt32(stream, &_list_noncom) == -1) return -1;
     if (fileReadInt32(stream, &_list_total) == -1) return -1;
@@ -2213,13 +2187,20 @@ int combatLoad(File* stream)
 // 0x421244
 int combatSave(File* stream)
 {
+    // v1 policy: no save point exists mid-fight on the resumable server path, so a
+    // live session here would mean the roster/round cursor is being frozen without
+    // its machine state. Log loud rather than silently persist an inconsistent CSD.
+    if (combatSessionActive()) {
+        fprintf(stderr, "SERVER: WARNING — combatSave while a resumable combat session is active (unsupported mid-fight save).\n");
+    }
+
     if (fileWriteInt32(stream, gCombatState) == -1) return -1;
 
     if (!isInCombat()) return 0;
 
     if (fileWriteInt32(stream, _combat_turn_running) == -1) return -1;
     if (fileWriteInt32(stream, _combat_free_move) == -1) return -1;
-    if (fileWriteInt32(stream, _combat_exps) == -1) return -1;
+    if (fileWriteInt32(stream, _combat_exps[0]) == -1) return -1;
     if (fileWriteInt32(stream, _list_com) == -1) return -1;
     if (fileWriteInt32(stream, _list_noncom) == -1) return -1;
     if (fileWriteInt32(stream, _list_total) == -1) return -1;
@@ -2569,7 +2550,9 @@ static void _combat_begin(Object* attacker)
 
     if (!isInCombat()) {
         _combatNumTurns = 0;
-        _combat_exps = 0;
+        for (int slot = 0; slot < kMaxPlayerActors; slot++) {
+            _combat_exps[slot] = 0;
+        }
         _combat_list = nullptr;
         _list_total = objectListCreate(-1, _combat_elev, OBJ_TYPE_CRITTER, &_combat_list);
         _list_noncom = _list_total;
@@ -2606,14 +2589,14 @@ static void _combat_begin(Object* attacker)
 
         gCombatState |= COMBAT_STATE_0x01;
 
-        tileWindowRefresh();
+        presenter()->worldInvalidate();
         gameUiDisable(0);
-        gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
+        presenter()->cursorSet(MOUSE_CURSOR_WAIT_WATCH);
         _combat_ending_guy = nullptr;
         _combat_begin_extra(attacker);
         _caiTeamCombatInit(_combat_list, _list_total);
-        interfaceBarEndButtonsShow(true);
-        _gmouse_enable_scrolling();
+        presenter()->hudEndButtonsShow(true);
+        presenter()->scrollEnable();
 
         if (v1 != nullptr && !_isLoadingGame()) {
             int fid = buildFid(FID_TYPE(v1->fid),
@@ -2654,7 +2637,7 @@ static void _combat_begin_extra(Object* attacker)
 // NOTE: Inlined.
 //
 // 0x421D18
-static void _combat_update_critters_in_los(bool a1)
+void _combat_update_critters_in_los(bool a1)
 {
     int index;
 
@@ -2754,6 +2737,11 @@ void _combat_update_critter_outline_for_los(Object* critter, bool a2)
 // 0x421EFC
 static void _combat_over()
 {
+    // MP_PROTOCOL.md §2: combat ended. Emitted at the teardown choke (covers the
+    // normal end + _combat_over_from_load). No-op under null/client (byte-
+    // identical). See Presenter::combatExit.
+    presenter()->combatExit();
+
     if (_game_user_wants_to_quit == 0) {
         for (int index = 0; index < _list_com; index++) {
             Object* critter = _combat_list[index];
@@ -2801,22 +2789,31 @@ static void _combat_over()
         }
     }
 
-    tileWindowRefresh();
+    presenter()->worldInvalidate();
 
     int leftItemAction;
     int rightItemAction;
     interfaceGetItemActions(&leftItemAction, &rightItemAction);
-    interfaceUpdateItems(true, leftItemAction, rightItemAction);
+    presenter()->hudItems(true, leftItemAction, rightItemAction);
 
     gDude->data.critter.combat.ap = critterGetStat(gDude, STAT_MAXIMUM_ACTION_POINTS);
 
-    interfaceRenderActionPoints(0, 0);
+    presenter()->hudActionPoints(0, 0);
 
     if (_game_user_wants_to_quit == 0) {
-        _combat_give_exps(_combat_exps);
+        // Pay every bucket to its own earner. playerActorCount() is 1 with an
+        // empty registry, so this is the vanilla single call.
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            _combat_give_exps(_combat_exps[slot], playerActorAt(slot));
+        }
     }
 
-    _combat_exps = 0;
+    // Cleared unconditionally, and for EVERY slot — including on the
+    // wants-to-quit path that skips the payout above. A bucket that survives the
+    // end of a fight is XP paid twice at the end of the next one.
+    for (int slot = 0; slot < kMaxPlayerActors; slot++) {
+        _combat_exps[slot] = 0;
+    }
 
     gCombatState &= ~(COMBAT_STATE_0x01 | COMBAT_STATE_0x02);
     gCombatState |= COMBAT_STATE_0x02;
@@ -2834,8 +2831,8 @@ static void _combat_over()
 
     _combat_ai_over();
     gameUiEnable();
-    gameMouseSetMode(GAME_MOUSE_MODE_MOVE);
-    interfaceRenderArmorClass(true);
+    presenter()->cursorModeSet(GAME_MOUSE_MODE_MOVE);
+    presenter()->hudArmorClass(true);
 
     if (_critter_is_prone(gDude) && !critterIsDead(gDude) && _combat_ending_guy == nullptr) {
         queueRemoveEventsByType(gDude, EVENT_TYPE_KNOCKOUT);
@@ -2854,7 +2851,7 @@ void _combat_over_from_load()
 // Give exp for destroying critter.
 //
 // 0x4221B4
-void _combat_give_exps(int exp_points)
+void _combat_give_exps(int exp_points, Object* earner)
 {
     MessageListItem v7;
     MessageListItem v9;
@@ -2866,13 +2863,28 @@ void _combat_give_exps(int exp_points)
         return;
     }
 
-    if (critterIsDead(gDude)) {
+    // nullptr is "no subject in hand" — the vanilla meaning of this function.
+    Object* subject = earner != nullptr ? earner : gDude;
+
+    // A dead earner banks nothing. Per-actor now: one player dying used to
+    // cancel the whole party's payout, because this read gDude no matter who
+    // the XP belonged to.
+    if (critterIsDead(subject)) {
         return;
     }
 
     // SFALL: Display actual xp received.
     int xpGained;
-    pcAddExperience(exp_points, &xpGained);
+    pcAddExperience(exp_points, &xpGained, subject);
+
+    // The award above is per-actor; the LINE below is not. It is the host's
+    // console, so an extra earns silently until per-client message routing
+    // exists — which also spares the host a wall of "you earn N exp" lines for
+    // kills that were not theirs. Note the flavour roll is inside this gate, so
+    // an extra's payout consumes no RNG (it must not: the sim is shared).
+    if (subject != gDude) {
+        return;
+    }
 
     v7.num = 621; // %s you earn %d exp. points.
     if (!messageListGetItem(&gProtoMessageList, &v7)) {
@@ -2892,7 +2904,7 @@ void _combat_give_exps(int exp_points)
     }
 
     snprintf(text, sizeof(text), v7.text, v9.text, xpGained);
-    displayMonitorAddMessage(text);
+    presenter()->consoleMessage(text);
 }
 
 // 0x4222A8
@@ -3005,6 +3017,28 @@ static void _combat_sequence_init(Object* attacker, Object* defender)
         }
     }
 
+    // Place the remaining player actors right after the dude, so the humans form
+    // ONE contiguous block at the head of the round (MP_PROPOSAL Ch 8.2 / locked
+    // decision #6) instead of being scattered through the NPCs by initiative. Same
+    // swap idiom as the three blocks above. Being in _list_com (the count `next`
+    // feeds) is also what makes them TURN-TAKING combatants rather than bystanders.
+    // Inert with a single actor: the loop body only ever sees gDude, already placed.
+    for (int slot = 0; slot < playerActorCount(); slot++) {
+        Object* player = playerActorAt(slot);
+        if (player == nullptr || player == attacker || player == defender || player == gDude) {
+            continue;
+        }
+        for (int index = 0; index < _list_total; index++) {
+            if (_combat_list[index] == player) {
+                Object* temp = _combat_list[next];
+                _combat_list[index] = temp;
+                _combat_list[next] = player;
+                next += 1;
+                break;
+            }
+        }
+    }
+
     _list_com = next;
     _list_noncom -= next;
 
@@ -3041,10 +3075,14 @@ static void _combat_sequence()
         }
     }
 
-    // Move knocked out and disengaged critters to non-combatant list.
+    // Move knocked out and disengaged critters to non-combatant list. Vanilla
+    // exempts the dude (a KO'd player keeps its roster slot and burns the turn at
+    // BEGIN instead of vanishing from the round); every player actor gets that same
+    // exemption, or an extra would drop out of the fight the first time it is
+    // knocked down. Identical to `critter != gDude` with one actor.
     for (int index = 0; index < count; index++) {
         Object* critter = _combat_list[index];
-        if (critter != gDude) {
+        if (!playerActorIs(critter)) {
             if ((critter->data.critter.combat.results & DAM_KNOCKED_OUT) != 0
                 || critter->data.critter.combat.maneuver == CRITTER_MANEUVER_DISENGAGING) {
                 critter->data.critter.combat.maneuver &= ~CRITTER_MANEUVER_ENGAGING;
@@ -3066,13 +3104,43 @@ static void _combat_sequence()
         count = _list_com;
     }
 
+    // Re-form the contiguous player block the round-1 placement established
+    // (MP_PROPOSAL Ch 8.2): the Sequence sort above is initiative-only and would
+    // interleave the humans with NPCs from round 2 on. Players share the premade's
+    // Sequence stat, so their relative order under _compare_faster is a qsort tie =
+    // implementation-defined; ordering them by SLOT makes the round deterministic
+    // and gives the barrier one contiguous input window instead of several.
+    // Gated on N>1 so the single-player round order is untouched, byte for byte.
+    if (count != 0 && playerActorCount() > 1) {
+        int head = 0;
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            Object* player = playerActorAt(slot);
+            if (player == nullptr) {
+                continue;
+            }
+            for (int index = head; index < count; index++) {
+                if (_combat_list[index] == player) {
+                    // Rotate it up to `head`, shifting the critters it passes down
+                    // one slot. A rotation and not a swap: swapping would fling one
+                    // NPC to the far end and scramble the initiative order the sort
+                    // just established for everyone else.
+                    memmove(&_combat_list[head + 1], &_combat_list[head],
+                        sizeof(*_combat_list) * (index - head));
+                    _combat_list[head] = player;
+                    head += 1;
+                    break;
+                }
+            }
+        }
+    }
+
     _list_com = count;
 
     gameTimeAddSeconds(5);
 }
 
 // 0x422694
-static void combatAttemptEnd()
+void combatAttemptEnd()
 {
     if (_combat_elev == gDude->elevation) {
         MessageListItem messageListItem;
@@ -3087,7 +3155,7 @@ static void combatAttemptEnd()
                     if (!_combatai_want_to_stop(critter)) {
                         messageListItem.num = 103;
                         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                            displayMonitorAddMessage(messageListItem.text);
+                            presenter()->consoleMessage(messageListItem.text);
                         }
                         return;
                     }
@@ -3104,7 +3172,7 @@ static void combatAttemptEnd()
                     if (_combatai_want_to_join(critter)) {
                         messageListItem.num = 103;
                         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                            displayMonitorAddMessage(messageListItem.text);
+                            presenter()->consoleMessage(messageListItem.text);
                         }
                         return;
                     }
@@ -3117,72 +3185,42 @@ static void combatAttemptEnd()
     _caiTeamCombatExit();
 }
 
-// 0x4227DC
-void _combat_turn_run()
+// 0x4227F4
+// Ledger H-12: the player-turn end conditions — turn-end authority belongs to
+// the sim, not the input pump. True = stop pumping input (forced combat end,
+// incapacitated dude, quit, pending load).
+bool combatPlayerTurnShouldBreak()
 {
-    while (_combat_turn_running > 0) {
-        sharedFpsLimiter.mark();
-
-        _process_bk();
-
-        renderPresent();
-        sharedFpsLimiter.throttle();
+    if ((gCombatState & COMBAT_STATE_0x08) != 0) {
+        return true;
     }
+
+    if ((gDude->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
+        return true;
+    }
+
+    if (_game_user_wants_to_quit != 0) {
+        return true;
+    }
+
+    if (_combat_end_due_to_load != 0) {
+        return true;
+    }
+
+    return false;
 }
 
-// 0x4227F4
-static int _combat_input()
+// Ledger H-12: the AP-exhaustion turn-end rule.
+bool combatPlayerTurnOutOfAp()
 {
-    ScopedGameMode gm(GameMode::kPlayerTurn);
+    return gDude->data.critter.combat.ap <= 0 && _combat_free_move <= 0;
+}
 
-    while ((gCombatState & COMBAT_STATE_0x02) != 0) {
-        sharedFpsLimiter.mark();
-
-        if ((gCombatState & COMBAT_STATE_0x08) != 0) {
-            break;
-        }
-
-        if ((gDude->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
-            break;
-        }
-
-        if (_game_user_wants_to_quit != 0) {
-            break;
-        }
-
-        if (_combat_end_due_to_load != 0) {
-            break;
-        }
-
-        int keyCode = inputGetInput();
-
-        // SFALL: CombatLoopHook.
-        sfall_gl_scr_process_main();
-
-        if (_action_explode_running()) {
-            // NOTE: Uninline.
-            _combat_turn_run();
-        }
-
-        if (gDude->data.critter.combat.ap <= 0 && _combat_free_move <= 0) {
-            break;
-        }
-
-        if (keyCode == KEY_SPACE) {
-            break;
-        }
-
-        if (keyCode == KEY_RETURN) {
-            combatAttemptEnd();
-        } else {
-            _scripts_check_state_in_combat();
-            gameHandleKey(keyCode, true);
-        }
-
-        renderPresent();
-        sharedFpsLimiter.throttle();
-    }
-
+// Ledger H-12: resolve the player's turn once the pump stopped — consumes the
+// COMBAT_STATE_0x08 end-combat handshake set by combatAttemptEnd. Returns -1
+// when the player's combat participation is over, 0 when only the turn ended.
+int combatPlayerTurnResolve()
+{
     int v4 = _game_user_wants_to_quit;
     if (_game_user_wants_to_quit == 1) {
         _game_user_wants_to_quit = 0;
@@ -3226,16 +3264,29 @@ static int _combat_turn(Object* obj, bool a2)
 {
     _combat_turn_obj = obj;
 
+    // MP_PROTOCOL.md §2: this combatant's turn begins. AP was reset for the round
+    // by _combat_set_move_all; deadline stubbed 0 (no turn timer in v1). No-op
+    // under null/client (byte-identical). See Presenter::turnStart.
+    presenter()->turnStart(obj, playerActorIs(obj), obj->data.critter.combat.ap, 0);
+
     attackInit(&_main_ctd, obj, nullptr, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
 
     if ((obj->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
         obj->data.critter.combat.results &= ~DAM_LOSE_TURN;
     } else {
+        // Free move belongs to the actor whose turn is STARTING, not to the host:
+        // this runs once per player actor's turn, and _combat_free_move is spent
+        // by that actor. Reading the host's Bonus Move handed every extra the
+        // host's free tiles (or none, when the host had the perk and the extra
+        // did not). playerActorIs IS `obj == gDude` with an empty registry.
+        if (playerActorIs(obj)) {
+            _combat_free_move = 2 * perkGetRank(obj, PERK_BONUS_MOVE);
+        }
+
         if (obj == gDude) {
             keyboardReset();
-            interfaceRenderArmorClass(true);
-            _combat_free_move = 2 * perkGetRank(gDude, PERK_BONUS_MOVE);
-            interfaceRenderActionPoints(gDude->data.critter.combat.ap, _combat_free_move);
+            presenter()->hudArmorClass(true);
+            presenter()->hudActionPoints(gDude->data.critter.combat.ap, _combat_free_move);
         } else {
             soundContinueAll();
         }
@@ -3263,7 +3314,7 @@ static int _combat_turn(Object* obj, bool a2)
 
             if (obj == gDude) {
                 gameUiEnable();
-                _gmouse_3d_refresh();
+                presenter()->cursorRefresh();
 
                 if (_gcsd != nullptr) {
                     _combat_attack_this(_gcsd->defender);
@@ -3273,7 +3324,7 @@ static int _combat_turn(Object* obj, bool a2)
                     gCombatState |= 0x02;
                 }
 
-                interfaceBarEndButtonsRenderGreenLights();
+                presenter()->hudEndButtonsGreen();
 
                 // NOTE: Uninline.
                 _combat_update_critters_in_los(false);
@@ -3284,19 +3335,19 @@ static int _combat_turn(Object* obj, bool a2)
 
                 if (_combat_input() == -1) {
                     gameUiDisable(1);
-                    gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
+                    presenter()->cursorSet(MOUSE_CURSOR_WAIT_WATCH);
                     obj->data.critter.combat.damageLastTurn = 0;
-                    interfaceBarEndButtonsRenderRedLights();
+                    presenter()->hudEndButtonsRed();
                     _combat_outline_off();
-                    interfaceRenderActionPoints(-1, -1);
-                    interfaceRenderArmorClass(true);
+                    presenter()->hudActionPoints(-1, -1);
+                    presenter()->hudArmorClass(true);
                     _combat_free_move = 0;
                     return -1;
                 }
             } else {
                 Rect rect;
                 if (objectEnableOutline(obj, &rect) == 0) {
-                    tileWindowRefreshRect(&rect, obj->elevation);
+                    presenter()->worldInvalidateRect(&rect, obj->elevation);
                 }
 
                 _combat_ai(obj, _gcsd != nullptr ? _gcsd->defender : nullptr);
@@ -3308,23 +3359,34 @@ static int _combat_turn(Object* obj, bool a2)
 
         if (obj == gDude) {
             gameUiDisable(1);
-            gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
-            interfaceBarEndButtonsRenderRedLights();
+            presenter()->cursorSet(MOUSE_CURSOR_WAIT_WATCH);
+            presenter()->hudEndButtonsRed();
             _combat_outline_off();
-            interfaceRenderActionPoints(-1, -1);
+            presenter()->hudActionPoints(-1, -1);
             _combat_turn_obj = nullptr;
-            interfaceRenderArmorClass(true);
+            presenter()->hudArmorClass(true);
             _combat_turn_obj = gDude;
         } else {
             Rect rect;
             if (objectDisableOutline(obj, &rect) == 0) {
-                tileWindowRefreshRect(&rect, obj->elevation);
+                presenter()->worldInvalidateRect(&rect, obj->elevation);
             }
         }
     }
 
+    // -1 here ENDS THE FIGHT (combatSessionAfterTurn routes it straight to kEnding),
+    // so with N players this vanilla "the player died -> end combat" check has to be
+    // read as "ALL players are down". It runs at the tail of EVERY _combat_turn — AI
+    // turns included — which is the resumable-session path an extra's fight flows
+    // through, so a raw gDude test tore the fight down the instant any enemy acted
+    // after the host died, even with other players still standing (owner-observed
+    // 2026-07: P1 dead, P2 provoking, combat ends anyway). Mirrors the ALREADY-
+    // generalized player-turn epilogue in combatSessionDudeFinalize — this is its
+    // AI-turn sibling, the half that commit "any living player keeps combat alive"
+    // missed. Single-actor byte-identical: the DAM_DEAD guard is vanilla's exact test
+    // and "any player alive" IS "gDude alive" with one registered actor.
     if ((gDude->data.critter.combat.results & DAM_DEAD) != 0) {
-        return -1;
+        return playerActorAnyAlive() ? 0 : -1;
     }
 
     if (obj != gDude || _combat_elev == gDude->elevation) {
@@ -3342,9 +3404,18 @@ static bool _combat_should_end()
         return true;
     }
 
+    // Co-op: ANY living player actor keeps combat alive — not gDude specifically.
+    // Vanilla searched for gDude (the one player) and ended combat when it was no longer
+    // in the active list. With N bodies sharing one character sheet, the host/gDude dying
+    // drops it from _list_com and ended the fight for every OTHER player still standing
+    // (owner-observed 2026-07: P1 dead, combat ends the moment P2 ends/skips its turn).
+    // Search for any player actor instead; gDude stays in the OR so single-player is
+    // byte-identical (SP: playerActorCount()==1 and the sole player actor IS gDude, so
+    // this finds it in exactly the same slot — goldens unchanged). The deeper death/
+    // respawn + all-players-down handling remains its own track (co-op elephants).
     int index;
     for (index = 0; index < _list_com; index++) {
-        if (_combat_list[index] == gDude) {
+        if (_combat_list[index] == gDude || playerActorIs(_combat_list[index])) {
             break;
         }
     }
@@ -3375,23 +3446,727 @@ static bool _combat_should_end()
 }
 
 // 0x422D2C
+// SERVER-ONLY combat deadlock watchdog. The headless server auto-ends the dude's
+// turn (combat_drain.cc: an empty intent queue resolves the turn immediately), so a
+// fight with no human to land a killing blow rests entirely on the AI. On the two
+// Monty-Python special-encounter maps (rndholy2 / rnduvilg) three+ mutually-hostile
+// teams close distance but never kill, and _combat_should_end() (which fires only on
+// a death) can never trip — _combat() spins forever. This fingerprint (roster size +
+// total combatant HP) lets the loop detect "no state change for N turns" and break
+// cleanly into _combat_over(). Purely a server guardrail: gated on serverLoopActive()
+// so the client and every golden stay byte-identical. Not the real fix — the resumable
+// per-tick combat turn (SERVER_LOOP_DESIGN.md, OPEN RISK a) is.
+static const int kServerCombatStuckTurnLimit = 300;
+
+static unsigned int _combat_server_progress_fingerprint()
+{
+    unsigned int fp = (unsigned int)_list_com;
+    for (int i = 0; i < _list_com; i++) {
+        // +bias keeps negative (dying/dead) HP contributing distinctly.
+        fp = fp * 131u + (unsigned int)(critterGetHitPoints(_combat_list[i]) + 100000);
+    }
+    return fp;
+}
+
+// Resumable-combat seam (SERVER_LOOP_DESIGN.md OPEN RISK a). The body of
+// _combat()'s round loop is broken into named per-beat steps so a later
+// server-side state machine can drive them one beat at a time. P1 is a pure
+// mechanical lift — behavior is byte-identical to the original inline loop.
+//
+// CombatRound carries the state that used to be stack-local across the round
+// do-while: the roster cursor plus the server deadlock-watchdog trio.
+//
+// P2 NOTE: _gcsd remains a raw pointer to the caller's stack CombatStartData
+// (lifetime unchanged in P1). A tick-resumable turn cannot hold that pointer
+// across server ticks — P2 must store a by-value copy of *csd here and point
+// _gcsd at it.
+struct CombatRound {
+    // Whether combat was already active on entry (save loaded mid-combat).
+    bool wasInCombat;
+    // Cursor into _combat_list; -1 means the forced dude turn ended combat.
+    int curIndex;
+    // Server watchdog: previous progress fingerprint / no-progress turn count /
+    // whether a fingerprint has been recorded yet.
+    unsigned int serverStuckPrev;
+    int serverStuckTurns;
+    bool serverStuckInit;
+};
+
+// Outcome of running the roster's turns for one round.
+enum class CombatTurnRun {
+    // Every combatant in [curIndex.._list_com) took a turn.
+    kAllRan,
+    // A turn ended combat (_combat_turn == -1 or _combat_ending_guy set); the
+    // round loop must break without advancing the sequence.
+    kEndingEarly,
+};
+
+// Round-start beat: refresh every combatant's movement allowance.
+static void combatRoundBegin()
+{
+    _combat_set_move_all();
+}
+
+// Turn beat: run each remaining combatant's turn from round.curIndex onward,
+// breaking on a turn that ends combat. Clears _gcsd after the first turn (the
+// initiating attack has been consumed). Returns whether combat is ending.
+static CombatTurnRun combatRunTurnsFrom(CombatRound& round)
+{
+    for (; round.curIndex < _list_com; round.curIndex++) {
+        if (_combat_turn(_combat_list[round.curIndex], false) == -1) {
+            break;
+        }
+
+        if (_combat_ending_guy != nullptr) {
+            break;
+        }
+
+        _gcsd = nullptr;
+    }
+
+    // The for either ran to completion (curIndex == _list_com) or broke early
+    // (curIndex < _list_com), which is exactly the original round-loop break.
+    return round.curIndex < _list_com ? CombatTurnRun::kEndingEarly : CombatTurnRun::kAllRan;
+}
+
+// Round-end beat: advance the combat sequence, reset the cursor, bump the turn
+// counter, then run the server deadlock watchdog. Returns true if the watchdog
+// forced the round loop to break.
+static bool combatRoundEnd(CombatRound& round)
+{
+    _combat_sequence();
+    round.curIndex = 0;
+    _combatNumTurns += 1;
+
+    if (serverLoopActive()) {
+        unsigned int fp = _combat_server_progress_fingerprint();
+        if (round.serverStuckInit && fp == round.serverStuckPrev) {
+            if (++round.serverStuckTurns >= kServerCombatStuckTurnLimit) {
+                debugPrint("\nSERVER: combat made no progress for %d turns — force-ending deadlocked fight.", kServerCombatStuckTurnLimit);
+                return true;
+            }
+        } else {
+            round.serverStuckTurns = 0;
+        }
+        round.serverStuckPrev = fp;
+        round.serverStuckInit = true;
+    }
+
+    return false;
+}
+
+// Post-loop teardown beat, preserving the _combat_end_due_to_load branch.
+static void combatTeardown()
+{
+    if (_combat_end_due_to_load) {
+        gameUiEnable();
+        presenter()->cursorModeSet(GAME_MOUSE_MODE_MOVE);
+    } else {
+        presenter()->scrollDisable();
+        presenter()->hudEndButtonsHide(true);
+        presenter()->scrollEnable();
+        _combat_over();
+        scriptsExecMapUpdateProc();
+    }
+
+    _combat_end_due_to_load = 0;
+
+    if (_game_user_wants_to_quit == 1) {
+        _game_user_wants_to_quit = 0;
+    }
+}
+
+// ===========================================================================
+// Resumable server-combat session machine (P2; F2_SERVER_RESUMABLE_COMBAT).
+//
+// With the gate ON (server loop only), _combat() sets up a session and RETURNS
+// instead of draining the whole fight inside one scriptsHandleRequests call;
+// serverTick then advances the session one beat at a time. AI turns run to
+// completion (one AI turn per beat); the player-actor block's turn WAITS across
+// beats for intents, gated by a per-action idle timer. Gate OFF, _combat() runs
+// the legacy nested loop above, byte-identical (the golden suite is the proof).
+//
+// The machine lives here as file-static so it can drive combat.cc's statics
+// (the roster _combat_list/_list_com, _gcsd, _combat_ending_guy, the dude-turn
+// internals) directly — the same precedent as the server watchdog, which is
+// already file-local and gated on serverLoopActive().
+// ===========================================================================
+
+// Gate: server loop active AND F2_SERVER_RESUMABLE_COMBAT=1. Env cached like
+// server_anim.cc's smoothWalkEnabled(); serverLoopActive() checked live.
+static bool combatResumableEnabled()
+{
+    static bool enabled = [] {
+        const char* v = getenv("F2_SERVER_RESUMABLE_COMBAT");
+        return v != nullptr && strcmp(v, "1") == 0;
+    }();
+    return serverLoopActive() && enabled;
+}
+
+// F2_SERVER_TURN_WAIT=1 forces the player barrier to wait even with no claimant
+// and no pending intents (headless gate driver). Cached.
+static bool combatResumableTurnWaitForced()
+{
+    static bool forced = [] {
+        const char* v = getenv("F2_SERVER_TURN_WAIT");
+        return v != nullptr && strcmp(v, "1") == 0;
+    }();
+    return forced;
+}
+
+// FLAT human input budget in sim-ms (F2_SERVER_TURN_IDLE_MS, default 60000). This is
+// the time a HUMAN gets to act once their turn is actually ON SCREEN. It is NOT the whole
+// deadline: the AI-animation backlog that must present before the human sees their turn
+// is added on top at turn-begin (serverTakePresentationCostMs). Any interactive action
+// resets the deadline back to this flat base — there is no further animation to wait on
+// after a single move/attack/inventory action (COMBAT_CLIENT_DESIGN.md §6 S6).
+static int combatResumableBaseIdleMs()
+{
+    static int budget = [] {
+        const char* v = getenv("F2_SERVER_TURN_IDLE_MS");
+        int ms = v != nullptr ? atoi(v) : 60000;
+        return ms > 0 ? ms : 60000;
+    }();
+    return budget;
+}
+
+// Rough per-attack presentation estimate (sim-ms) added to the AI backlog for each AI
+// swing: swing + hit reaction + (often) a death fall. Deliberately generous — the failure
+// we are avoiding is timing the player out BEFORE their turn is on screen, so a slight
+// over-estimate (a little extra human time) is the safe direction.
+static const unsigned int kAttackPresentationEstimateMs = 1500;
+
+enum class CombatSessionState {
+    kInactive,
+    kRoundBegin,
+    kTurns,
+    kPlayerTurn,
+    kRoundEnd,
+    kEnding,
+};
+
+struct CombatSession {
+    bool active = false;
+    CombatSessionState state = CombatSessionState::kInactive;
+    CombatRound round {};
+    // By-value copy of the initiating CombatStartData; _gcsd points HERE. The
+    // caller's *csd is a stack/soon-freed buffer (scripts.cc memsets gScriptsCSD
+    // the instant _combat returns; _combat_attack_this builds a stack CSD), which
+    // a beat-spanning turn cannot hold (P1 flagged this).
+    CombatStartData csd {};
+    // Player-turn barrier state. ONE set of fields is enough for N players
+    // (MP_PROPOSAL Ch 8.3): the roster is sequential, so exactly one player turn
+    // is ever live, and every field here resets at that turn's BEGIN.
+    bool playerTurnBegun = false;
+    int idleBudgetMs = 0;
+    unsigned int lastActionSimTs = 0; // simClockNow() of the last committed action
+    // Registry slot of the player whose turn the barrier is holding. Set when
+    // kTurns lands on a player actor; it is what the pump, the wait test and the
+    // idle timeout mean by "the player". 0 == the host == the only value reachable
+    // with a single actor.
+    int playerTurnSlot = 0;
+};
+
+static CombatSession gCombatSession;
+
+bool combatSessionActive()
+{
+    return gCombatSession.active;
+}
+
+void combatSessionRearmIdleTimer()
+{
+    // The player is demonstrably still there — they just did something the intent
+    // queue never sees. Opening the inventory screen is the case this exists for:
+    // it is a wire verb, not a combat intent, so it does not reach the pump, and
+    // without this a player browsing their pack for longer than the idle budget
+    // would have their turn force-ended out from under an open screen.
+    gCombatSession.lastActionSimTs = simClockNow();
+}
+
+// Which combatants get the HUMAN barrier instead of an AI turn. THE generalized
+// "obj == gDude" (MP_PROPOSAL Ch 8.3): with an empty registry playerActorIs is
+// literally that comparison, so single-player behavior is unchanged, and every
+// registered extra now takes its own turn instead of being played by the AI.
+static bool combatSessionIsPlayerActor(Object* obj)
+{
+    return playerActorIs(obj);
+}
+
+// The barrier only WAITS when there is someone to wait for: THIS actor's client
+// is connected, THIS actor has intents queued, or the headless force knob is set.
+// Otherwise the turn ends immediately = the legacy auto-end-turn, so a resumable
+// server with no client never stalls a fight.
+//
+// Per-slot, not "any claimant": an unbound or disconnected body must not hold the
+// round open for a human who is not there (MP_PROPOSAL Ch 6.3), and one player
+// must not keep another's turn alive. serverSessionForSlot reports 0 (unbound) on
+// every client/probe/golden path, where there is no control plane at all — and
+// with one actor slot 0 IS the old single claimant, so this is the same test it
+// replaced.
+static bool combatSessionShouldWait(const CombatSession& s)
+{
+    return serverSessionForSlot(s.playerTurnSlot) != 0
+        || combatIntentPendingForSlot(s.playerTurnSlot)
+        || combatResumableTurnWaitForced();
+}
+
+static bool combatSessionIdleExpired(const CombatSession& s)
+{
+    return simClockNow() - s.lastActionSimTs >= (unsigned int)s.idleBudgetMs;
+}
+
+// The dude-turn tail shared by every non-error player-turn exit: the [_combat_
+// turn_run + HUD epilogue] block and the final dude-dead/elevation checks. runRun
+// bundles _combat_turn_run + the epilogue (they always co-occur inside _combat_
+// turn's else-block; the KO/lose-turn skip runs neither). CROSS-PIN: _combat_turn
+// (obj==gDude) tail. The HUD/cursor presenter calls are no-ops under the null/
+// network presenter (it overrides only combatEnter/Exit/turnStart/attackResult/
+// console), kept verbatim for fidelity.
+static int combatSessionDudeFinalize(bool runRun, Object* actor)
+{
+    if (runRun) {
+        // NOTE: Uninline.
+        _combat_turn_run();
+
+        gameUiDisable(1);
+        presenter()->cursorSet(MOUSE_CURSOR_WAIT_WATCH);
+        presenter()->hudEndButtonsRed();
+        _combat_outline_off();
+        presenter()->hudActionPoints(-1, -1);
+        _combat_turn_obj = nullptr;
+        presenter()->hudArmorClass(true);
+        _combat_turn_obj = actor;
+    }
+
+    // -1 here means THE FIGHT IS OVER, not "this turn is over" (the caller feeds it
+    // to combatSessionAfterTurn, which goes straight to kEnding) — so with N players
+    // both of vanilla's dude-shaped end conditions have to be read as questions
+    // about the PLAYERS COLLECTIVELY, or one casualty would end everyone's fight
+    // (MP_PROPOSAL Ch 9.4). Single-actor behavior is untouched: with one player,
+    // "any player alive" IS "the dude is alive".
+    if ((actor->data.critter.combat.results & DAM_DEAD) != 0) {
+        return playerActorAnyAlive() ? 0 : -1;
+    }
+
+    if (_combat_elev == actor->elevation) {
+        _combat_free_move = 0;
+        return 0;
+    }
+
+    // Off the combat elevation. Vanilla ends the FIGHT — only the dude could ever
+    // be here. For an EXTRA that should end only their own participation, so drop
+    // them out of the round rather than ending everyone's fight. Nothing can
+    // actually produce this for an extra yet (in-combat elevation change is not
+    // wired), so the host keeps vanilla's answer rather than us inventing
+    // semantics for it. Revisit with intra-map elevation follow.
+    return playerActorSlotOf(actor) == 0 ? -1 : 0;
+}
+
+enum class CombatPlayerPhase {
+    kPump, // proceed to the cross-beat intent pump
+    kFinalizeNoRun, // KO/lose-turn skip: final checks only (no _combat_turn_run)
+    kFinalizeWithRun, // scriptOverrides: _combat_turn_run + epilogue + final checks
+    kEndCombat, // quit requested mid-script: turn returns -1
+};
+
+// Player-turn BEGIN — the dude branch of _combat_turn up to (not including) the
+// input pump, run once when the barrier is entered. CROSS-PIN: _combat_turn
+// (obj==gDude, a2==false). A faithful copy, NOT shared, so the legacy monolith
+// stays byte-identical; the one deliberate change is turnStart's deadlineMs =
+// the idle budget (MP_PROTOCOL §7d: the reserved slot now has its producer).
+static CombatPlayerPhase combatSessionPlayerTurnBegin(CombatSession& s, Object* obj)
+{
+    _combat_turn_obj = obj;
+
+    // isPlayer=true is right for every actor here by construction — the barrier is
+    // only entered for registry members. Each viewer decides "is it MY turn" by
+    // matching the netId against its own actor, so the other players' clients read
+    // this as "someone else is acting" and lock their input.
+    presenter()->turnStart(obj, true, obj->data.critter.combat.ap, s.idleBudgetMs);
+
+    attackInit(&_main_ctd, obj, nullptr, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+
+    if ((obj->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
+        obj->data.critter.combat.results &= ~DAM_LOSE_TURN;
+        return CombatPlayerPhase::kFinalizeNoRun;
+    }
+
+    keyboardReset();
+    presenter()->hudArmorClass(true);
+    _combat_free_move = 2 * perkGetRank(obj, PERK_BONUS_MOVE);
+    presenter()->hudActionPoints(obj->data.critter.combat.ap, _combat_free_move);
+
+    bool scriptOverrides = false;
+    if (obj->sid != -1) {
+        scriptSetObjects(obj->sid, nullptr, nullptr);
+        scriptSetFixedParam(obj->sid, 4);
+        scriptExecProc(obj->sid, SCRIPT_PROC_COMBAT);
+
+        Script* scr;
+        if (scriptGetScript(obj->sid, &scr) != -1) {
+            scriptOverrides = scr->scriptOverrides;
+        }
+
+        if (_game_user_wants_to_quit == 1) {
+            return CombatPlayerPhase::kEndCombat;
+        }
+    }
+
+    if (scriptOverrides) {
+        return CombatPlayerPhase::kFinalizeWithRun;
+    }
+
+    if (_critter_is_prone(obj)) {
+        _combat_standup(obj);
+    }
+
+    gameUiEnable();
+    presenter()->cursorRefresh();
+
+    // The initiating attack is replayed ONCE, by the player who threw it. Without
+    // the attacker test it fires on whichever player's turn comes first — so an
+    // extra could start the round by swinging at the host's chosen target for free.
+    // s.csd is the by-value copy _gcsd points at, so csd.attacker is stable across
+    // beats (MP_PROPOSAL Ch 8.3).
+    if (_gcsd != nullptr && (s.csd.attacker == nullptr || s.csd.attacker == obj)) {
+        _combat_attack_this(_gcsd->defender);
+    }
+
+    gCombatState |= 0x02;
+
+    presenter()->hudEndButtonsGreen();
+
+    // NOTE: Uninline.
+    _combat_update_critters_in_los(false);
+
+    if (_combat_highlight != 0) {
+        _combat_outline_on();
+    }
+
+    // _combat_input holds kPlayerTurn for the pump's duration (ScopedGameMode in
+    // combat_drain.cc); the session's pump spans beats, so enter it here and exit
+    // it when the pump resolves. Mirrors the legacy scope exactly.
+    GameMode::enterGameMode(GameMode::kPlayerTurn);
+    return CombatPlayerPhase::kPump;
+}
+
+// Forward decl: the roster-cursor advance shared by AI and player turns.
+static void combatSessionAfterTurn(CombatSession& s, int rc);
+
+enum class CombatPlayerBeat {
+    kWait, // barrier is still waiting on the player — yield the beat
+    kTurnEnded, // the player turn resolved; s.state was advanced
+};
+
+// One beat of the player-actor barrier. On first entry runs BEGIN; then each beat
+// pumps this beat's queued intents (combatServerPumpIntents, shared with the
+// legacy _combat_input). On a drained queue with someone to wait for and idle
+// budget remaining it yields (kWait); otherwise the turn ends exactly as
+// _combat_input's return path — combatPlayerTurnResolve()'s -1 = combat over.
+static CombatPlayerBeat combatSessionAdvancePlayerTurn(CombatSession& s)
+{
+    Object* actor = playerActorAt(s.playerTurnSlot);
+    if (actor == nullptr) {
+        actor = gDude; // unregistered == single-player == the host
+    }
+
+    // BIND gDude TO THE ACTOR FOR THE WHOLE BEAT. Everything below reaches core
+    // code that asks "is this the player?" by comparing against gDude — the perk
+    // and AP reads here, the attack/move entry points in the pump, the scripts
+    // SCRIPT_PROC_COMBAT runs, combatPlayerTurnShouldBreak/OutOfAp, the resolve
+    // tail. Threading an actor parameter through all of that is the post-v1
+    // refactor (MP_PROPOSAL Ch 7.2); the scope is what makes an extra player's
+    // turn act on their own body today. It must be held per BEAT, not per turn:
+    // a player turn spans beats, and nothing may leak the swap past this return.
+    ServerActorScope scope(actor);
+
+    if (!s.playerTurnBegun) {
+        s.playerTurnBegun = true;
+        // The deadline = flat human budget + the AI backlog the client still has to
+        // animate before this turn is on screen (§6 S6). serverTakePresentationCostMs
+        // reads+clears the estimate the AI turns since our last turn accumulated.
+        s.idleBudgetMs = combatResumableBaseIdleMs() + (int)serverTakePresentationCostMs();
+        s.lastActionSimTs = simClockNow(); // arm the idle timer
+
+        switch (combatSessionPlayerTurnBegin(s, actor)) {
+        case CombatPlayerPhase::kEndCombat:
+            combatSessionAfterTurn(s, -1);
+            return CombatPlayerBeat::kTurnEnded;
+        case CombatPlayerPhase::kFinalizeNoRun:
+            combatSessionAfterTurn(s, combatSessionDudeFinalize(false, actor));
+            return CombatPlayerBeat::kTurnEnded;
+        case CombatPlayerPhase::kFinalizeWithRun:
+            combatSessionAfterTurn(s, combatSessionDudeFinalize(true, actor));
+            return CombatPlayerBeat::kTurnEnded;
+        case CombatPlayerPhase::kPump:
+            break; // fall through to pump this same beat
+        }
+    }
+
+    CombatPumpOutcome outcome = combatServerPumpIntents(s.playerTurnSlot);
+    if (outcome.consumed > 0) {
+        s.lastActionSimTs = simClockNow(); // any committed action rearms the timer
+        // An interactive action has no AI-animation backlog behind it, so the deadline
+        // drops back to the FLAT human budget — no headroom (§6 S6).
+        s.idleBudgetMs = combatResumableBaseIdleMs();
+    }
+
+    // A drained queue means "wait for the human's next action" ONLY when the turn is
+    // still live. If the turn is already forced to break — the end-combat handshake is
+    // armed (combatAttemptEnd set COMBAT_STATE_0x08 this beat), the dude was knocked
+    // out / lost the turn, or a quit/load is pending — we must fall through to
+    // combatPlayerTurnResolve() now, exactly as legacy _combat_input does the moment
+    // its pump loop breaks. Without the !combatPlayerTurnShouldBreak() guard the
+    // barrier would return kWait every beat (a connected claimant makes
+    // combatSessionShouldWait() always true), stranding the 0x08 handshake UNCONSUMED
+    // until a second cendcombat press re-enters the pump and trips shouldBreak there —
+    // the "end-combat takes two presses" bug (confirmed live: attemptEnd ARMED 0x08
+    // then N beats of kWait). Resolve() consumes 0x08 and returns -1 = combat over.
+    if (outcome.stop == CombatPumpStop::kQueueDrained
+        && !combatPlayerTurnShouldBreak()
+        && combatSessionShouldWait(s)) {
+        if (!combatSessionIdleExpired(s)) {
+            return CombatPlayerBeat::kWait; // someone to wait for, budget remains
+        }
+        fprintf(stderr, "SERVER: resumable combat — player turn idle timeout (%d ms), ending turn.\n",
+            s.idleBudgetMs);
+    }
+
+    // Turn ends. combatPlayerTurnResolve() mirrors _combat_input's return: -1 =
+    // the player's combat participation is over (it runs _scripts_check_state_in_
+    // combat on the 0-path, kept). The -1 branch matches _combat_turn's
+    // `_combat_input()==-1` epilogue (damageLastTurn/_combat_free_move reset,
+    // no _combat_turn_run).
+    int inputRc = combatPlayerTurnResolve();
+    GameMode::exitGameMode(GameMode::kPlayerTurn); // _combat_input's scope ends here
+    if (inputRc == -1) {
+        actor->data.critter.combat.damageLastTurn = 0;
+        _combat_outline_off(); // no-op headless (matches _combat_turn's -1 branch)
+        _combat_free_move = 0;
+        combatSessionAfterTurn(s, -1);
+    } else {
+        combatSessionAfterTurn(s, combatSessionDudeFinalize(true, actor));
+    }
+    return CombatPlayerBeat::kTurnEnded;
+}
+
+// After a combatant's turn (AI or player): mirror the per-turn break logic of
+// combatRunTurnsFrom — rc==-1 or a set _combat_ending_guy ends the fight;
+// otherwise the initiating attack is consumed (_gcsd cleared) and the roster
+// cursor advances. CROSS-PIN: combatRunTurnsFrom (legacy inline round loop).
+static void combatSessionAfterTurn(CombatSession& s, int rc)
+{
+    if (rc == -1 || _combat_ending_guy != nullptr) {
+        s.state = CombatSessionState::kEnding;
+        return;
+    }
+    _gcsd = nullptr;
+    s.round.curIndex++;
+    s.state = CombatSessionState::kTurns;
+}
+
+// Set up a new session: the exact _combat() pre-loop work, then leave the machine
+// at kRoundBegin (or kEnding if the save-load forced dude turn already ended it).
+static void combatSessionBegin(CombatStartData* csd)
+{
+    CombatSession& s = gCombatSession;
+    s = CombatSession();
+    s.active = true;
+    s.idleBudgetMs = combatResumableBaseIdleMs();
+    // Discard any presentation-cost residue from a prior fight so this one's first
+    // player turn measures only its own AI backlog.
+    serverTakePresentationCostMs();
+
+    CombatRound& round = s.round;
+    round.wasInCombat = (gCombatState & 0x01) != 0;
+
+    _combat_begin(nullptr);
+    presenter()->combatEnter(csd != nullptr ? csd->attacker : nullptr);
+
+    if (round.wasInCombat) {
+        // Save loaded mid-combat: force the dude turn synchronously (legacy
+        // parity). v1 server policy is that no save happens mid-combat, so this
+        // branch is not expected on the server path; kept identical.
+        if (_combat_turn(gDude, true) == -1) {
+            round.curIndex = -1;
+        } else {
+            int index;
+            for (index = 0; index < _list_com; index++) {
+                if (_combat_list[index] == gDude) {
+                    break;
+                }
+            }
+            round.curIndex = index + 1;
+        }
+        _gcsd = nullptr;
+    } else {
+        Object* defender = csd != nullptr ? csd->defender : nullptr;
+        Object* attacker = csd != nullptr ? csd->attacker : nullptr;
+        _combat_sequence_init(attacker, defender);
+        if (csd != nullptr) {
+            s.csd = *csd; // by-value; _gcsd must outlive the beat
+            _gcsd = &s.csd;
+        } else {
+            _gcsd = nullptr;
+        }
+        round.curIndex = 0;
+    }
+
+    round.serverStuckPrev = 0;
+    round.serverStuckTurns = 0;
+    round.serverStuckInit = false;
+
+    s.state = (round.curIndex == -1) ? CombatSessionState::kEnding : CombatSessionState::kRoundBegin;
+}
+
+// Advance the session one beat (serverTick, after scriptsHandleRequests). At most
+// ONE AI turn runs per beat; the player barrier may yield mid-turn. Round-boundary
+// bookkeeping (kRoundBegin/kRoundEnd) does not itself consume the beat — it falls
+// through to the next turn so combat keeps flowing.
+void combatSessionAdvance()
+{
+    CombatSession& s = gCombatSession;
+    if (!s.active) {
+        return;
+    }
+
+    for (;;) {
+        switch (s.state) {
+        case CombatSessionState::kRoundBegin:
+            combatRoundBegin();
+            s.state = CombatSessionState::kTurns;
+            continue;
+
+        case CombatSessionState::kTurns: {
+            if (s.round.curIndex >= _list_com) {
+                s.state = CombatSessionState::kRoundEnd;
+                continue;
+            }
+            // Re-read the roster each beat: _combat_sequence / a turn's scripts can
+            // reshuffle _combat_list, so never cache Object* across beats.
+            Object* combatant = _combat_list[s.round.curIndex];
+            if (combatSessionIsPlayerActor(combatant)) {
+                s.state = CombatSessionState::kPlayerTurn;
+                s.playerTurnBegun = false;
+                // WHOSE turn — everything the barrier does past here (which intents
+                // to consume, whose client to wait for, whose body acts) keys off
+                // this. Re-derived from the roster each turn rather than tracked,
+                // because _combat_list is re-sorted every round.
+                s.playerTurnSlot = playerActorSlotOf(combatant);
+                if (s.playerTurnSlot < 0) {
+                    s.playerTurnSlot = 0; // cannot happen: the predicate above IS registry membership
+                }
+                continue; // enter the barrier this beat
+            }
+            // One full AI turn per beat.
+            int rc = _combat_turn(combatant, false);
+            combatSessionAfterTurn(s, rc);
+            if (s.state == CombatSessionState::kEnding) {
+                // The turn ENDED THE FIGHT (rc == -1 / _combat_ending_guy). Legacy
+                // _combat() tore the fight down synchronously before returning, so
+                // no caller ever observed the in-between state. Ending is not a
+                // turn — do not spend a beat on it, fall through to kEnding now.
+                //
+                // Load-bearing, not cosmetic: a script's op_terminate_combat sets
+                // _game_user_wants_to_quit = 1 (the engine's in-band "break out of
+                // combat" signal, NOT a process quit — see combatTeardown, which is
+                // what clears it). Deferring teardown a beat leaks that flag past
+                // serverTick, where serverServe's continue-predicate reads it and
+                // shuts the server down mid-fight. Live repro: ACTemVil (Temple of
+                // Trials challenger) calls terminate_combat from combat_p_proc the
+                // moment his HP drops to half.
+                continue;
+            }
+            return;
+        }
+
+        case CombatSessionState::kPlayerTurn:
+            if (combatSessionAdvancePlayerTurn(s) == CombatPlayerBeat::kWait) {
+                return; // barrier still waiting; resume next beat
+            }
+            continue; // turn ended; state was advanced (kTurns or kEnding)
+
+        case CombatSessionState::kRoundEnd:
+            // combatRoundEnd runs _combat_sequence (which may itself run a joining
+            // noncom's _combat_turn synchronously — left synchronous by design),
+            // the numTurns bump, and the server watchdog (state persists in round).
+            if (combatRoundEnd(s.round)) {
+                s.state = CombatSessionState::kEnding;
+                continue;
+            }
+            if (_combat_should_end()) {
+                s.state = CombatSessionState::kEnding;
+                continue;
+            }
+            s.state = CombatSessionState::kRoundBegin;
+            continue;
+
+        case CombatSessionState::kEnding:
+            combatTeardown();
+            GameMode::exitGameMode(GameMode::kCombat);
+            s.active = false;
+            s.state = CombatSessionState::kInactive;
+            return;
+
+        case CombatSessionState::kInactive:
+        default:
+            return;
+        }
+    }
+}
+
 void _combat(CombatStartData* csd)
 {
+    bool guardOpen = (csd == nullptr
+        || (csd->attacker == nullptr || csd->attacker->elevation == gElevation)
+        || (csd->defender == nullptr || csd->defender->elevation == gElevation));
+
+    // Resumable server path (F2_SERVER_RESUMABLE_COMBAT): set up a session and
+    // return; serverTick drives it across beats. kCombat mode is owned by the
+    // session (entered here, exited at teardown), so this is intercepted BEFORE
+    // the ScopedGameMode below — whose destructor would clear the bit on the
+    // early return. Gate OFF, this is never taken and the legacy path below runs
+    // byte-identically (ScopedGameMode still spans the whole function).
+    // The N-player turn barrier lives ONLY in the resumable session below. The
+    // legacy path drains a whole fight inside one call with a single hardcoded dude
+    // turn, so with extras registered it would silently hand their bodies to the AI
+    // — the exact bug M3 exists to fix. Fail loud rather than ship that quietly.
+    if (playerActorCount() > 1 && !(guardOpen && combatResumableEnabled())) {
+        fprintf(stderr, "SERVER: combat with %d player actors requires resumable combat "
+                        "(F2_SERVER_RESUMABLE_COMBAT); the legacy path would AI-drive the extras.\n",
+            playerActorCount());
+    }
+
+    if (guardOpen && combatResumableEnabled()) {
+        if (combatSessionActive()) {
+            // scriptsHandleRequests can fire SCRIPT_REQUEST_COMBAT mid-fight now
+            // that fights span beats; a session is already running — ignore it.
+            fprintf(stderr, "SERVER: resumable combat — ignoring re-entrant _combat() (session already active).\n");
+            return;
+        }
+        GameMode::enterGameMode(GameMode::kCombat);
+        combatSessionBegin(csd);
+        return;
+    }
+
     ScopedGameMode gm(GameMode::kCombat);
 
-    if (csd == nullptr
-        || (csd->attacker == nullptr || csd->attacker->elevation == gElevation)
-        || (csd->defender == nullptr || csd->defender->elevation == gElevation)) {
-        bool wasInCombat = (gCombatState & 0x01) != 0;
+    if (guardOpen) {
+        CombatRound round;
+        round.wasInCombat = (gCombatState & 0x01) != 0;
 
         _combat_begin(nullptr);
 
-        int curIndex;
+        // MP_PROTOCOL.md §2: combat entered. _combat_begin is always called with
+        // a null attacker; the real initiator lives in csd. No-op under the null/
+        // client presenter (byte-identical). See Presenter::combatEnter.
+        presenter()->combatEnter(csd != nullptr ? csd->attacker : nullptr);
 
         // If we loaded a save in combat, we need to force dude turn and then continue with the next combatant.
-        if (wasInCombat) {
+        if (round.wasInCombat) {
             if (_combat_turn(gDude, true) == -1) {
-                curIndex = -1;
+                round.curIndex = -1;
             } else {
                 int index;
                 for (index = 0; index < _list_com; index++) {
@@ -3399,7 +4174,7 @@ void _combat(CombatStartData* csd)
                         break;
                     }
                 }
-                curIndex = index + 1;
+                round.curIndex = index + 1;
             }
             _gcsd = nullptr;
         } else {
@@ -3414,53 +4189,30 @@ void _combat(CombatStartData* csd)
             }
             _combat_sequence_init(attacker, defender);
             _gcsd = csd;
-            curIndex = 0;
+            round.curIndex = 0;
         }
+
+        round.serverStuckPrev = 0;
+        round.serverStuckTurns = 0;
+        round.serverStuckInit = false;
 
         do {
-            if (curIndex == -1) {
+            if (round.curIndex == -1) {
                 break;
             }
 
-            _combat_set_move_all();
+            combatRoundBegin();
 
-            for (; curIndex < _list_com; curIndex++) {
-                if (_combat_turn(_combat_list[curIndex], false) == -1) {
-                    break;
-                }
-
-                if (_combat_ending_guy != nullptr) {
-                    break;
-                }
-
-                _gcsd = nullptr;
-            }
-
-            if (curIndex < _list_com) {
+            if (combatRunTurnsFrom(round) == CombatTurnRun::kEndingEarly) {
                 break;
             }
 
-            _combat_sequence();
-            curIndex = 0;
-            _combatNumTurns += 1;
+            if (combatRoundEnd(round)) {
+                break;
+            }
         } while (!_combat_should_end());
 
-        if (_combat_end_due_to_load) {
-            gameUiEnable();
-            gameMouseSetMode(GAME_MOUSE_MODE_MOVE);
-        } else {
-            _gmouse_disable_scrolling();
-            interfaceBarEndButtonsHide(true);
-            _gmouse_enable_scrolling();
-            _combat_over();
-            scriptsExecMapUpdateProc();
-        }
-
-        _combat_end_due_to_load = 0;
-
-        if (_game_user_wants_to_quit == 1) {
-            _game_user_wants_to_quit = 0;
-        }
+        combatTeardown();
     }
 }
 
@@ -3483,6 +4235,59 @@ void attackInit(Attack* attack, Object* attacker, Object* defender, int hitMode,
     attack->defenderKnockback = 0;
     attack->extrasLength = 0;
     attack->oops = defender;
+}
+
+// True iff this attack's presentation is carried by the record channel (EVENT_PRES_SEQ)
+// on the dedicated server — so the parallel decoder-mirror cue (EVENT_ATTACK_RESULT ->
+// clientCombatAnimPlay) must NOT also present it, or the viewer double-presents (e.g. a
+// rocket gib plays twice; a grenade would double every victim's hit/death anim). The
+// record stream already carries the animation AND reserves the same participants
+// (reserveSeqRef -> clientCombatAnimReserve, the same-beat OBJECT_DELTA leak guard that
+// attackResult performs), so suppressing the cue for a recorded attack is safe.
+//
+// Single source of truth for the gate at BOTH sites: _combat_attack (open the record
+// section) and _combat_apply_attack_results (suppress the redundant cue). Off the record
+// backend / SP client this is false, so EVENT_ATTACK_RESULT is emitted exactly as before
+// (goldens byte-identical). THROW folds in with the throw-arc slice (recordAttack widens).
+static bool combatAttackRecorded(Object* attacker, int hitMode)
+{
+    (void)attacker;
+    (void)hitMode;
+    // Every attack anim now presents through the record channel: melee, ranged, and THROW
+    // (spears/grenades). The throw arc records with a transient flight projectile while its
+    // authoritative consumption rides the STATE arm (actionThrowConsumeHeadless) — see
+    // _action_ranged. Off the record backend / SP client this is false (env + backend gate).
+    return serverLoopActive() && presRecordEnabled();
+}
+
+// True iff an in-combat MOVE bracket should record its walk over the record channel
+// (COMBAT_MOVE_RECORD_DESIGN.md). Wraps the composite reg_anim brackets (combat_ai AI
+// moves + combat_drain player move) in an AMBIENT record section so the RunTo/MoveTo leaf
+// records its real args, replayed as-is on the client. Off the record backend / SP / out of
+// combat this is false → today's EVENT_MOVE glide path, byte-identical. !presRecordActive()
+// guards against nesting inside another open section (belt-and-braces; move brackets don't
+// nest today).
+bool combatMoveRecorded()
+{
+    return serverLoopActive() && presRecordEnabled() && isInCombat() && !presRecordActive();
+}
+
+// Close an in-combat MOVE record bracket (COMBAT_MOVE_RECORD_DESIGN.md): end the ambient
+// section, ship the recorded RunTo/MoveTo leaf as the actor's presSeq (opCount > 2 = the
+// bracket actually recorded a move, not a bare BEGIN/END from a leaf that early-outed), then
+// commit the deferred authoritative walk — so the presentation event precedes its own state
+// (EVENT_MOVE / AP delta) on the wire. No-op when not recording. Pair with
+// `if (recording) presRecordAmbientBegin();` before reg_anim_begin at each move bracket.
+void combatMoveRecordClose(bool recording, Object* actor)
+{
+    if (!recording) {
+        return;
+    }
+    presRecordAmbientEnd();
+    if (presRecordOpCount() > 2) {
+        presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), actor->netId);
+    }
+    presRecordCommitDeferred();
 }
 
 // 0x422F3C
@@ -3521,7 +4326,11 @@ int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocat
         }
     }
 
-    bool aiming;
+    // Init false: headless has no interface bar, so interfaceGetCurrentHitMode
+    // returns -1 WITHOUT writing aiming (interface.cc). Without this init the
+    // dude's uncalled-shot AP cost would read an uninitialized bool under the
+    // server loop. On the client the call succeeds and overwrites this.
+    bool aiming = false;
     if (_main_ctd.defenderHitLocation == HIT_LOCATION_TORSO || _main_ctd.defenderHitLocation == HIT_LOCATION_UNCALLED) {
         if (attacker == gDude) {
             interfaceGetCurrentHitMode(&hitMode, &aiming);
@@ -3535,8 +4344,47 @@ int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocat
     int actionPoints = weaponGetActionPointCost(attacker, _main_ctd.hitMode, aiming);
     debugPrint("sequencing attack...\n");
 
-    if (_action_attack(&_main_ctd) == -1) {
-        return -1;
+    // Under the server loop the attack is NOT animated: _action_attack builds an
+    // attack/projectile animation sequence that cannot finalize headless
+    // (reg_anim_end rejects it, esp. ranged), so we skip it and apply the
+    // computed outcome directly below (Phase 2.4 de-coupling). AP accounting and
+    // the cleanup flags are identical to the animated path.
+    //
+    // PRESENTATION-RECORD (attack family, MELEE + RANGED slices — PRESENTATION_RECORD_
+    // REPLAY_SPEC §8): on the dedicated server with F2_SERVER_PRES_RECORD set, RUN the
+    // animate composite (normally skipped) inside a record section so _action_melee /
+    // _action_ranged's leaves stream as EVENT_PRES_SEQ, then apply the outcome
+    // authoritatively below exactly as today (_combat_apply_attack_results —
+    // ammo/AP/damage/XP all live there, OUTSIDE _action_attack, so re-enabling the animate
+    // branch adds no state). NON-THROW ONLY for now: a throw attack keeps the server-skip
+    // path (its build phase mutates inventory — itemRemove/itemReplace/_obj_connect — which
+    // lands in a later slice). The melee/ranged build phase is register-only save for the
+    // projectile transient (created NO_SAVE + destroyed after record in _action_ranged);
+    // its only recorded callbacks are _show_death (tagged) and hideProjectile (HIDE_FORCED).
+    // Gate off / SP client → recording is false → today's path exactly.
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        Object* h1 = critterGetItem1(attacker); // left / item1
+        Object* h2 = critterGetItem2(attacker); // right / item2
+        fprintf(stderr, "[satk] net=%d fid=0x%x hitMode=%d item1_pid=%d item2_pid=%d\n",
+            attacker->netId, attacker->fid, _main_ctd.hitMode,
+            h1 ? h1->pid : -1, h2 ? h2->pid : -1);
+    }
+    bool recording = combatAttackRecorded(attacker, _main_ctd.hitMode);
+    if (!serverLoopActive() || recording) {
+        if (recording) {
+            presRecordSectionBegin();
+        }
+        int attackRc = _action_attack(&_main_ctd);
+        if (attackRc == -1) {
+            if (recording) {
+                presRecordSectionAbort();
+            }
+            return -1;
+        }
+        if (recording) {
+            presRecordSectionEnd();
+            presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), attacker->netId);
+        }
     }
 
     if (actionPoints > attacker->data.critter.combat.ap) {
@@ -3546,7 +4394,7 @@ int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocat
     }
 
     if (attacker == gDude) {
-        interfaceRenderActionPoints(attacker->data.critter.combat.ap, _combat_free_move);
+        presenter()->hudActionPoints(attacker->data.critter.combat.ap, _combat_free_move);
         _critter_set_who_hit_me(attacker, defender);
     }
 
@@ -3557,6 +4405,14 @@ int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocat
     _combat_cleanup_enabled = 1;
     aiInfoSetLastTarget(attacker, defender);
     debugPrint("running attack...\n");
+
+    // Server loop: no animation to complete, so apply the outcome now (ammo,
+    // damage, end-combat, standup) with animated=false instead of waiting for
+    // _combat_anim_finished. _combat_turn_running is never incremented, so the
+    // driver's _combat_turn_run() drain is a no-op.
+    if (serverLoopActive()) {
+        _combat_apply_attack_results(false);
+    }
 
     return 0;
 }
@@ -3862,12 +4718,18 @@ static int attackCompute(Attack* attack)
     }
 
     if (roll == ROLL_SUCCESS) {
-        if ((attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) && attack->attacker == gDude) {
+        if ((attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) && playerActorIs(attack->attacker)) {
             if (perkHasRank(attack->attacker, PERK_SLAYER)) {
                 roll = ROLL_CRITICAL_SUCCESS;
             }
 
-            if (perkHasRank(gDude, PERK_SILENT_DEATH)
+            // ⚠ SILENT DEATH stays HOST-ONLY, deliberately. It is gated on
+            // dudeHasState(DUDE_STATE_SNEAKING), which is still a PC-GLOBAL —
+            // generalizing the perk without generalizing sneak would grant an
+            // extra a x4 backstab whenever the HOST happened to be sneaking.
+            // Unblocks when sneak becomes per-actor (PLAYER_SHEET_DESIGN.md §8).
+            if (attack->attacker == gDude
+                && perkHasRank(gDude, PERK_SILENT_DEATH)
                 && !_is_hit_from_front(gDude, attack->defender)
                 && dudeHasState(DUDE_STATE_SNEAKING)
                 && gDude != attack->defender->data.critter.combat.whoHitMe) {
@@ -3887,10 +4749,10 @@ static int attackCompute(Attack* attack)
     if (attackType == ATTACK_TYPE_RANGED) {
         attack->ammoQuantity = v26;
 
-        if (roll == ROLL_SUCCESS && attack->attacker == gDude) {
-            if (perkGetRank(gDude, PERK_SNIPER) != 0) {
+        if (roll == ROLL_SUCCESS && playerActorIs(attack->attacker)) {
+            if (perkGetRank(attack->attacker, PERK_SNIPER) != 0) {
                 int d10 = randomBetween(1, 10);
-                int luck = critterGetStat(gDude, STAT_LUCK);
+                int luck = critterGetStat(attack->attacker, STAT_LUCK);
                 if (d10 <= luck) {
                     roll = ROLL_CRITICAL_SUCCESS;
                 }
@@ -3911,6 +4773,8 @@ static int attackCompute(Attack* attack)
         damageMultiplier = attackComputeCriticalHit(attack);
 
         // SFALL: Fix Silent Death bonus not being applied to critical hits.
+        // Host-only for the same reason as the other Silent Death site above:
+        // it is gated on the PC-global sneak state, not on a per-actor one.
         if ((attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) && attack->attacker == gDude) {
             if (perkHasRank(gDude, PERK_SILENT_DEATH)
                 && !_is_hit_from_front(gDude, attack->defender)
@@ -4351,8 +5215,8 @@ static int attackDetermineToHit(Object* attacker, int tile, Object* defender, in
             int perception = critterGetStat(attacker, STAT_PERCEPTION);
 
             // SFALL: Fix Sharpshooter.
-            if (attacker == gDude) {
-                perception += 2 * perkGetRank(gDude, PERK_SHARPSHOOTER);
+            if (playerActorIs(attacker)) {
+                perception += 2 * perkGetRank(attacker, PERK_SHARPSHOOTER);
             }
 
             int distanceMod = 0;
@@ -4401,7 +5265,7 @@ static int attackDetermineToHit(Object* attacker, int tile, Object* defender, in
             toHit -= 10 * numCrittersInLof;
         }
 
-        if (attacker == gDude && traitIsSelected(TRAIT_ONE_HANDER)) {
+        if (playerActorIs(attacker) && traitIsSelected(TRAIT_ONE_HANDER, attacker)) {
             if (weaponIsTwoHanded(weapon)) {
                 toHit -= 40;
             } else {
@@ -4411,7 +5275,7 @@ static int attackDetermineToHit(Object* attacker, int tile, Object* defender, in
 
         int minStrength = weaponGetMinStrengthRequired(weapon);
         int minStrengthMod = minStrength - critterGetStat(attacker, STAT_STRENGTH);
-        if (attacker == gDude && perkGetRank(gDude, PERK_WEAPON_HANDLING) != 0) {
+        if (playerActorIs(attacker) && perkGetRank(attacker, PERK_WEAPON_HANDLING) != 0) {
             minStrengthMod -= 3;
         }
 
@@ -4537,14 +5401,14 @@ static void attackComputeDamage(Attack* attack, int ammoQuantity, int bonusDamag
             damageThreshold = 20 * damageThreshold / 100;
         }
 
-        if (attack->attacker == gDude && traitIsSelected(TRAIT_FINESSE)) {
+        if (playerActorIs(attack->attacker) && traitIsSelected(TRAIT_FINESSE, attack->attacker)) {
             damageResistance += 30;
         }
     }
 
     int damageBonus;
-    if (attack->attacker == gDude && weaponGetAttackTypeForHitMode(attack->weapon, attack->hitMode) == ATTACK_TYPE_RANGED) {
-        damageBonus = 2 * perkGetRank(gDude, PERK_BONUS_RANGED_DAMAGE);
+    if (playerActorIs(attack->attacker) && weaponGetAttackTypeForHitMode(attack->weapon, attack->hitMode) == ATTACK_TYPE_RANGED) {
+        damageBonus = 2 * perkGetRank(attack->attacker, PERK_BONUS_RANGED_DAMAGE);
     } else {
         damageBonus = 0;
     }
@@ -4811,7 +5675,7 @@ static void _set_new_results(Object* critter, int flags)
         int leftItemAction;
         int rightItemAction;
         interfaceGetItemActions(&leftItemAction, &rightItemAction);
-        interfaceUpdateItems(true, leftItemAction, rightItemAction);
+        presenter()->hudItems(true, leftItemAction, rightItemAction);
     } else {
         critter->data.critter.combat.results |= flags & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN | DAM_CRIP | DAM_DEAD | DAM_LOSE_TURN);
     }
@@ -4839,7 +5703,7 @@ static void _damage_object(Object* a1, int damage, bool animated, int a4, Object
     critterAdjustHitPoints(a1, -damage);
 
     if (a1 == gDude) {
-        interfaceRenderHitPoints(animated);
+        presenter()->hudHitPoints(animated);
     }
 
     a1->data.critter.combat.damageLastTurn += damage;
@@ -4867,7 +5731,23 @@ static void _damage_object(Object* a1, int damage, bool animated, int a4, Object
                 }
 
                 if (!scriptOverrides) {
-                    _combat_exps += critterGetExp(a1);
+                    // Credit the KILLER's bucket. whoHitMe is a live pointer
+                    // right here, which is why §4 takes the subject from the call
+                    // site rather than from nearest-player geometry — that would
+                    // hand a kill to whoever happened to be standing closest.
+                    //
+                    // A killer that is not a registered player actor (a companion,
+                    // or the team-mate branch of the guard above) credits slot 0.
+                    // That is exactly today's behavior for those cases — a
+                    // disclosed default, not new guesswork (§4). The -1 is mapped
+                    // to that policy explicitly and never used as an index — a
+                    // negative one would corrupt whatever static precedes the
+                    // array.
+                    int slot = playerActorSlotOf(whoHitMe);
+                    if (slot < 0) {
+                        slot = 0;
+                    }
+                    _combat_exps[slot] += critterGetExp(a1);
                     killsIncByType(critterGetKillType(a1));
                 }
             }
@@ -4882,446 +5762,12 @@ static void _damage_object(Object* a1, int damage, bool animated, int a4, Object
     }
 }
 
-// Print attack description to monitor.
-//
-// 0x425170
-void _combat_display(Attack* attack)
-{
-    MessageListItem messageListItem;
-
-    if (attack->attacker == gDude) {
-        Object* weapon = critterGetWeaponForHitMode(attack->attacker, attack->hitMode);
-        int strengthRequired = weaponGetMinStrengthRequired(weapon);
-
-        if (perkGetRank(attack->attacker, PERK_WEAPON_HANDLING) != 0) {
-            strengthRequired -= 3;
-        }
-
-        if (weapon != nullptr) {
-            if (strengthRequired > critterGetStat(gDude, STAT_STRENGTH)) {
-                // You are not strong enough to use this weapon properly.
-                messageListItem.num = 107;
-                if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                    displayMonitorAddMessage(messageListItem.text);
-                }
-            }
-        }
-    }
-
-    Object* mainCritter;
-    if ((attack->attackerFlags & DAM_HIT) != 0) {
-        mainCritter = attack->defender;
-    } else {
-        mainCritter = attack->attacker;
-    }
-
-    char* mainCritterName = _a_1;
-
-    char you[20];
-    you[0] = '\0';
-    if (critterGetStat(gDude, STAT_GENDER) == GENDER_MALE) {
-        // You (male)
-        messageListItem.num = 506;
-    } else {
-        // You (female)
-        messageListItem.num = 556;
-    }
-
-    if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-        strcpy(you, messageListItem.text);
-    }
-
-    int baseMessageId;
-    if (mainCritter == gDude) {
-        mainCritterName = you;
-        if (critterGetStat(gDude, STAT_GENDER) == GENDER_MALE) {
-            baseMessageId = 500;
-        } else {
-            baseMessageId = 550;
-        }
-    } else if (mainCritter != nullptr) {
-        mainCritterName = objectGetName(mainCritter);
-        if (critterGetStat(mainCritter, STAT_GENDER) == GENDER_MALE) {
-            baseMessageId = 600;
-        } else {
-            baseMessageId = 700;
-        }
-    }
-
-    char text[280];
-    if (attack->defender != nullptr
-        && attack->oops != nullptr
-        && attack->defender != attack->oops
-        && (attack->attackerFlags & DAM_HIT) != 0) {
-        if (FID_TYPE(attack->defender->fid) == OBJ_TYPE_CRITTER) {
-            if (attack->oops == gDude) {
-                // 608 (male) - Oops! %s was hit instead of you!
-                // 708 (female) - Oops! %s was hit instead of you!
-                messageListItem.num = baseMessageId + 8;
-                if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                    snprintf(text, sizeof(text), messageListItem.text, mainCritterName);
-                }
-            } else {
-                // 509 (male) - Oops! %s were hit instead of %s!
-                // 559 (female) - Oops! %s were hit instead of %s!
-                const char* name = objectGetName(attack->oops);
-                messageListItem.num = baseMessageId + 9;
-                if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                    snprintf(text, sizeof(text), messageListItem.text, mainCritterName, name);
-                }
-            }
-        } else {
-            if (attack->attacker == gDude) {
-                if (critterGetStat(attack->attacker, STAT_GENDER) == GENDER_MALE) {
-                    // (male) %s missed
-                    messageListItem.num = 515;
-                } else {
-                    // (female) %s missed
-                    messageListItem.num = 565;
-                }
-
-                if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                    snprintf(text, sizeof(text), messageListItem.text, you);
-                }
-            } else {
-                const char* name = objectGetName(attack->attacker);
-                if (critterGetStat(attack->attacker, STAT_GENDER) == GENDER_MALE) {
-                    // (male) %s missed
-                    messageListItem.num = 615;
-                } else {
-                    // (female) %s missed
-                    messageListItem.num = 715;
-                }
-
-                if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                    snprintf(text, sizeof(text), messageListItem.text, name);
-                }
-            }
-        }
-
-        strcat(text, ".");
-
-        displayMonitorAddMessage(text);
-    }
-
-    if ((attack->attackerFlags & DAM_HIT) != 0) {
-        Object* v21 = attack->defender;
-        if (v21 != nullptr && (v21->data.critter.combat.results & DAM_DEAD) == 0) {
-            text[0] = '\0';
-
-            if (FID_TYPE(v21->fid) == OBJ_TYPE_CRITTER) {
-                if (attack->defenderHitLocation == HIT_LOCATION_TORSO) {
-                    if ((attack->attackerFlags & DAM_CRITICAL) != 0) {
-                        switch (attack->defenderDamage) {
-                        case 0:
-                            // 528 - %s were critically hit for no damage
-                            messageListItem.num = baseMessageId + 28;
-                            break;
-                        case 1:
-                            // 524 - %s were critically hit for 1 hit point
-                            messageListItem.num = baseMessageId + 24;
-                            break;
-                        default:
-                            // 520 - %s were critically hit for %d hit points
-                            messageListItem.num = baseMessageId + 20;
-                            break;
-                        }
-
-                        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                            if (attack->defenderDamage <= 1) {
-                                snprintf(text, sizeof(text), messageListItem.text, mainCritterName);
-                            } else {
-                                snprintf(text, sizeof(text), messageListItem.text, mainCritterName, attack->defenderDamage);
-                            }
-                        }
-                    } else {
-                        combatCopyDamageAmountDescription(text, sizeof(text), v21, attack->defenderDamage);
-                    }
-                } else {
-                    const char* hitLocationName = hitLocationGetName(v21, attack->defenderHitLocation);
-                    if (hitLocationName != nullptr) {
-                        if ((attack->attackerFlags & DAM_CRITICAL) != 0) {
-                            switch (attack->defenderDamage) {
-                            case 0:
-                                // 525 - %s were critically hit in %s for no damage
-                                messageListItem.num = baseMessageId + 25;
-                                break;
-                            case 1:
-                                // 521 - %s were critically hit in %s for 1 damage
-                                messageListItem.num = baseMessageId + 21;
-                                break;
-                            default:
-                                // 511 - %s were critically hit in %s for %d hit points
-                                messageListItem.num = baseMessageId + 11;
-                                break;
-                            }
-                        } else {
-                            switch (attack->defenderDamage) {
-                            case 0:
-                                // 526 - %s were hit in %s for no damage
-                                messageListItem.num = baseMessageId + 26;
-                                break;
-                            case 1:
-                                // 522 - %s were hit in %s for 1 damage
-                                messageListItem.num = baseMessageId + 22;
-                                break;
-                            default:
-                                // 512 - %s were hit in %s for %d hit points
-                                messageListItem.num = baseMessageId + 12;
-                                break;
-                            }
-                        }
-
-                        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                            if (attack->defenderDamage <= 1) {
-                                snprintf(text, sizeof(text), messageListItem.text, mainCritterName, hitLocationName);
-                            } else {
-                                snprintf(text, sizeof(text), messageListItem.text, mainCritterName, hitLocationName, attack->defenderDamage);
-                            }
-                        }
-                    }
-                }
-
-                if (settings.preferences.combat_messages && (attack->attackerFlags & DAM_CRITICAL) != 0 && attack->criticalMessageId != -1) {
-                    messageListItem.num = attack->criticalMessageId;
-                    if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                        strcat(text, messageListItem.text);
-                    }
-
-                    if ((attack->defenderFlags & DAM_DEAD) != 0) {
-                        strcat(text, ".");
-                        displayMonitorAddMessage(text);
-
-                        if (attack->defender == gDude) {
-                            if (critterGetStat(attack->defender, STAT_GENDER) == GENDER_MALE) {
-                                // were killed
-                                messageListItem.num = 207;
-                            } else {
-                                // were killed
-                                messageListItem.num = 257;
-                            }
-                        } else {
-                            if (critterGetStat(attack->defender, STAT_GENDER) == GENDER_MALE) {
-                                // was killed
-                                messageListItem.num = 307;
-                            } else {
-                                // was killed
-                                messageListItem.num = 407;
-                            }
-                        }
-
-                        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                            snprintf(text, sizeof(text), "%s %s", mainCritterName, messageListItem.text);
-                        }
-                    }
-                } else {
-                    combatAddDamageFlagsDescription(text, attack->defenderFlags, attack->defender);
-                }
-
-                strcat(text, ".");
-
-                displayMonitorAddMessage(text);
-            }
-        }
-    }
-
-    if (attack->attacker != nullptr && (attack->attacker->data.critter.combat.results & DAM_DEAD) == 0) {
-        if ((attack->attackerFlags & DAM_HIT) == 0) {
-            if ((attack->attackerFlags & DAM_CRITICAL) != 0) {
-                switch (attack->attackerDamage) {
-                case 0:
-                    // 514 - %s critically missed
-                    messageListItem.num = baseMessageId + 14;
-                    break;
-                case 1:
-                    // 533 - %s critically missed and took 1 hit point
-                    messageListItem.num = baseMessageId + 33;
-                    break;
-                default:
-                    // 534 - %s critically missed and took %d hit points
-                    messageListItem.num = baseMessageId + 34;
-                    break;
-                }
-            } else {
-                // 515 - %s missed
-                messageListItem.num = baseMessageId + 15;
-            }
-
-            if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                if (attack->attackerDamage <= 1) {
-                    snprintf(text, sizeof(text), messageListItem.text, mainCritterName);
-                } else {
-                    snprintf(text, sizeof(text), messageListItem.text, mainCritterName, attack->attackerDamage);
-                }
-            }
-
-            combatAddDamageFlagsDescription(text, attack->attackerFlags, attack->attacker);
-
-            strcat(text, ".");
-
-            displayMonitorAddMessage(text);
-        }
-
-        if ((attack->attackerFlags & DAM_HIT) != 0 || (attack->attackerFlags & DAM_CRITICAL) == 0) {
-            if (attack->attackerDamage > 0) {
-                combatCopyDamageAmountDescription(text, sizeof(text), attack->attacker, attack->attackerDamage);
-                combatAddDamageFlagsDescription(text, attack->attackerFlags, attack->attacker);
-                strcat(text, ".");
-                displayMonitorAddMessage(text);
-            }
-        }
-    }
-
-    for (int index = 0; index < attack->extrasLength; index++) {
-        Object* critter = attack->extras[index];
-        if ((critter->data.critter.combat.results & DAM_DEAD) == 0) {
-            combatCopyDamageAmountDescription(text, sizeof(text), critter, attack->extrasDamage[index]);
-            combatAddDamageFlagsDescription(text, attack->extrasFlags[index], critter);
-            strcat(text, ".");
-
-            displayMonitorAddMessage(text);
-        }
-    }
-}
-
-// 0x425A9C
-static void combatCopyDamageAmountDescription(char* dest, size_t size, Object* critter, int damage)
-{
-    MessageListItem messageListItem;
-    char text[40];
-    char* name;
-
-    int messageId;
-    if (critter == gDude) {
-        text[0] = '\0';
-
-        if (critterGetStat(gDude, STAT_GENDER) == GENDER_MALE) {
-            messageId = 500;
-        } else {
-            messageId = 550;
-        }
-
-        // 506 - You
-        messageListItem.num = messageId + 6;
-        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            strcpy(text, messageListItem.text);
-        }
-
-        name = text;
-    } else {
-        name = objectGetName(critter);
-
-        if (critterGetStat(critter, STAT_GENDER) == GENDER_MALE) {
-            messageId = 600;
-        } else {
-            messageId = 700;
-        }
-    }
-
-    switch (damage) {
-    case 0:
-        // 627 - %s was hit for no damage
-        messageId += 27;
-        break;
-    case 1:
-        // 623 - %s was hit for 1 hit point
-        messageId += 23;
-        break;
-    default:
-        // 613 - %s was hit for %d hit points
-        messageId += 13;
-        break;
-    }
-
-    messageListItem.num = messageId;
-    if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-        if (damage <= 1) {
-            snprintf(dest, size, messageListItem.text, name);
-        } else {
-            snprintf(dest, size, messageListItem.text, name, damage);
-        }
-    }
-}
-
-// 0x425BA4
-static void combatAddDamageFlagsDescription(char* dest, int flags, Object* critter)
-{
-    MessageListItem messageListItem;
-
-    int num;
-    if (critter == gDude) {
-        if (critterGetStat(critter, STAT_GENDER) == GENDER_MALE) {
-            num = 200;
-        } else {
-            num = 250;
-        }
-    } else {
-        if (critterGetStat(critter, STAT_GENDER) == GENDER_MALE) {
-            num = 300;
-        } else {
-            num = 400;
-        }
-    }
-
-    if (flags == 0) {
-        return;
-    }
-
-    if ((flags & DAM_DEAD) != 0) {
-        // " and "
-        messageListItem.num = 108;
-        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            strcat(dest, messageListItem.text);
-        }
-
-        // were killed
-        messageListItem.num = num + 7;
-        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            strcat(dest, messageListItem.text);
-        }
-
-        return;
-    }
-
-    int bit = 1;
-    int flagsListLength = 0;
-    int flagsList[32];
-    for (int index = 0; index < 32; index++) {
-        if (bit != DAM_CRITICAL && bit != DAM_HIT && (bit & flags) != 0) {
-            flagsList[flagsListLength++] = index;
-        }
-        bit <<= 1;
-    }
-
-    if (flagsListLength != 0) {
-        for (int index = 0; index < flagsListLength - 1; index++) {
-            strcat(dest, ", ");
-
-            messageListItem.num = num + flagsList[index];
-            if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                strcat(dest, messageListItem.text);
-            }
-        }
-
-        // " and "
-        messageListItem.num = 108;
-        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            strcat(dest, messageListItem.text);
-        }
-
-        messageListItem.num = num + flagsList[flagsListLength - 1];
-        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            strcat(dest, messageListItem.text);
-        }
-    }
-}
-
 // 0x425E3C
 void _combat_anim_begin()
 {
     if (++_combat_turn_running == 1 && gDude == _main_ctd.attacker) {
         gameUiDisable(1);
-        gameMouseSetCursor(26);
+        presenter()->cursorSet(26);
         if (_combat_highlight == 2) {
             _combat_outline_off();
         }
@@ -5340,49 +5786,156 @@ void _combat_anim_finished()
         gameUiEnable();
     }
 
-    if (_combat_cleanup_enabled) {
-        _combat_cleanup_enabled = false;
+    // The attack outcome is applied when the animation completes (animated=true
+    // registers the defender's death/knockback animation).
+    _combat_apply_attack_results(true);
+}
 
-        Object* weapon = critterGetWeaponForHitMode(_main_ctd.attacker, _main_ctd.hitMode);
-        if (weapon != nullptr) {
-            if (ammoGetCapacity(weapon) > 0) {
-                int ammoQuantity = ammoGetQuantity(weapon);
-                ammoSetQuantity(weapon, ammoQuantity - _main_ctd.ammoQuantity);
+// The attack-outcome application (ammo spend, damage, end-combat check, _main_ctd
+// reset, attacker standup) that _combat_anim_finished runs when an attack
+// animation completes. Extracted (REWRITE_PLAN Phase 2.4) so the headless server
+// can apply the same outcome WITHOUT the attack animation, which cannot build
+// headless (the projectile-travel sequence is rejected by reg_anim_end). The
+// `animated` flag is forwarded to _apply_damage: true keeps the death animation
+// (client), false applies the results with no animation (server). Gated by
+// _combat_cleanup_enabled exactly as the inline block was, so it is a no-op when
+// no attack is pending cleanup.
+static void _combat_apply_attack_results(bool animated)
+{
+    if (!_combat_cleanup_enabled) {
+        return;
+    }
 
-                if (_main_ctd.attacker == gDude) {
-                    _intface_update_ammo_lights();
-                }
+    _combat_cleanup_enabled = false;
+
+    Object* weapon = critterGetWeaponForHitMode(_main_ctd.attacker, _main_ctd.hitMode);
+    if (weapon != nullptr) {
+        if (ammoGetCapacity(weapon) > 0) {
+            int ammoQuantity = ammoGetQuantity(weapon);
+            ammoSetQuantity(weapon, ammoQuantity - _main_ctd.ammoQuantity);
+
+            if (_main_ctd.attacker == gDude) {
+                _intface_update_ammo_lights();
             }
         }
+    }
 
-        if (_combat_call_display) {
-            _combat_display(&_main_ctd);
-            _combat_call_display = false;
+    if (_combat_call_display) {
+        _combat_display(&_main_ctd);
+        _combat_call_display = false;
+    }
+
+    // The client displaces knocked-back critters to a new tile via the
+    // actionKnockdown animation inside _show_damage_to_object; the server skips
+    // that animation, so apply the same tile move directly. This MUST run before
+    // _apply_damage: the animated path completes the knockdown move before
+    // _apply_damage (which is deferred to _combat_anim_finished), so the
+    // knockback/prone decision has to observe each critter's PRE-damage state.
+    // _apply_damage ORs the fresh DAM_KNOCKED_DOWN/OUT into combat.results, and
+    // _critter_is_prone tests exactly those bits — running knockback afterwards
+    // would make the guard suppress the very knockback we want. Non-dead only
+    // (dead corpses are finalized NO_BLOCK below; their knockback is death-
+    // animation dependent — see _combat_knockback_headless). The death flags read
+    // here were computed by attackComputeDeathFlags before this function.
+    // Knockback COMPUTE now (pre-damage board: the prone/knockdown guard must see each
+    // victim's state before _apply_damage ORs in DAM_KNOCKED_DOWN). The APPLY (the MOVE
+    // emission) is DEFERRED to after attackResult() below, so the knockback delta rides the
+    // wire AFTER the event that reserves the victim on the client — else the client can't
+    // hold the durMs=0 snap and the recorded slide plays from a stale origin (bug J; pacing
+    // design §8.5). Non-animated (headless/server) only, exactly as before.
+    Object* kbVictims[1 + EXPLOSION_TARGET_COUNT];
+    int kbDests[1 + EXPLOSION_TARGET_COUNT];
+    int kbCount = 0;
+    if (!animated) {
+        kbCount = _combat_compute_knockback(&_main_ctd, kbVictims, kbDests);
+    }
+
+    _apply_damage(&_main_ctd, animated);
+
+    // The client finalizes a killed critter's physical state (death FID, go
+    // flat, OBJECT_NO_BLOCK, light off) via the _show_death animation callback
+    // registered inside _action_attack. The server skips that animation, so
+    // finalize newly dead critters directly with critterKill (mirrors the
+    // non-animated branches of actionExplode / _action_dmg). _apply_damage
+    // already flagged DAM_DEAD, awarded XP and removed the death script;
+    // critterKill only applies the physical/corpse state and does not repeat
+    // those. Without this a killed critter stays blocking its tile and blocks
+    // line-of-sight, diverging AI pathing and to-hit.
+    if (!animated) {
+        if (_main_ctd.attacker != nullptr && (_main_ctd.attackerFlags & DAM_DEAD) != 0) {
+            critterKill(_main_ctd.attacker, -1, false);
         }
-
-        _apply_damage(&_main_ctd, true);
-
-        Object* attacker = _main_ctd.attacker;
-        if (attacker == gDude && _combat_highlight == 2) {
-            _combat_outline_on();
+        if (_main_ctd.defender != nullptr && (_main_ctd.defenderFlags & DAM_DEAD) != 0) {
+            critterKill(_main_ctd.defender, -1, false);
         }
-
-        if (_scr_end_combat()) {
-            if ((gDude->data.critter.combat.results & DAM_KNOCKED_OUT) != 0) {
-                if (attacker->data.critter.combat.team == gDude->data.critter.combat.team) {
-                    _combat_ending_guy = gDude->data.critter.combat.whoHitMe;
-                } else {
-                    _combat_ending_guy = attacker;
-                }
+        for (int index = 0; index < _main_ctd.extrasLength; index++) {
+            if ((_main_ctd.extrasFlags[index] & DAM_DEAD) != 0) {
+                critterKill(_main_ctd.extras[index], -1, false);
             }
         }
+    }
 
-        attackInit(&_main_ctd, _main_ctd.attacker, nullptr, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+    // Thrown-weapon consumption. The animated path runs itemRemove/itemReplace/object
+    // placement inline inside _action_ranged's throw branch; the server skips that
+    // composite, so apply the same authoritative state directly (else a thrown weapon is
+    // never consumed — pre-existing bug). No-op for non-throws. Headless only: the client
+    // (animated=true) still consumes via _action_ranged, so there is no double-apply.
+    if (!animated) {
+        actionThrowConsumeHeadless(&_main_ctd);
+    }
 
-        if ((attacker->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) {
-            if ((attacker->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) == 0) {
-                _combat_standup(attacker);
+    // MP_PROTOCOL.md §2: one resolved attack (the causal envelope; state rode
+    // objectDelta). Emitted after damage/death are final and BEFORE the _main_ctd
+    // re-init below, so all fields are readable. No-op under null/client (byte-
+    // identical). See Presenter::attackResult.
+    //
+    // CONVERGENCE (record channel = sole attack presenter): when this attack's animation
+    // is carried by the record stream (EVENT_PRES_SEQ), suppress this decoder-mirror cue —
+    // else the viewer double-presents it (rocket gib twice; a grenade would double every
+    // victim). The presseq already carries the anim AND reserves the same participants, so
+    // nothing is lost. Off record / SP → still emitted (goldens byte-identical).
+    if (!combatAttackRecorded(_main_ctd.attacker, _main_ctd.hitMode)) {
+        presenter()->attackResult(&_main_ctd);
+    }
+
+    // Knockback APPLY — deferred to HERE so its EVENT_MOVE is buffered AFTER the reserving
+    // event above (attackResult, or the recorded presSeq emitted earlier in _action_attack).
+    // The client then holds the durMs=0 knockback snap against the victim's now-reserved
+    // replay and commits it at the slide's action frame (resolveHeld). Dead victims were
+    // computed as no-move, so a critterKill above never strands a freed pointer. Pointers +
+    // tiles were captured pre-damage; independent of the _main_ctd re-init below.
+    if (!animated) {
+        _combat_commit_knockback(kbVictims, kbDests, kbCount);
+    }
+
+    // Idle-deadline pacing (server_loop.h): an AI attack adds a swing estimate to the
+    // backlog the client animates before the player's turn is on screen. Only inside a
+    // resumable session and only for AI attackers (the player's own swing is already
+    // shown); off the resumable path there is no session, so goldens are byte-identical.
+    if (combatSessionActive() && _main_ctd.attacker != gDude) {
+        serverAddPresentationCostMs(kAttackPresentationEstimateMs);
+    }
+
+    Object* attacker = _main_ctd.attacker;
+    if (attacker == gDude && _combat_highlight == 2) {
+        _combat_outline_on();
+    }
+
+    if (_scr_end_combat()) {
+        if ((gDude->data.critter.combat.results & DAM_KNOCKED_OUT) != 0) {
+            if (attacker->data.critter.combat.team == gDude->data.critter.combat.team) {
+                _combat_ending_guy = gDude->data.critter.combat.whoHitMe;
+            } else {
+                _combat_ending_guy = attacker;
             }
+        }
+    }
+
+    attackInit(&_main_ctd, _main_ctd.attacker, nullptr, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+
+    if ((attacker->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) {
+        if ((attacker->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) == 0) {
+            _combat_standup(attacker);
         }
     }
 }
@@ -5393,7 +5946,7 @@ static void _combat_standup(Object* a1)
     int v2;
 
     v2 = 3;
-    if (a1 == gDude && perkGetRank(a1, PERK_QUICK_RECOVERY)) {
+    if (playerActorIs(a1) && perkGetRank(a1, PERK_QUICK_RECOVERY)) {
         v2 = 1;
     }
 
@@ -5404,238 +5957,13 @@ static void _combat_standup(Object* a1)
     }
 
     if (a1 == gDude) {
-        interfaceRenderActionPoints(gDude->data.critter.combat.ap, _combat_free_move);
+        presenter()->hudActionPoints(gDude->data.critter.combat.ap, _combat_free_move);
     }
 
     _dude_standup(a1);
 
     // NOTE: Uninline.
     _combat_turn_run();
-}
-
-// Render two digits.
-//
-// 0x42603C
-static void _print_tohit(unsigned char* dest, int destPitch, int accuracy)
-{
-    FrmImage numbersFrmImage;
-    int numbersFid = buildFid(OBJ_TYPE_INTERFACE, 82, 0, 0, 0);
-    if (!numbersFrmImage.lock(numbersFid)) {
-        return;
-    }
-
-    if (accuracy >= 0) {
-        blitBufferToBuffer(numbersFrmImage.getData() + 9 * (accuracy % 10), 9, 17, 360, dest + 9, destPitch);
-        blitBufferToBuffer(numbersFrmImage.getData() + 9 * (accuracy / 10), 9, 17, 360, dest, destPitch);
-    } else {
-        blitBufferToBuffer(numbersFrmImage.getData() + 108, 6, 17, 360, dest + 9, destPitch);
-        blitBufferToBuffer(numbersFrmImage.getData() + 108, 6, 17, 360, dest, destPitch);
-    }
-}
-
-// 0x42612C
-static char* hitLocationGetName(Object* critter, int hitLocation)
-{
-    MessageListItem messageListItem;
-    messageListItem.num = 1000 + 10 * _art_alias_num(critter->fid & 0xFFF) + hitLocation;
-    if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-        return messageListItem.text;
-    }
-
-    return nullptr;
-}
-
-// 0x4261B4
-static void _draw_loc_off(int a1, int a2)
-{
-    _draw_loc_(a2, _colorTable[992]);
-}
-
-// 0x4261C0
-static void _draw_loc_on_(int a1, int a2)
-{
-    _draw_loc_(a2, _colorTable[31744]);
-}
-
-// 0x4261CC
-static void _draw_loc_(int eventCode, int color)
-{
-    color |= 0x3000000;
-
-    if (eventCode >= 4) {
-        char* name = hitLocationGetName(gCalledShotCritter, _hit_loc_right[eventCode - 4]);
-        int width = fontGetStringWidth(name);
-        windowDrawText(gCalledShotWindow, name, 0, 431 - width, _call_ty[eventCode - 4] - 86, color);
-    } else {
-        char* name = hitLocationGetName(gCalledShotCritter, _hit_loc_left[eventCode]);
-        windowDrawText(gCalledShotWindow, name, 0, 74, _call_ty[eventCode] - 86, color);
-    }
-}
-
-// 0x426218
-static int calledShotSelectHitLocation(Object* critter, int* hitLocation, int hitMode)
-{
-    *hitLocation = HIT_LOCATION_TORSO;
-
-    if (critter == nullptr) {
-        return 0;
-    }
-
-    if (PID_TYPE(critter->pid) != OBJ_TYPE_CRITTER) {
-        return 0;
-    }
-
-    gCalledShotCritter = critter;
-
-    // The default value is 68, which centers called shot window given it's
-    // width (68 - 504 - 68).
-    int calledShotWindowX = (screenGetWidth() - CALLED_SHOT_WINDOW_WIDTH) / 2;
-    // Center vertically for HRP, otherwise maintain original location (20).
-    int calledShotWindowY = screenGetHeight() != 480
-        ? (screenGetHeight() - INTERFACE_BAR_HEIGHT - 1 - CALLED_SHOT_WINDOW_HEIGHT) / 2
-        : CALLED_SHOT_WINDOW_Y;
-    gCalledShotWindow = windowCreate(calledShotWindowX,
-        calledShotWindowY,
-        CALLED_SHOT_WINDOW_WIDTH,
-        CALLED_SHOT_WINDOW_HEIGHT,
-        _colorTable[0],
-        WINDOW_MODAL);
-    if (gCalledShotWindow == -1) {
-        return -1;
-    }
-
-    unsigned char* windowBuffer = windowGetBuffer(gCalledShotWindow);
-
-    FrmImage backgroundFrm;
-    int backgroundFid = buildFid(OBJ_TYPE_INTERFACE, 118, 0, 0, 0);
-    if (!backgroundFrm.lock(backgroundFid)) {
-        windowDestroy(gCalledShotWindow);
-        return -1;
-    }
-
-    blitBufferToBuffer(backgroundFrm.getData(),
-        CALLED_SHOT_WINDOW_WIDTH,
-        CALLED_SHOT_WINDOW_HEIGHT,
-        CALLED_SHOT_WINDOW_WIDTH,
-        windowBuffer,
-        CALLED_SHOT_WINDOW_WIDTH);
-
-    FrmImage critterFrm;
-    int critterFid = buildFid(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_CALLED_SHOT_PIC, 0, 0);
-    if (critterFrm.lock(critterFid)) {
-        blitBufferToBuffer(critterFrm.getData(),
-            170,
-            225,
-            170,
-            windowBuffer + CALLED_SHOT_WINDOW_WIDTH * 31 + 168,
-            CALLED_SHOT_WINDOW_WIDTH);
-    }
-
-    FrmImage cancelButtonNormalFrmImage;
-    int cancelButtonNormalFid = buildFid(OBJ_TYPE_INTERFACE, 8, 0, 0, 0);
-    if (!cancelButtonNormalFrmImage.lock(cancelButtonNormalFid)) {
-        windowDestroy(gCalledShotWindow);
-        return -1;
-    }
-
-    FrmImage cancelButtonPressedFrmImage;
-    int cancelButtonPressedFid = buildFid(OBJ_TYPE_INTERFACE, 9, 0, 0, 0);
-    if (!cancelButtonPressedFrmImage.lock(cancelButtonPressedFid)) {
-        windowDestroy(gCalledShotWindow);
-        return -1;
-    }
-
-    // Cancel button
-    int cancelBtn = buttonCreate(gCalledShotWindow,
-        210,
-        268,
-        15,
-        16,
-        -1,
-        -1,
-        -1,
-        KEY_ESCAPE,
-        cancelButtonNormalFrmImage.getData(),
-        cancelButtonPressedFrmImage.getData(),
-        nullptr,
-        BUTTON_FLAG_TRANSPARENT);
-    if (cancelBtn != -1) {
-        buttonSetCallbacks(cancelBtn, _gsound_red_butt_press, _gsound_red_butt_release);
-    }
-
-    int oldFont = fontGetCurrent();
-    fontSetCurrent(101);
-
-    for (int index = 0; index < 4; index++) {
-        int probability;
-        int btn;
-
-        probability = _determine_to_hit(gDude, critter, _hit_loc_left[index], hitMode);
-        _print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (_call_ty[index] - 86) + 33, CALLED_SHOT_WINDOW_WIDTH, probability);
-
-        btn = buttonCreate(gCalledShotWindow, 33, _call_ty[index] - 90, 128, 20, index, index, -1, index, nullptr, nullptr, nullptr, 0);
-        buttonSetMouseCallbacks(btn, _draw_loc_on_, _draw_loc_off, nullptr, nullptr);
-        _draw_loc_(index, _colorTable[992]);
-
-        probability = _determine_to_hit(gDude, critter, _hit_loc_right[index], hitMode);
-        _print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (_call_ty[index] - 86) + 453, CALLED_SHOT_WINDOW_WIDTH, probability);
-
-        btn = buttonCreate(gCalledShotWindow, 341, _call_ty[index] - 90, 128, 20, index + 4, index + 4, -1, index + 4, nullptr, nullptr, nullptr, 0);
-        buttonSetMouseCallbacks(btn, _draw_loc_on_, _draw_loc_off, nullptr, nullptr);
-        _draw_loc_(index + 4, _colorTable[992]);
-    }
-
-    windowRefresh(gCalledShotWindow);
-
-    bool gameUiWasDisabled = gameUiIsDisabled();
-    if (gameUiWasDisabled) {
-        gameUiEnable();
-    }
-
-    _gmouse_disable(0);
-    gameMouseSetCursor(MOUSE_CURSOR_ARROW);
-
-    int eventCode;
-    while (true) {
-        sharedFpsLimiter.mark();
-
-        eventCode = inputGetInput();
-
-        if (eventCode == KEY_ESCAPE) {
-            break;
-        }
-
-        if (eventCode >= 0 && eventCode < HIT_LOCATION_COUNT) {
-            break;
-        }
-
-        if (_game_user_wants_to_quit != 0) {
-            break;
-        }
-
-        renderPresent();
-        sharedFpsLimiter.throttle();
-    }
-
-    _gmouse_enable();
-
-    if (gameUiWasDisabled) {
-        gameUiDisable(0);
-    }
-
-    fontSetCurrent(oldFont);
-
-    windowDestroy(gCalledShotWindow);
-
-    if (eventCode == KEY_ESCAPE) {
-        return -1;
-    }
-
-    *hitLocation = eventCode < 4 ? _hit_loc_left[eventCode] : _hit_loc_right[eventCode - 4];
-
-    soundPlayFile("icsxxxx1");
-
-    return 0;
 }
 
 // check for possibility of performing attacking
@@ -5712,6 +6040,21 @@ bool _combat_to_hit(Object* target, int* accuracy)
 }
 
 // 0x4267CC
+// Wire-viewer attack commit hook (COMBAT_CLIENT_DESIGN.md §3.b). When the SDL wire
+// viewer runs _combat_attack_this, the whole vanilla selection UX (turn guard, hit
+// mode, bad-shot messages, called-shot picker) runs locally exactly as in the real
+// game; only the COMMIT point — where the local sim would begin — forwards the fully
+// selected attack UPSTREAM through this hook instead. Held as a pointer so f2_core /
+// f2_server link without f2_client (client_net.cc's implementation lives there); it
+// is null on every non-viewer path, and the fork is additionally gated on
+// clientViewerActive() so it is inert wherever the flag is unset (all goldens).
+static void (*gViewerAttackHook)(Object* target, int hitMode, int hitLocation) = nullptr;
+
+void combatSetViewerAttackHook(void (*hook)(Object* target, int hitMode, int hitLocation))
+{
+    gViewerAttackHook = hook;
+}
+
 void _combat_attack_this(Object* target)
 {
     if (target == nullptr) {
@@ -5739,16 +6082,16 @@ void _combat_attack_this(Object* target)
         item = critterGetWeaponForHitMode(gDude, hitMode);
         messageListItem.num = 101; // Out of ammo.
         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
 
         sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_OUT_OF_AMMO, item, hitMode, nullptr);
-        soundPlayFile(sfx);
+        presenter()->sfxPlay(sfx);
         return;
     case COMBAT_BAD_SHOT_OUT_OF_RANGE:
         messageListItem.num = 102; // Target out of range.
         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
         return;
     case COMBAT_BAD_SHOT_NOT_ENOUGH_AP:
@@ -5757,7 +6100,7 @@ void _combat_attack_this(Object* target)
         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
             int actionPointsRequired = weaponGetActionPointCost(gDude, hitMode, aiming);
             snprintf(formattedText, sizeof(formattedText), messageListItem.text, actionPointsRequired);
-            displayMonitorAddMessage(formattedText);
+            presenter()->consoleMessage(formattedText);
         }
         return;
     case COMBAT_BAD_SHOT_ALREADY_DEAD:
@@ -5765,19 +6108,19 @@ void _combat_attack_this(Object* target)
     case COMBAT_BAD_SHOT_AIM_BLOCKED:
         messageListItem.num = 104; // Your aim is blocked.
         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
         return;
     case COMBAT_BAD_SHOT_ARM_CRIPPLED:
         messageListItem.num = 106; // You cannot use two-handed weapons with a crippled arm.
         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
         return;
     case COMBAT_BAD_SHOT_BOTH_ARMS_CRIPPLED:
         messageListItem.num = 105; // You cannot use weapons with both arms crippled.
         if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
         return;
     }
@@ -5797,6 +6140,11 @@ void _combat_attack_this(Object* target)
     }
 
     if (!aiming) {
+        // §3.b commit fork: forward the unaimed shot upstream instead of simulating.
+        if (clientViewerActive() && gViewerAttackHook != nullptr) {
+            gViewerAttackHook(target, hitMode, HIT_LOCATION_UNCALLED);
+            return;
+        }
         _combat_attack(gDude, target, hitMode, HIT_LOCATION_UNCALLED);
         return;
     }
@@ -5807,71 +6155,14 @@ void _combat_attack_this(Object* target)
 
     int hitLocation;
     if (calledShotSelectHitLocation(target, &hitLocation, hitMode) != -1) {
+        // §3.b commit fork: the called-shot picker (modal, local, pure) already ran;
+        // forward the aimed shot upstream instead of simulating.
+        if (clientViewerActive() && gViewerAttackHook != nullptr) {
+            gViewerAttackHook(target, hitMode, hitLocation);
+            return;
+        }
         _combat_attack(gDude, target, hitMode, hitLocation);
     }
-}
-
-// Highlights critters.
-//
-// 0x426AA8
-void _combat_outline_on()
-{
-    if (settings.preferences.target_highlight == TARGET_HIGHLIGHT_OFF) {
-        return;
-    }
-
-    if (gameMouseGetMode() != GAME_MOUSE_MODE_CROSSHAIR) {
-        return;
-    }
-
-    if (isInCombat()) {
-        for (int index = 0; index < _list_total; index++) {
-            _combat_update_critter_outline_for_los(_combat_list[index], 1);
-        }
-    } else {
-        Object** critterList;
-        int critterListLength = objectListCreate(-1, gElevation, OBJ_TYPE_CRITTER, &critterList);
-        for (int index = 0; index < critterListLength; index++) {
-            Object* critter = critterList[index];
-            if (critter != gDude && (critter->data.critter.combat.results & DAM_DEAD) == 0) {
-                _combat_update_critter_outline_for_los(critter, 1);
-            }
-        }
-
-        if (critterListLength != 0) {
-            objectListFree(critterList);
-        }
-    }
-
-    // NOTE: Uninline.
-    _combat_update_critters_in_los(true);
-
-    tileWindowRefresh();
-}
-
-// 0x426BC0
-void _combat_outline_off()
-{
-    int i;
-    int v5;
-    Object** v9;
-
-    if (gCombatState & 1) {
-        for (i = 0; i < _list_total; i++) {
-            objectDisableOutline(_combat_list[i], nullptr);
-        }
-    } else {
-        v5 = objectListCreate(-1, gElevation, 1, &v9);
-        for (i = 0; i < v5; i++) {
-            objectDisableOutline(v9[i], nullptr);
-            objectClearOutline(v9[i], nullptr);
-        }
-        if (v5) {
-            objectListFree(v9);
-        }
-    }
-
-    tileWindowRefresh();
 }
 
 // 0x426C64
@@ -6014,7 +6305,7 @@ void _combat_delete_critter(Object* obj)
 void _combatKillCritterOutsideCombat(Object* critter_obj, char* msg)
 {
     if (critter_obj != gDude) {
-        displayMonitorAddMessage(msg);
+        presenter()->consoleMessage(msg);
         scriptExecProc(critter_obj->sid, SCRIPT_PROC_DESTROY);
         critterKill(critter_obj, -1, 1);
     }

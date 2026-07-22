@@ -1,15 +1,22 @@
 #include "input.h"
 
+#include <stdlib.h>
+
 #include <SDL.h>
 
 #include "audio_engine.h"
+#include "client_net.h"
 #include "color.h"
 #include "delay.h"
 #include "dinput.h"
 #include "draw.h"
+#include "game_movie.h"
+#include "input_replay.h"
 #include "kb.h"
 #include "memory.h"
 #include "mouse.h"
+#include "server_loop.h"
+#include "sim_clock.h"
 #include "svga.h"
 #include "text_font.h"
 #include "touch.h"
@@ -31,12 +38,6 @@ typedef struct RepeatInfo {
     int tick;
     int repeatCount;
 } RepeatInfo;
-
-typedef struct TickerListNode {
-    int flags;
-    TickerProc* proc;
-    struct TickerListNode* next;
-} TickerListNode;
 
 static int dequeueInputEvent();
 static void screenshotBlitter(unsigned char* src, int src_pitch, int a3, int x, int y, int width, int height, int dest_x, int dest_y);
@@ -89,14 +90,12 @@ static unsigned char* gScreenshotBuffer;
 // 0x6AC77C
 static int gInputEventQueueWriteIndex;
 
-// 0x6AC780
-static bool gRunLoopDisabled;
-
-// 0x6AC784
-static TickerListNode* gTickerListHead;
-
-// 0x6AC788
-static unsigned int gTickerLastTimestamp;
+// Wall-clock source for the timing layer (f2_core timing.cc), registered below
+// in inputInit(). Keeps SDL confined to f2_client while getTicks() lives in core.
+static unsigned int _sdlGetTicks()
+{
+    return SDL_GetTicks();
+}
 
 // 0x4C8A70
 int inputInit(int a1)
@@ -125,9 +124,9 @@ int inputInit(int a1)
     gInputEventQueueReadIndex = -1;
     _input_mx = -1;
     _input_my = -1;
-    gRunLoopDisabled = 0;
+    tickersReset();
+    clockProviderSet(_sdlGetTicks);
     gScreenshotHandler = screenshotHandlerDefaultImpl;
-    gTickerListHead = nullptr;
     gScreenshotKeyCode = KEY_ALT_C;
 
     return 0;
@@ -141,12 +140,7 @@ void inputExit()
     keyboardFree();
     directInputFree();
 
-    TickerListNode* curr = gTickerListHead;
-    while (curr != nullptr) {
-        TickerListNode* next = curr->next;
-        internal_free(curr);
-        curr = next;
-    }
+    tickersFree();
 }
 
 // 0x4C8B78
@@ -156,7 +150,10 @@ int inputGetInput()
 
     _GNW95_process_message();
 
-    if (!gProgramIsActive) {
+    // A network viewer is a passive mirror — it must keep pumping the socket
+    // and rendering while unfocused (the lost-focus block would freeze it and
+    // backpressure the server). The normal game keeps its pause-on-focus-loss.
+    if (!gProgramIsActive && !clientViewerActive()) {
         _GNW95_lost_focus();
     }
 
@@ -266,78 +263,6 @@ void inputEventQueueReset()
 {
     gInputEventQueueReadIndex = -1;
     gInputEventQueueWriteIndex = 0;
-}
-
-// 0x4C8D1C
-void tickersExecute()
-{
-    if (gRunLoopDisabled) {
-        return;
-    }
-
-    gTickerLastTimestamp = SDL_GetTicks();
-
-    TickerListNode* curr = gTickerListHead;
-    TickerListNode** currPtr = &(gTickerListHead);
-
-    while (curr != nullptr) {
-        TickerListNode* next = curr->next;
-        if (curr->flags & 1) {
-            *currPtr = next;
-
-            internal_free(curr);
-        } else {
-            curr->proc();
-            currPtr = &(curr->next);
-        }
-        curr = next;
-    }
-}
-
-// 0x4C8D74
-void tickersAdd(TickerProc* proc)
-{
-    TickerListNode* curr = gTickerListHead;
-    while (curr != nullptr) {
-        if (curr->proc == proc) {
-            if ((curr->flags & 0x01) != 0) {
-                curr->flags &= ~0x01;
-                return;
-            }
-        }
-        curr = curr->next;
-    }
-
-    curr = (TickerListNode*)internal_malloc(sizeof(*curr));
-    curr->flags = 0;
-    curr->proc = proc;
-    curr->next = gTickerListHead;
-    gTickerListHead = curr;
-}
-
-// 0x4C8DC4
-void tickersRemove(TickerProc* proc)
-{
-    TickerListNode* curr = gTickerListHead;
-    while (curr != nullptr) {
-        if (curr->proc == proc) {
-            curr->flags |= 0x01;
-            return;
-        }
-        curr = curr->next;
-    }
-}
-
-// 0x4C8DE4
-void tickersEnable()
-{
-    gRunLoopDisabled = false;
-}
-
-// 0x4C8DF0
-void tickersDisable()
-{
-    gRunLoopDisabled = true;
 }
 
 // 0x4C8F4C
@@ -508,12 +433,6 @@ void screenshotHandlerConfigure(int keyCode, ScreenshotHandler* handler)
     gScreenshotHandler = handler;
 }
 
-// 0x4C9370
-unsigned int getTicks()
-{
-    return SDL_GetTicks();
-}
-
 // 0x4C937C
 void inputPauseForTocks(unsigned int delay)
 {
@@ -537,31 +456,6 @@ void inputPauseForTocks(unsigned int delay)
 void inputBlockForTocks(unsigned int ms)
 {
     delay_ms(ms);
-}
-
-// 0x4C93E0
-unsigned int getTicksSince(unsigned int start)
-{
-    unsigned int end = SDL_GetTicks();
-
-    // NOTE: Uninline.
-    return getTicksBetween(end, start);
-}
-
-// 0x4C9400
-unsigned int getTicksBetween(unsigned int end, unsigned int start)
-{
-    if (start > end) {
-        return INT_MAX;
-    } else {
-        return end - start;
-    }
-}
-
-// 0x4C9410
-unsigned int _get_bk_time()
-{
-    return gTickerLastTimestamp;
 }
 
 // 0x4C9490
@@ -907,6 +801,8 @@ void _GNW95_process_message()
     // is disabled, because if we ignore it, we'll never be able to reactivate
     // it again.
 
+    inputReplayPumpTick();
+
     KeyboardData keyboardData;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -931,6 +827,7 @@ void _GNW95_process_message()
             if (!keyboardIsDisabled()) {
                 keyboardData.key = e.key.keysym.scancode;
                 keyboardData.down = (e.key.state & SDL_PRESSED) != 0;
+                inputReplayRecordKey(keyboardData.key, keyboardData.down != 0);
                 _GNW95_process_key(&keyboardData);
             }
             break;
@@ -939,6 +836,15 @@ void _GNW95_process_message()
             case SDL_WINDOWEVENT_EXPOSED:
                 windowRefreshAll(&_scr_size);
                 break;
+            case SDL_WINDOWEVENT_ENTER:
+                // Re-assert the windowed mouse grab whenever the pointer re-enters
+                // the window. FOCUS_GAINED alone misses cases where the confine was
+                // dropped without a focus change (some WMs/compositors), which reads
+                // as "the cursor sometimes escapes the window".
+                if (gSdlWindowedMode && gSdlWindow != nullptr) {
+                    SDL_SetWindowGrab(gSdlWindow, SDL_TRUE);
+                }
+                break;
             case SDL_WINDOWEVENT_SIZE_CHANGED:
                 handleWindowSizeChanged();
                 break;
@@ -946,10 +852,33 @@ void _GNW95_process_message()
                 gProgramIsActive = true;
                 windowRefreshAll(&_scr_size);
                 audioEngineResume();
+                // Re-confine the mouse when a windowed window regains focus (SDL
+                // drops the grab while unfocused so alt-tab can leave).
+                if (gSdlWindowedMode && gSdlWindow != nullptr) {
+                    SDL_SetWindowGrab(gSdlWindow, SDL_TRUE);
+                }
                 break;
             case SDL_WINDOWEVENT_FOCUS_LOST:
                 gProgramIsActive = false;
-                audioEnginePause();
+                // Explicitly RELEASE the windowed mouse grab on focus loss. SDL keeps
+                // the grab FLAG set across focus changes, so re-calling
+                // SetWindowGrab(TRUE) on FOCUS_GAINED is a no-op and the WM never
+                // re-confines — the cursor escapes after the first alt-tab. Dropping
+                // it here makes the regain a real off->on transition that re-applies
+                // the confine. Also lets alt-tab leave the window freely.
+                if (gSdlWindowedMode && gSdlWindow != nullptr) {
+                    SDL_SetWindowGrab(gSdlWindow, SDL_FALSE);
+                }
+                // Keep audio running while a movie plays: the MVE player syncs
+                // playback to the audio clock, so pausing the device stalls the
+                // movie forever — and it stalls inside gameMoviePlay's own blocking
+                // loop, which on the network viewer wedges the server in the movie
+                // barrier with no escape but a hard kill. Movies are meant to play
+                // through even when the window is not focused; FOCUS_GAINED's resume
+                // is a harmless no-op when we never paused.
+                if (!gameMovieIsPlaying()) {
+                    audioEnginePause();
+                }
                 break;
             }
             break;

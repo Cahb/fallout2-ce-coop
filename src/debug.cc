@@ -5,8 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <SDL.h>
-
 #include "memory.h"
 #include "platform_compat.h"
 #include "window_manager_private.h"
@@ -139,7 +137,7 @@ int debugPrint(const char* format, ...)
         rc = gDebugPrintProc(string);
     } else {
 #ifndef NDEBUG
-        SDL_LogMessageV(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO, format, args);
+        vfprintf(stderr, format, args);
 #endif
         rc = -1;
     }

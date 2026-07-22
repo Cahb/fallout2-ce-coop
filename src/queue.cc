@@ -11,6 +11,7 @@
 #include "message.h"
 #include "object.h"
 #include "perk.h"
+#include "presenter.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "scripts.h"
@@ -500,7 +501,7 @@ static int explosionFailureEventProcess(Object* obj, void* data)
     // Due to your inept handling, the explosive detonates prematurely.
     msg.num = 4000;
     if (messageListGetItem(&gMiscMessageList, &msg)) {
-        displayMonitorAddMessage(msg.text);
+        presenter()->consoleMessage(msg.text);
     }
 
     return _queue_do_explosion_(obj, true);

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #else
 #include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -23,33 +24,82 @@
 #include <chrono>
 #endif
 
-#include <SDL.h>
-
 namespace fallout {
 
 int compat_stricmp(const char* string1, const char* string2)
 {
-    return SDL_strcasecmp(string1, string2);
+#ifdef _WIN32
+    return _stricmp(string1, string2);
+#else
+    return strcasecmp(string1, string2);
+#endif
 }
 
 int compat_strnicmp(const char* string1, const char* string2, size_t size)
 {
-    return SDL_strncasecmp(string1, string2, size);
+#ifdef _WIN32
+    return _strnicmp(string1, string2, size);
+#else
+    return strncasecmp(string1, string2, size);
+#endif
 }
 
+// ASCII-only, locale-independent case mapping — matches the previous
+// SDL_strupr/SDL_strlwr semantics exactly (SDL_toupper/SDL_tolower fold only
+// a-z/A-Z), so output is byte-identical regardless of the C locale.
 char* compat_strupr(char* string)
 {
-    return SDL_strupr(string);
+    for (char* pch = string; *pch != '\0'; pch++) {
+        if (*pch >= 'a' && *pch <= 'z') {
+            *pch += 'A' - 'a';
+        }
+    }
+    return string;
 }
 
 char* compat_strlwr(char* string)
 {
-    return SDL_strlwr(string);
+    for (char* pch = string; *pch != '\0'; pch++) {
+        if (*pch >= 'A' && *pch <= 'Z') {
+            *pch += 'a' - 'A';
+        }
+    }
+    return string;
 }
 
+// Mirrors SDL_itoa/SDL_ltoa: optional '-' sign then the magnitude in `radix`,
+// digits drawn low-order-first from the 0-9a-z table and reversed in place.
+// Value is widened to long before negation (as SDL does) to stay well-defined.
 char* compat_itoa(int value, char* buffer, int radix)
 {
-    return SDL_itoa(value, buffer, radix);
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+    char* bufp = buffer;
+    long magnitude = value;
+    if (magnitude < 0) {
+        *bufp++ = '-';
+        magnitude = -magnitude;
+    }
+
+    char* start = bufp;
+    unsigned long uv = (unsigned long)magnitude;
+    if (uv != 0) {
+        while (uv > 0) {
+            *bufp++ = digits[uv % (unsigned)radix];
+            uv /= (unsigned)radix;
+        }
+    } else {
+        *bufp++ = '0';
+    }
+    *bufp = '\0';
+
+    for (char* end = bufp - 1; start < end; start++, end--) {
+        char tmp = *start;
+        *start = *end;
+        *end = tmp;
+    }
+
+    return buffer;
 }
 
 void compat_splitpath(const char* path, char* drive, char* dir, char* fname, char* ext)
@@ -375,7 +425,11 @@ int compat_access(const char* path, int mode)
 
 char* compat_strdup(const char* string)
 {
-    return SDL_strdup(string);
+#ifdef _WIN32
+    return _strdup(string);
+#else
+    return strdup(string);
+#endif
 }
 
 // It's a replacement for compat_filelength(fileno(stream)) on platforms without
@@ -387,6 +441,26 @@ long getFileSize(FILE* stream)
     long filesize = ftell(stream);
     fseek(stream, originalOffset, SEEK_SET);
     return filesize;
+}
+
+// Builds "name.ext" into `dest`, replacing whatever extension `name` had.
+//
+// Relocated out of the SDL/UI-coupled character_editor.cc into core: this is a
+// pure string helper the save pipeline (loadsave.cc) and map save-name logic
+// (map.cc) need on the headless server, where character_editor.cc never links.
+char* _strmfe(char* dest, const char* name, const char* ext)
+{
+    char* save = dest;
+
+    while (*name != '\0' && *name != '.') {
+        *dest++ = *name++;
+    }
+
+    *dest++ = '.';
+
+    strcpy(dest, ext);
+
+    return save;
 }
 
 } // namespace fallout

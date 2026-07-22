@@ -33,6 +33,7 @@
 #include "queue.h"
 #include "random.h"
 #include "scripts.h"
+#include "server_loop.h"
 #include "settings.h"
 #include "sfall_config.h"
 #include "stat.h"
@@ -118,24 +119,8 @@ typedef enum PipboyTextOptions {
     PIPBOY_TEXT_NO_INDENT = 0x80,
 } PipboyTextOptions;
 
-typedef enum PipboyRestDuration {
-    PIPBOY_REST_DURATION_TEN_MINUTES,
-    PIPBOY_REST_DURATION_THIRTY_MINUTES,
-    PIPBOY_REST_DURATION_ONE_HOUR,
-    PIPBOY_REST_DURATION_TWO_HOURS,
-    PIPBOY_REST_DURATION_THREE_HOURS,
-    PIPBOY_REST_DURATION_FOUR_HOURS,
-    PIPBOY_REST_DURATION_FIVE_HOURS,
-    PIPBOY_REST_DURATION_SIX_HOURS,
-    PIPBOY_REST_DURATION_UNTIL_MORNING,
-    PIPBOY_REST_DURATION_UNTIL_NOON,
-    PIPBOY_REST_DURATION_UNTIL_EVENING,
-    PIPBOY_REST_DURATION_UNTIL_MIDNIGHT,
-    PIPBOY_REST_DURATION_UNTIL_HEALED,
-    PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED,
-    PIPBOY_REST_DURATION_COUNT,
-    PIPBOY_REST_DURATION_COUNT_WITHOUT_PARTY = PIPBOY_REST_DURATION_COUNT - 1,
-} PipboyRestDuration;
+// Ledger H-42: the PipboyRestDuration enum moved to party_member.h with the
+// rest-intent decoder.
 
 typedef enum PipboyFrm {
     PIPBOY_FRM_LITTLE_RED_BUTTON_UP,
@@ -218,9 +203,6 @@ static void pipboyDrawHitPoints();
 static void pipboyWindowCreateButtons(int a1, int a2, bool a3);
 static void pipboyWindowDestroyButtons();
 static bool pipboyRest(int hours, int minutes, int kind);
-static bool _Check4Health(int minutes);
-static bool _AddHealth();
-static void _ClacTime(int* hours, int* minutes, int wakeUpHour);
 static int pipboyRenderScreensaver();
 static int questInit();
 static void questFree();
@@ -374,7 +356,6 @@ int gPipboyWindowButtonStart;
 int gPipboyCurrentLine;
 
 // 0x664518
-int _rest_time;
 
 // 0x66451C
 int _amcty_indx;
@@ -506,7 +487,7 @@ static int pipboyWindowInit(int intent)
     fontSetCurrent(101);
 
     _proc_bail_flag = 0;
-    _rest_time = 0;
+    restHealReset();
     gPipboyCurrentLine = 0;
     gPipboyWindowButtonCount = 0;
     gPipboyLinesCount = PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT / fontGetLineHeight() - 1;
@@ -1792,45 +1773,20 @@ static void pipboyHandleAlarmClock(int eventCode)
         int duration = eventCode - 4;
         int minutes = 0;
         int hours = 0;
+        int kind = 0;
 
-        switch (duration) {
-        case PIPBOY_REST_DURATION_TEN_MINUTES:
-            pipboyRest(0, 10, 0);
-            break;
-        case PIPBOY_REST_DURATION_THIRTY_MINUTES:
-            pipboyRest(0, 30, 0);
-            break;
-        case PIPBOY_REST_DURATION_ONE_HOUR:
-        case PIPBOY_REST_DURATION_TWO_HOURS:
-        case PIPBOY_REST_DURATION_THREE_HOURS:
-        case PIPBOY_REST_DURATION_FOUR_HOURS:
-        case PIPBOY_REST_DURATION_FIVE_HOURS:
-        case PIPBOY_REST_DURATION_SIX_HOURS:
-            pipboyRest(duration - 1, 0, 0);
-            break;
-        case PIPBOY_REST_DURATION_UNTIL_MORNING:
-            _ClacTime(&hours, &minutes, 8);
-            pipboyRest(hours, minutes, 0);
-            break;
-        case PIPBOY_REST_DURATION_UNTIL_NOON:
-            _ClacTime(&hours, &minutes, 12);
-            pipboyRest(hours, minutes, 0);
-            break;
-        case PIPBOY_REST_DURATION_UNTIL_EVENING:
-            _ClacTime(&hours, &minutes, 18);
-            pipboyRest(hours, minutes, 0);
-            break;
-        case PIPBOY_REST_DURATION_UNTIL_MIDNIGHT:
-            _ClacTime(&hours, &minutes, 0);
-            if (pipboyRest(hours, minutes, 0) == 0) {
+        // Ledger H-42: rest-intent decode (the rest-duration tables and the
+        // until-hour wall-clock math) extracted to core; the pipboy keeps
+        // the until-midnight midnight-render quirk.
+        restOptionDecode(duration, &hours, &minutes, &kind);
+
+        if (duration == PIPBOY_REST_DURATION_UNTIL_MIDNIGHT) {
+            if (pipboyRest(hours, minutes, kind) == 0) {
                 pipboyDrawNumber(0, 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
             }
             windowRefresh(gPipboyWindow);
-            break;
-        case PIPBOY_REST_DURATION_UNTIL_HEALED:
-        case PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED:
-            pipboyRest(0, 0, duration);
-            break;
+        } else {
+            pipboyRest(hours, minutes, kind);
         }
 
         soundPlayFile("ib2lu1x1");
@@ -1967,47 +1923,61 @@ static void pipboyWindowDestroyButtons()
 // 0x499A24
 static bool pipboyRest(int hours, int minutes, int duration)
 {
-    gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
+    // Headless server driver: the real rest loop below runs unchanged, but
+    // every window/render/input/real-time-pacing call is guarded out under the
+    // headless probe (main.cc drives the true modal loop via pipboyRestHeadless
+    // instead of reimplementing its control flow). The gate is the BROAD
+    // headlessProbeActive() (not serverLoopActive()) so the legacy probe pump,
+    // which never opens the pipboy window, also skips the UI. The sim (restSim*
+    // clock/heal accrual, queue-event interrupt, _proc_bail_flag) is identical
+    // on both paths.
+    const bool headless = headlessProbeActive();
+
+    if (!headless) {
+        gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
+    }
 
     bool rc = false;
 
     if (duration == 0) {
-        int hoursInMinutes = hours * 60;
-        double v1 = (double)hoursInMinutes + (double)minutes;
-        double v2 = v1 * (1.0 / 1440.0) * 3.5 + 0.25;
-        double v3 = (double)minutes / v1 * v2;
+        // Ledger H-40: rest-sim pacing (the animation frame counts both
+        // phases divide their clock interpolation and heal accrual by)
+        // extracted to core.
+        double v4;
+        double v7;
+        restSimPacing(hours, minutes, &v4, &v7);
+
         if (minutes != 0) {
             unsigned int gameTime = gameTimeGetTime();
 
-            double v4 = v3 * 20.0;
             int v5 = 0;
             for (int v5 = 0; v5 < (int)v4; v5++) {
-                sharedFpsLimiter.mark();
+                if (!headless) {
+                    sharedFpsLimiter.mark();
+                }
 
                 if (rc) {
                     break;
                 }
 
-                unsigned int start = getTicks();
+                unsigned int start = headless ? 0 : getTicks();
 
-                unsigned int v6 = (unsigned int)((double)v5 / v4 * ((double)minutes * 600.0) + (double)gameTime);
-                unsigned int nextEventTime = queueGetNextEventTime();
-                if (v6 >= nextEventTime) {
-                    gameTimeSetTime(nextEventTime + 1);
-                    if (queueProcessEvents()) {
-                        rc = true;
-                        debugPrint("PIPBOY: Returning from Queue trigger...\n");
-                        _proc_bail_flag = 1;
-                        break;
-                    }
-
-                    if (_game_user_wants_to_quit != 0) {
-                        rc = true;
-                    }
+                // Ledger H-40: clock interpolation, queue-event interrupt
+                // rule and clock advance extracted to core; the pipboy keeps
+                // the bail-flag bookkeeping, ESC polling and redraws.
+                int tick = restSimMinutesTick(gameTime, v5, v4, minutes);
+                if (tick == REST_SIM_TICK_EVENT) {
+                    rc = true;
+                    debugPrint("PIPBOY: Returning from Queue trigger...\n");
+                    _proc_bail_flag = 1;
+                    break;
                 }
 
-                if (!rc) {
-                    gameTimeSetTime(v6);
+                if (tick == REST_SIM_TICK_QUIT) {
+                    rc = true;
+                }
+
+                if (!rc && !headless) {
                     if (inputGetInput() == KEY_ESCAPE || _game_user_wants_to_quit != 0) {
                         rc = true;
                     }
@@ -2019,68 +1989,62 @@ static bool pipboyRest(int hours, int minutes, int duration)
                     delay_ms(50 - (getTicks() - start));
                 }
 
-                renderPresent();
-                sharedFpsLimiter.throttle();
-            }
-
-            if (!rc) {
-                gameTimeSetTime(gameTime + 600 * minutes);
-
-                if (_Check4Health(minutes)) {
-                    // NOTE: Uninline.
-                    _AddHealth();
+                if (!headless) {
+                    renderPresent();
+                    sharedFpsLimiter.throttle();
                 }
             }
 
-            pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-            pipboyDrawDate();
-            pipboyDrawHitPoints();
-            windowRefresh(gPipboyWindow);
+            if (!rc) {
+                // Ledger H-40: final clock snap + heal-cadence accrual
+                // extracted to core.
+                restSimMinutesFinish(gameTime, minutes);
+            }
+
+            if (!headless) {
+                pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
+                pipboyDrawDate();
+                pipboyDrawHitPoints();
+                windowRefresh(gPipboyWindow);
+            }
         }
 
         if (hours != 0 && !rc) {
             unsigned int gameTime = gameTimeGetTime();
-            double v7 = (v2 - v3) * 20.0;
 
             for (int hour = 0; hour < (int)v7; hour++) {
-                sharedFpsLimiter.mark();
+                if (!headless) {
+                    sharedFpsLimiter.mark();
+                }
 
                 if (rc) {
                     break;
                 }
 
-                unsigned int start = getTicks();
+                unsigned int start = headless ? 0 : getTicks();
 
-                if (inputGetInput() == KEY_ESCAPE || _game_user_wants_to_quit != 0) {
+                if (!headless && (inputGetInput() == KEY_ESCAPE || _game_user_wants_to_quit != 0)) {
                     rc = true;
                 }
 
-                unsigned int v8 = (unsigned int)((double)hour / v7 * (hours * GAME_TIME_TICKS_PER_HOUR) + gameTime);
-                unsigned int nextEventTime = queueGetNextEventTime();
-                if (!rc && v8 >= nextEventTime) {
-                    gameTimeSetTime(nextEventTime + 1);
-
-                    if (queueProcessEvents()) {
+                if (!rc) {
+                    // Ledger H-40: clock interpolation, queue-event interrupt
+                    // rule, clock advance and per-frame heal accrual extracted
+                    // to core (restSimHoursTick).
+                    int tick = restSimHoursTick(gameTime, hour, v7, hours);
+                    if (tick == REST_SIM_TICK_EVENT) {
                         rc = true;
                         debugPrint("PIPBOY: Returning from Queue trigger...\n");
                         _proc_bail_flag = 1;
                         break;
                     }
 
-                    if (_game_user_wants_to_quit != 0) {
+                    if (tick == REST_SIM_TICK_QUIT) {
                         rc = true;
                     }
                 }
 
-                if (!rc) {
-                    gameTimeSetTime(v8);
-
-                    int healthToAdd = (int)((double)hoursInMinutes / v7);
-                    if (_Check4Health(healthToAdd)) {
-                        // NOTE: Uninline.
-                        _AddHealth();
-                    }
-
+                if (!rc && !headless) {
                     pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
                     pipboyDrawDate();
                     pipboyDrawHitPoints();
@@ -2089,18 +2053,23 @@ static bool pipboyRest(int hours, int minutes, int duration)
                     delay_ms(50 - (getTicks() - start));
                 }
 
-                renderPresent();
-                sharedFpsLimiter.throttle();
+                if (!headless) {
+                    renderPresent();
+                    sharedFpsLimiter.throttle();
+                }
             }
 
             if (!rc) {
-                gameTimeSetTime(gameTime + GAME_TIME_TICKS_PER_HOUR * hours);
+                // Ledger H-40: final clock snap extracted to core.
+                restSimHoursFinish(gameTime, hours);
             }
 
-            pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-            pipboyDrawDate();
-            pipboyDrawHitPoints();
-            windowRefresh(gPipboyWindow);
+            if (!headless) {
+                pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
+                pipboyDrawDate();
+                pipboyDrawHitPoints();
+                windowRefresh(gPipboyWindow);
+            }
         }
     } else if (duration == PIPBOY_REST_DURATION_UNTIL_HEALED || duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED) {
         int currentHp = critterGetHitPoints(gDude);
@@ -2108,9 +2077,8 @@ static bool pipboyRest(int hours, int minutes, int duration)
         if (currentHp != maxHp
             || (duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED && partyIsAnyoneCanBeHealedByRest())) {
             // First pass - healing dude is the top priority.
-            int hpToHeal = maxHp - currentHp;
-            int healingRate = critterGetStat(gDude, STAT_HEALING_RATE);
-            int hoursToHeal = (int)((double)hpToHeal / (double)healingRate * 3.0);
+            // Ledger H-40: rest-until-healed duration math extracted to core.
+            int hoursToHeal = restUntilHealedDuration();
             while (!rc && hoursToHeal != 0) {
                 if (hoursToHeal <= 24) {
                     rc = pipboyRest(hoursToHeal, 0, 0);
@@ -2126,7 +2094,7 @@ static bool pipboyRest(int hours, int minutes, int duration)
             // performed in 3 hour increments.
             currentHp = critterGetHitPoints(gDude);
             maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
-            hpToHeal = maxHp - currentHp;
+            int hpToHeal = maxHp - currentHp;
 
             if (duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED) {
                 int partyHpToHeal = partyGetMaxWoundToHealByRest();
@@ -2151,81 +2119,37 @@ static bool pipboyRest(int hours, int minutes, int duration)
             }
         } else {
             // No one needs healing.
-            gameMouseSetCursor(MOUSE_CURSOR_ARROW);
+            if (!headless) {
+                gameMouseSetCursor(MOUSE_CURSOR_ARROW);
+            }
             return rc;
         }
     }
 
-    if (gameTimeGetTime() > queueGetNextEventTime()) {
-        if (queueProcessEvents()) {
-            debugPrint("PIPBOY: Returning from Queue trigger...\n");
-            _proc_bail_flag = 1;
-            rc = true;
-        }
+    // Ledger H-40: end-of-rest overdue-queue-event flush extracted to core.
+    if (restSimOverdueEvents()) {
+        debugPrint("PIPBOY: Returning from Queue trigger...\n");
+        _proc_bail_flag = 1;
+        rc = true;
     }
 
-    pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-    pipboyDrawDate();
-    windowRefresh(gPipboyWindow);
+    if (!headless) {
+        pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
+        pipboyDrawDate();
+        windowRefresh(gPipboyWindow);
 
-    gameMouseSetCursor(MOUSE_CURSOR_ARROW);
+        gameMouseSetCursor(MOUSE_CURSOR_ARROW);
+    }
 
     return rc;
 }
 
-// 0x499FCC
-static bool _Check4Health(int minutes)
+// Headless server rest driver entry (see main.cc): drives the real modal rest
+// loop above (pipboyRest) with all UI/real-time pacing guarded out under
+// serverLoopActive(). Returns true if a queued event/quit interrupted the rest.
+bool pipboyRestHeadless(int hours, int minutes, int kind)
 {
-    _rest_time += minutes;
-
-    if (_rest_time < 180) {
-        return false;
-    }
-
-    debugPrint("\n health added!\n");
-    _rest_time = 0;
-
-    return true;
-}
-
-// NOTE: Inlined.
-static bool _AddHealth()
-{
-    _partyMemberRestingHeal(3);
-
-    int currentHp = critterGetHitPoints(gDude);
-    int maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
-    return currentHp == maxHp;
-}
-
-// Returns [hours] and [minutes] needed to rest until [wakeUpHour].
-static void _ClacTime(int* hours, int* minutes, int wakeUpHour)
-{
-    int gameTimeHour = gameTimeGetHour();
-
-    *hours = gameTimeHour / 100;
-    *minutes = gameTimeHour % 100;
-
-    if (*hours != wakeUpHour || *minutes != 0) {
-        *hours = wakeUpHour - *hours;
-        if (*hours < 0) {
-            *hours += 24;
-            if (*minutes != 0) {
-                *hours -= 1;
-                *minutes = 60 - *minutes;
-            }
-        } else {
-            if (*minutes != 0) {
-                *hours -= 1;
-                *minutes = 60 - *minutes;
-                if (*hours < 0) {
-                    *hours = 23;
-                }
-            }
-        }
-    } else {
-        *hours = 24;
-    }
+    return pipboyRest(hours, minutes, kind);
 }
 
 // 0x49A0C8

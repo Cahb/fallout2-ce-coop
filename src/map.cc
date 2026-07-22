@@ -8,7 +8,7 @@
 #include "animation.h"
 #include "art.h"
 #include "automap.h"
-#include "character_editor.h"
+#include "platform_compat.h"
 #include "color.h"
 #include "combat.h"
 #include "critter.h"
@@ -25,16 +25,21 @@
 #include "item.h"
 #include "light.h"
 #include "loadsave.h"
+#include "map_render.h"
 #include "memory.h"
 #include "object.h"
 #include "palette.h"
 #include "party_member.h"
 #include "pipboy.h"
+#include "presenter.h"
+#include "player_sheet.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "queue.h"
 #include "random.h"
+#include "script_request_handler.h"
 #include "scripts.h"
+#include "server_players.h"
 #include "settings.h"
 #include "svga.h"
 #include "text_object.h"
@@ -46,15 +51,14 @@
 namespace fallout {
 
 static char* mapBuildPath(char* name);
-static int mapLoad(File* stream);
+// mapLoad(File*) is the inner stream loader (scripts-before-objects, gvars/lvars,
+// map-enter regen). Public (declared in map.h) for the STEP-4 join path, which
+// loads a snapshot blob directly (CLIENT_JOIN_DESIGN.md §B4) rather than through
+// mapLoadSaved (which ages/heals critters + touches the on-disk .SAV).
 static int _map_age_dead_critters();
-static void _map_fix_critter_combat_data();
+void _map_fix_critter_combat_data();
 static int _map_save();
 static int _map_save_file(File* stream);
-static void mapMakeMapsDirectory();
-static void isoWindowRefreshRect(Rect* rect);
-static void isoWindowRefreshRectGame(Rect* rect);
-static void isoWindowRefreshRectMapper(Rect* rect);
 static int mapGlobalVariablesInit(int count);
 static void mapGlobalVariablesFree();
 static int mapGlobalVariablesLoad(File* stream);
@@ -62,7 +66,6 @@ static int mapLocalVariablesInit(int count);
 static void mapLocalVariablesFree();
 static int mapLocalVariablesLoad(File* stream);
 static void _map_place_dude_and_mouse();
-static void square_init();
 static void _square_reset();
 static int _square_load(File* stream, int a2);
 static int mapHeaderWrite(MapHeader* ptr, File* stream);
@@ -75,7 +78,10 @@ static char byte_50B058[] = "";
 static char _aErrorF2[] = "ERROR! F2";
 
 // 0x519540
-static IsoWindowRefreshProc* _map_scroll_refresh = isoWindowRefreshRectGame;
+// De-static'd for the map_render.cc TU split: core _map_init assigns
+// isoWindowRefreshRectMapper here and render mapScroll reads it. The definition
+// stays in core; map_render.h re-exposes it via extern.
+IsoWindowRefreshProc* _map_scroll_refresh = isoWindowRefreshRectGame;
 
 // 0x519544
 static const int _map_data_elev_flags[ELEVATION_COUNT] = {
@@ -83,9 +89,6 @@ static const int _map_data_elev_flags[ELEVATION_COUNT] = {
     4,
     8,
 };
-
-// 0x519550
-static unsigned int gIsoWindowScrollTimestamp = 0;
 
 // 0x519554
 static bool gIsoEnabled = false;
@@ -135,26 +138,26 @@ static TileData _square_data[ELEVATION_COUNT];
 // 0x631D28
 static MapTransition gMapTransition;
 
-// 0x631D38
-static Rect gIsoWindowRect;
-
 // map.msg
 //
 // map_msg_file
 // 0x631D48
 MessageList gMapMessageList;
 
-// 0x631D50
-static unsigned char* gIsoWindowBuffer;
-
 // 0x631D54
 MapHeader gMapHeader;
 
+// STEP-4 viewer join: when set, mapLoad leaves scripts disabled so the map-enter
+// procs do not run (CLIENT_JOIN_DESIGN.md §E). Set only by the join-blob loader.
+static bool gMapViewerLoad = false;
+
+void mapSetViewerLoad(bool viewerLoad)
+{
+    gMapViewerLoad = viewerLoad;
+}
+
 // 0x631E40
 TileData* _square[ELEVATION_COUNT];
-
-// 0x631E4C
-int gIsoWindow;
 
 // 0x631E50
 static char _scratchStr[40];
@@ -169,78 +172,6 @@ static std::vector<void*> gMapGlobalPointers;
 // meaningless to save these pointers in file. As a workaround use second array
 // to store these pointers.
 static std::vector<void*> gMapLocalPointers;
-
-// iso_init
-// 0x481CA0
-int isoInit()
-{
-    tileScrollLimitingDisable();
-    tileScrollBlockingDisable();
-
-    // NOTE: Uninline.
-    square_init();
-
-    gIsoWindow = windowCreate(0, 0, screenGetWidth(), screenGetVisibleHeight(), 256, 10);
-    if (gIsoWindow == -1) {
-        debugPrint("win_add failed in iso_init\n");
-        return -1;
-    }
-
-    gIsoWindowBuffer = windowGetBuffer(gIsoWindow);
-    if (gIsoWindowBuffer == nullptr) {
-        debugPrint("win_get_buf failed in iso_init\n");
-        return -1;
-    }
-
-    if (windowGetRect(gIsoWindow, &gIsoWindowRect) != 0) {
-        debugPrint("win_get_rect failed in iso_init\n");
-        return -1;
-    }
-
-    if (artInit() != 0) {
-        debugPrint("art_init failed in iso_init\n");
-        return -1;
-    }
-
-    debugPrint(">art_init\t\t");
-
-    if (tileInit(_square, SQUARE_GRID_WIDTH, SQUARE_GRID_HEIGHT, HEX_GRID_WIDTH, HEX_GRID_HEIGHT, gIsoWindowBuffer, screenGetWidth(), screenGetVisibleHeight(), screenGetWidth(), isoWindowRefreshRect) != 0) {
-        debugPrint("tile_init failed in iso_init\n");
-        return -1;
-    }
-
-    debugPrint(">tile_init\t\t");
-
-    if (objectsInit(gIsoWindowBuffer, screenGetWidth(), screenGetVisibleHeight(), screenGetWidth()) != 0) {
-        debugPrint("obj_init failed in iso_init\n");
-        return -1;
-    }
-
-    debugPrint(">obj_init\t\t");
-
-    colorCycleInit();
-    debugPrint(">cycle_init\t\t");
-
-    tileScrollBlockingEnable();
-    tileScrollLimitingEnable();
-
-    if (interfaceInit() != 0) {
-        debugPrint("intface_init failed in iso_init\n");
-        return -1;
-    }
-
-    debugPrint(">intface_init\t\t");
-
-    // SFALL
-    elevatorsInit();
-
-    mapMakeMapsDirectory();
-
-    // NOTE: Uninline.
-    mapSetEnteringLocation(-1, -1, -1);
-
-    return 0;
-}
 
 // 0x481ED4
 void isoReset()
@@ -261,17 +192,11 @@ void isoReset()
     mapSetEnteringLocation(-1, -1, -1);
 }
 
-// 0x481F48
-void isoExit()
+// Ledger H-17 (extracted from isoExit): map-variable teardown is sim state —
+// the server must free MVARs/LVARs regardless of any render window. Called by
+// gameExit right after isoExit, preserving the original teardown order.
+void mapVariablesFree()
 {
-    interfaceFree();
-    colorCycleFree();
-    objectsExit();
-    tileExit();
-    artExit();
-
-    windowDestroy(gIsoWindow);
-
     // NOTE: Uninline.
     mapGlobalVariablesFree();
 
@@ -309,7 +234,7 @@ void _map_init()
 void _map_exit()
 {
     windowHide(gIsoWindow);
-    gameMouseSetCursor(MOUSE_CURSOR_ARROW);
+    presenter()->cursorSet(MOUSE_CURSOR_ARROW);
     tickersRemove(gameMouseRefresh);
 
     messageListRepositorySetStandardMessageList(STANDARD_MESSAGE_LIST_MAP, nullptr);
@@ -318,16 +243,18 @@ void _map_exit()
     }
 }
 
+// Ledger H-18: the world-freeze (_scr_enable_critters/_scr_disable_critters)
+// and gIsoEnabled are sim authority and stay core; the ticker/mouse/text chrome
+// here is future client-side and moves only once the client-init hook lands.
+//
 // 0x4820C0
 void isoEnable()
 {
     if (!gIsoEnabled) {
-        textObjectsEnable();
-        if (!gameUiIsDisabled()) {
-            _gmouse_enable();
-        }
-        tickersAdd(_object_animate);
-        tickersAdd(_dude_fidget);
+        // Chrome (float-text / mouse / frame-animation tickers) via the presenter
+        // seam; the critter freeze + gIsoEnabled are sim authority and stay core.
+        // Order matches the legacy body exactly. See Presenter::worldEnable.
+        presenter()->worldEnable();
         _scr_enable_critters();
         gIsoEnabled = true;
     }
@@ -341,10 +268,7 @@ bool isoDisable()
     }
 
     _scr_disable_critters();
-    tickersRemove(_dude_fidget);
-    tickersRemove(_object_animate);
-    _gmouse_disable(0);
-    textObjectsDisable();
+    presenter()->worldDisable();
 
     gIsoEnabled = false;
 
@@ -368,8 +292,8 @@ int mapSetElevation(int elevation)
     bool gameMouseWasVisible = false;
     if (gameMouseGetCursor() != MOUSE_CURSOR_WAIT_PLANET) {
         gameMouseWasVisible = gameMouseObjectsIsVisible();
-        gameMouseObjectsHide();
-        gameMouseSetCursor(MOUSE_CURSOR_NONE);
+        presenter()->mouseObjectsHide();
+        presenter()->cursorSet(MOUSE_CURSOR_NONE);
     }
 
     if (elevation != gElevation) {
@@ -387,7 +311,7 @@ int mapSetElevation(int elevation)
     }
 
     if (gameMouseWasVisible) {
-        gameMouseObjectsShow();
+        presenter()->mouseObjectsShow();
     }
 
     return 0;
@@ -599,106 +523,12 @@ int mapGetCurrentMap()
     return gMapHeader.index;
 }
 
-// 0x4826C0
-int mapScroll(int dx, int dy)
+// Bumped once per mapLoad (below). See map.h for why the index cannot serve.
+static unsigned int gMapLoadGeneration = 0;
+
+unsigned int mapGetLoadGeneration()
 {
-    if (getTicksSince(gIsoWindowScrollTimestamp) < 33) {
-        return -2;
-    }
-
-    gIsoWindowScrollTimestamp = getTicks();
-
-    int screenDx = dx * 32;
-    int screenDy = dy * 24;
-
-    if (screenDx == 0 && screenDy == 0) {
-        return -1;
-    }
-
-    gameMouseObjectsHide();
-
-    int centerScreenX;
-    int centerScreenY;
-    tileToScreenXY(gCenterTile, &centerScreenX, &centerScreenY, gElevation);
-    centerScreenX += screenDx + 16;
-    centerScreenY += screenDy + 8;
-
-    int newCenterTile = tileFromScreenXY(centerScreenX, centerScreenY, gElevation);
-    if (newCenterTile == -1) {
-        return -1;
-    }
-
-    if (tileSetCenter(newCenterTile, 0) == -1) {
-        return -1;
-    }
-
-    Rect r1;
-    rectCopy(&r1, &gIsoWindowRect);
-
-    Rect r2;
-    rectCopy(&r2, &r1);
-
-    int width = screenGetWidth();
-    int pitch = width;
-    int height = screenGetVisibleHeight();
-
-    if (screenDx != 0) {
-        width -= 32;
-    }
-
-    if (screenDy != 0) {
-        height -= 24;
-    }
-
-    if (screenDx < 0) {
-        r2.right = r2.left - screenDx;
-    } else {
-        r2.left = r2.right - screenDx;
-    }
-
-    unsigned char* src;
-    unsigned char* dest;
-    int step;
-    if (screenDy < 0) {
-        r1.bottom = r1.top - screenDy;
-        src = gIsoWindowBuffer + pitch * (height - 1);
-        dest = gIsoWindowBuffer + pitch * (screenGetVisibleHeight() - 1);
-        if (screenDx < 0) {
-            dest -= screenDx;
-        } else {
-            src += screenDx;
-        }
-        step = -pitch;
-    } else {
-        r1.top = r1.bottom - screenDy;
-        dest = gIsoWindowBuffer;
-        src = gIsoWindowBuffer + pitch * screenDy;
-
-        if (screenDx < 0) {
-            dest -= screenDx;
-        } else {
-            src += screenDx;
-        }
-        step = pitch;
-    }
-
-    for (int y = 0; y < height; y++) {
-        memmove(dest, src, width);
-        dest += step;
-        src += step;
-    }
-
-    if (screenDx != 0) {
-        _map_scroll_refresh(&r2);
-    }
-
-    if (screenDy != 0) {
-        _map_scroll_refresh(&r1);
-    }
-
-    windowRefresh(gIsoWindow);
-
-    return 0;
+    return gMapLoadGeneration;
 }
 
 // 0x482900
@@ -747,7 +577,7 @@ void mapNewMap()
 
     _square_reset();
     _map_place_dude_and_mouse();
-    tileWindowRefresh();
+    presenter()->worldInvalidate();
 }
 
 // 0x482A68
@@ -813,28 +643,27 @@ int mapLoadById(int map)
 }
 
 // 0x482B74
-static int mapLoad(File* stream)
+int mapLoad(File* stream)
 {
+    presenterSetEmissionsSuppressed(true);
+    // A new world is being built: every object is torn down and rebuilt (with
+    // netId 0) regardless of whether the map INDEX changes. Consumers rebaseline
+    // off this, not the index (map.h).
+    gMapLoadGeneration++;
     _map_save_in_game(true);
-    backgroundSoundLoad("wind2", 12, 13, 16);
+    presenter()->ambientSoundLoad("wind2", 12, 13, 16);
     isoDisable();
     _partyMemberPrepLoad();
-    _gmouse_disable_scrolling();
+    presenter()->scrollDisable();
 
     int savedMouseCursorId = gameMouseGetCursor();
-    gameMouseSetCursor(MOUSE_CURSOR_WAIT_PLANET);
+    presenter()->cursorSet(MOUSE_CURSOR_WAIT_PLANET);
     fileSetReadProgressHandler(gameMouseRefreshImmediately, 32768);
     tileDisable();
 
     int rc = 0;
 
-    windowFill(gIsoWindow,
-        0,
-        0,
-        windowGetWidth(gIsoWindow),
-        windowGetHeight(gIsoWindow),
-        _colorTable[0]);
-    windowRefresh(gIsoWindow);
+    presenter()->worldClear();
     animationStop();
     scriptsDisable();
 
@@ -945,9 +774,29 @@ static int mapLoad(File* stream)
         strcat(path, ".GAM");
         globalVarsRead(path, "MAP_GLOBAL_VARS:", &gMapGlobalVarsLength, &gMapGlobalVars);
         gMapHeader.globalVariablesCount = gMapGlobalVarsLength;
+
+        // CE: globalVarsRead() reallocates gMapGlobalVars and rewrites the
+        // length from the .GAM file, but knows nothing about the parallel
+        // gMapGlobalPointers vector — sized above from the .MAP header's count.
+        // When the .GAM declares more vars than the header does (cowbomb.map:
+        // header 0, .GAM 1) the vector stays short, and since mapGetGlobalVar/
+        // mapSetGlobalVar bounds-check only against gMapGlobalVarsLength, the
+        // first map-var access indexes it out of bounds and segfaults. Keep the
+        // two in lockstep.
+        gMapGlobalPointers.resize(gMapGlobalVarsLength);
     }
 
-    scriptsEnable();
+    // STEP-4 viewer join (CLIENT_JOIN_DESIGN.md §E): a joining viewer is a puppet
+    // and must run NO scripts. Leaving scripts disabled here makes every map-enter/
+    // update/start proc below a no-op (scriptExecProc gates on gScriptsEnabled,
+    // scripts.cc:1264), so the client adopts the blob's post-server-enter state
+    // verbatim instead of re-running a second, divergent map-enter (which mutates
+    // lvars / object flags / script bindings on non-idempotent maps). The map
+    // script is still REGISTERED (scriptAdd below is not gated), only its proc
+    // execution is suppressed. Default path (client + server) unchanged.
+    if (!gMapViewerLoad) {
+        scriptsEnable();
+    }
 
     if (gMapHeader.scriptIndex > 0) {
         error = "Error creating new map script";
@@ -992,16 +841,26 @@ err:
         rc = -1;
     } else {
         _obj_preload_art_cache(gMapHeader.flags);
+
+        // MP_PROTOCOL.md §2/§5: the active tactical map is now fully loaded — the
+        // universal choke every in-game map change funnels through (exit grids and
+        // elevators via mapHandleTransition, worldmap arrivals/encounters via
+        // worldmap_ui.cc mapLoadById). No-op under the null/client presenter, so
+        // byte-identical. gMapHeader.index / gElevation are the freshly-loaded
+        // values. NOTE: new-game (main.cc) and save-restore (mapLoadSaved) also
+        // reach here — that is snapshot territory; the NetworkPresenter adds the
+        // §5 load-window guard in P5-C. See Presenter::mapTransition (presenter.h).
+        presenter()->mapTransition(gMapHeader.index, gElevation);
     }
 
     _partyMemberRecoverLoad();
-    interfaceBarShow();
+    presenter()->hudBarShow();
     _proto_dude_update_gender();
     _map_place_dude_and_mouse();
     fileSetReadProgressHandler(nullptr, 0);
     isoEnable();
-    _gmouse_disable_scrolling();
-    gameMouseSetCursor(MOUSE_CURSOR_WAIT_PLANET);
+    presenter()->scrollDisable();
+    presenter()->cursorSet(MOUSE_CURSOR_WAIT_PLANET);
 
     if (scriptsExecStartProc() == -1) {
         debugPrint("\n   Error: scr_load_all_scripts failed!");
@@ -1016,7 +875,7 @@ err:
             objectSetRotation(gDude, gMapTransition.rotation, nullptr);
         }
     } else {
-        tileWindowRefresh();
+        presenter()->worldInvalidate();
     }
 
     gameTimeScheduleUpdateEvent();
@@ -1035,18 +894,19 @@ err:
     fileSetReadProgressHandler(nullptr, 0);
 
     if (gameUiIsDisabled() == 0) {
-        _gmouse_enable_scrolling();
+        presenter()->scrollEnable();
     }
 
-    gameMouseSetCursor(savedMouseCursorId);
+    presenter()->cursorSet(savedMouseCursorId);
 
     // NOTE: Uninline.
     mapSetEnteringLocation(-1, -1, -1);
 
-    gameMovieFadeOut();
+    presenter()->movieFadeOut();
 
     gMapHeader.version = 20;
 
+    presenterSetEmissionsSuppressed(false);
     return rc;
 }
 
@@ -1210,10 +1070,28 @@ int _map_target_load_area()
 }
 
 // 0x4835B4
+// Set while a NON-TRANSIT-AUTHORITY player actor's spatial procs run
+// (scripts.cc). Everything an exit grid does funnels through mapSetTransition,
+// so suppressing there is one choke point instead of auditing every script that
+// can call op_load_map — and it drops only the transition, leaving the rest of
+// the script's effects intact (an extra still trips the trap, just does not
+// travel). MP_PROPOSAL Ch 14.2.
+static bool gMapTransitionSuppressed = false;
+
+void mapSetTransitionSuppressed(bool suppressed)
+{
+    gMapTransitionSuppressed = suppressed;
+}
+
 int mapSetTransition(MapTransition* transition)
 {
     if (transition == nullptr) {
         return -1;
+    }
+
+    if (gMapTransitionSuppressed) {
+        debugPrint("map: transition request dropped (actor may not transit)\n");
+        return 0;
     }
 
     memcpy(&gMapTransition, transition, sizeof(gMapTransition));
@@ -1229,6 +1107,16 @@ int mapSetTransition(MapTransition* transition)
     return 0;
 }
 
+// Is a map transition latched and waiting for the beat tail? mapSetTransition
+// only records the request; mapHandleTransition performs it. Anything that keeps
+// mutating the world between those two points is working on a map that is about
+// to be torn down — the stepped walker uses this to stop walking the moment a
+// tile it crossed triggered an exit.
+bool mapTransitionPending()
+{
+    return gMapTransition.map != 0;
+}
+
 // 0x4835F8
 int mapHandleTransition()
 {
@@ -1236,20 +1124,20 @@ int mapHandleTransition()
         return 0;
     }
 
-    gameMouseObjectsHide();
+    presenter()->mouseObjectsHide();
 
-    gameMouseSetCursor(MOUSE_CURSOR_NONE);
+    presenter()->cursorSet(MOUSE_CURSOR_NONE);
 
     if (gMapTransition.map == -1) {
         if (!isInCombat()) {
             animationStop();
-            wmTownMap();
+            scriptRequestHandler()->townMap();
             memset(&gMapTransition, 0, sizeof(gMapTransition));
         }
     } else if (gMapTransition.map == -2) {
         if (!isInCombat()) {
             animationStop();
-            wmWorldMap();
+            scriptRequestHandler()->worldMap();
             memset(&gMapTransition, 0, sizeof(gMapTransition));
         }
     } else {
@@ -1267,6 +1155,29 @@ int mapHandleTransition()
                 objectSetLocation(gDude, gMapTransition.tile, gMapTransition.elevation, nullptr);
                 mapSetElevation(gMapTransition.elevation);
                 objectSetRotation(gDude, gMapTransition.rotation, nullptr);
+
+                // Everyone travels with the host (MP_PROPOSAL Ch 14.2). The host
+                // is placed on the entry tile above; extras ring it. With an empty
+                // registry the loop body never runs, so this is inert everywhere
+                // but a co-op server.
+                for (int slot = 1; slot < playerActorCount(); slot++) {
+                    Object* actor = playerActorAt(slot);
+                    // An offline body travels with the group ONLY as data (it is
+                    // off the object list; objectSetLocation would fail closed
+                    // anyway) — placing it would resurrect a player who left.
+                    if (actor == nullptr || !playerActorOnline(slot)) {
+                        continue;
+                    }
+                    int tile = playerActorFindFreeTileNear(gDude->tile, gMapTransition.elevation);
+                    if (tile == -1) {
+                        // Nowhere free within the ring: co-locate rather than
+                        // strand the actor off-map. Two bodies on one tile is
+                        // ugly; an actor at a stale tile on a new map is a bug.
+                        tile = gDude->tile;
+                    }
+                    objectSetLocation(actor, tile, gMapTransition.elevation, nullptr);
+                    objectSetRotation(actor, gMapTransition.rotation, nullptr);
+                }
             }
 
             if (tileSetCenter(gDude->tile, TILE_SET_CENTER_REFRESH_WINDOW) == -1) {
@@ -1287,7 +1198,7 @@ int mapHandleTransition()
 }
 
 // 0x483784
-static void _map_fix_critter_combat_data()
+void _map_fix_critter_combat_data()
 {
     for (Object* object = objectFindFirst(); object != nullptr; object = objectFindNext()) {
         if (object->pid == -1) {
@@ -1298,9 +1209,16 @@ static void _map_fix_critter_combat_data()
             continue;
         }
 
-        if (object->data.critter.combat.whoHitMeCid == -1) {
-            object->data.critter.combat.whoHitMe = nullptr;
-        }
+        // Null the runtime-only whoHitMe POINTER on load, regardless of the persistent
+        // whoHitMeCid. Out of combat whoHitMe is never re-resolved, so a critter loaded
+        // with cid != -1 otherwise keeps a bad pointer — on 64-bit a 4-byte -1 sitting in
+        // the 8-byte field — which _damage_object derefs (combat.cc:5425, guarded only
+        // against nullptr) when an OUT-OF-COMBAT explosion (C4 / la bombia) kills it → a
+        // ~50% server SIGSEGV. Combat re-resolves whoHitMe from whoHitMeCid via _find_cid
+        // at _combat_begin (combat.cc:2063-2091), so nulling here is safe; the persistent
+        // whoHitMeCid is untouched. (Vanilla nulled only when cid == -1 — a latent bug the
+        // 64-bit pointer width makes reliably fatal.)
+        object->data.critter.combat.whoHitMe = nullptr;
     }
 }
 
@@ -1410,15 +1328,106 @@ static int _map_save_file(File* stream)
 
     if (scriptSaveAll(stream) == -1) {
         snprintf(err, sizeof(err), "Error saving scripts in %s", gMapHeader.name);
-        _win_msg(err, 80, 80, _colorTable[31744]);
+        presenter()->errorBox(err);
     }
 
     if (objectSaveAll(stream) == -1) {
         snprintf(err, sizeof(err), "Error saving objects in %s", gMapHeader.name);
-        _win_msg(err, 80, 80, _colorTable[31744]);
+        presenter()->errorBox(err);
     }
 
     scriptsEnable();
+
+    return 0;
+}
+
+// Delete one file under the patches dir. Vanilla homed this in loadsave.cc, but
+// it is pure filesystem housekeeping with no save-UI dependency whatsoever, and
+// map.cc is its ONLY caller (both sites below discard a random encounter map's
+// .SAV). Left in loadsave.cc it made a core map path reach a client-only symbol:
+// the dedicated server aborted with "client symbol '_MapDirEraseFile_' called on
+// the core-only server" the moment a player LEFT a random encounter map — a path
+// unreachable until worldmap encounters started working. Moved here rather than
+// stubbed or #ifdef'd, per the cut-list rule: restructure the reference out.
+//
+// Reads the patches path straight from settings; loadsave.cc's `_patches` static
+// was only ever a cached copy of the same value.
+//
+// 0x4800C8
+int _MapDirEraseFile_(const char* a1, const char* a2)
+{
+    char path[COMPAT_MAX_PATH];
+
+    snprintf(path, sizeof(path), "%s\\%s%s",
+        settings.system.master_patches_path.c_str(), a1, a2);
+    if (compat_remove(path) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+// Serialize the current map + the dude to `stream` as a STEP-4 join snapshot blob
+// (CLIENT_JOIN_DESIGN.md §B). The caller runs objectAssignAllNetIds() first (§C)
+// so the object ORDER the walk numbered is the order objectSaveAll writes; a
+// joining client re-runs the same walk after loading and gets identical netIds.
+//
+// B2: stamp the "saved map" header bits so the loader takes the saved-map branch
+// (no first-run .GAM re-read, map_first_run=0 → no one-time spawn logic). These
+// are the two benign lines of _map_save_in_game; we do NOT call it (it runs
+// scriptsExecMapExitProc, which mutates, and writes an on-disk .SAV).
+// B1: append the dude — objectSaveAll skips OBJECT_NO_SAVE (object.cc:674), and
+// the dude is NO_SAVE, so _obj_save_dude carries him after the map body.
+int mapSaveToStream(File* stream, int* mapBodyLenOut)
+{
+    gMapHeader.flags |= 0x01;
+    gMapHeader.lastVisitTime = gameTimeGetTime();
+
+    if (_map_save_file(stream) == -1) {
+        return -1;
+    }
+
+    // The map body ends here; the dude blob follows. The two sub-streams
+    // self-delimit on load, but the split length is a fail-loud wire guard (§2).
+    if (mapBodyLenOut != nullptr) {
+        *mapBodyLenOut = (int)fileTell(stream);
+    }
+
+    if (_obj_save_dude(stream) == -1) {
+        return -1;
+    }
+
+    // B1-N: the extra player actors follow the host, in registry slot order
+    // (MP_PROPOSAL.md Ch 5.3). They are NO_SAVE for the same reason the dude is,
+    // so objectSaveAll skipped them too. Slot order IS wire order: the viewer
+    // registers them in this order and then reproduces objectAssignAllNetIds,
+    // which numbers the registry before the tile walk — get the order wrong and
+    // every netId after the actors shifts.
+    //
+    // The sections self-delimit on load (each is one _obj_save_obj tree), so the
+    // header carries the actor COUNT rather than per-section lengths; the
+    // existing dudeBlobLen guard still bounds the whole appendix and the crc32
+    // still covers every byte.
+    for (int slot = 1; slot < playerActorCount(); slot++) {
+        if (_obj_save_player_actor(stream, playerActorAt(slot)) == -1) {
+            return -1;
+        }
+    }
+
+    // B1-S: the CHARACTER SHEETS follow the actor objects, from slot 0 — the
+    // sheet lives off the Object (in the proto row and the PC-globals), so
+    // nothing above carries it. Before this the viewer seeded every sheet from
+    // its own gDudeProto, which is right only until someone levels: a joiner
+    // then sees the host's character as it was at boot, and every extra as a
+    // copy of that (PLAYER_SHEET_DESIGN.md §5).
+    //
+    // Last in the appendix on purpose: the sections above self-delimit as
+    // _obj_save_obj trees, so a reader that predates this block simply stops
+    // early and ignores the tail (the headless F2_CLIENT_BLOB_IN probe does
+    // exactly that, and is unaffected).
+    if (playerSheetBlockWrite(stream, 0) == -1) {
+        return -1;
+    }
 
     return 0;
 }
@@ -1485,8 +1494,11 @@ int _map_save_in_game(bool a1)
     return 0;
 }
 
+// De-static'd for the map_render.cc TU split: called by the moved isoInit.
+// The definition stays in core; map_render.h exposes the prototype.
+//
 // 0x483E28
-static void mapMakeMapsDirectory()
+void mapMakeMapsDirectory()
 {
     char path[COMPAT_MAX_PATH];
 
@@ -1495,55 +1507,6 @@ static void mapMakeMapsDirectory()
 
     strcat(path, "\\MAPS");
     compat_mkdir(path);
-}
-
-// 0x483ED0
-static void isoWindowRefreshRect(Rect* rect)
-{
-    windowRefreshRect(gIsoWindow, rect);
-}
-
-// 0x483EE4
-static void isoWindowRefreshRectGame(Rect* rect)
-{
-    Rect rectToUpdate;
-    if (rectIntersection(rect, &gIsoWindowRect, &rectToUpdate) == -1) {
-        return;
-    }
-
-    // CE: Clear dirty rect to prevent most of the visual artifacts near map
-    // edges.
-    bufferFill(gIsoWindowBuffer + rectToUpdate.top * rectGetWidth(&gIsoWindowRect) + rectToUpdate.left,
-        rectGetWidth(&rectToUpdate),
-        rectGetHeight(&rectToUpdate),
-        rectGetWidth(&gIsoWindowRect),
-        0);
-
-    tileRenderFloorsInRect(&rectToUpdate, gElevation);
-    _obj_render_pre_roof(&rectToUpdate, gElevation);
-    tileRenderRoofsInRect(&rectToUpdate, gElevation);
-    _obj_render_post_roof(&rectToUpdate, gElevation);
-}
-
-// 0x483F44
-static void isoWindowRefreshRectMapper(Rect* rect)
-{
-    Rect rectToUpdate;
-    if (rectIntersection(rect, &gIsoWindowRect, &rectToUpdate) == -1) {
-        return;
-    }
-
-    bufferFill(gIsoWindowBuffer + rectToUpdate.top * rectGetWidth(&gIsoWindowRect) + rectToUpdate.left,
-        rectGetWidth(&rectToUpdate),
-        rectGetHeight(&rectToUpdate),
-        rectGetWidth(&gIsoWindowRect),
-        0);
-
-    tileRenderFloorsInRect(&rectToUpdate, gElevation);
-    _grid_render(&rectToUpdate, gElevation);
-    _obj_render_pre_roof(&rectToUpdate, gElevation);
-    tileRenderRoofsInRect(&rectToUpdate, gElevation);
-    _obj_render_post_roof(&rectToUpdate, gElevation);
 }
 
 // NOTE: Inlined.
@@ -1659,14 +1622,56 @@ static void _map_place_dude_and_mouse()
         _partyMemberSyncPosition();
     }
 
-    gameMouseResetBouncingCursorFid();
-    gameMouseObjectsShow();
+    // Same treatment for every other player actor (MP_PROPOSAL Ch 14.2): the
+    // STAND fid fix and the NO_SAVE re-assert are per-ACTOR properties, not
+    // per-gDude ones. The flags survive the map load (extras are NO_REMOVE
+    // server-side), so re-asserting is belt-and-braces — but stating the
+    // invariant here is what keeps it from silently applying to slot 0 only.
+    //
+    // ⚠ Placement here is UNCONDITIONAL, unlike the dude's `tile == -1` case.
+    // Player actors are NO_REMOVE, so they SURVIVE the teardown still holding a
+    // tile index from the map we just left — a number that means something else
+    // entirely (or nothing) on the new one. There is no "did it get placed"
+    // signal to test, because the stale tile looks perfectly valid. So every load
+    // re-plants them beside the host. The transition path then moves the whole
+    // group again if it has a specific entry tile; landing twice is harmless,
+    // landing never is a body standing inside a wall on the wrong map.
+    for (int slot = 1; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor == nullptr || gDude == nullptr) {
+            continue;
+        }
+        // Same offline rule as the transition placement above: a despawned body
+        // stays off-map through a load until its player logs back in.
+        if (!playerActorOnline(slot)) {
+            continue;
+        }
+
+        if (FID_ANIM_TYPE(actor->fid) != ANIM_STAND) {
+            objectSetFrame(actor, 0, nullptr);
+            actor->fid = buildFid(OBJ_TYPE_CRITTER, actor->fid & 0xFFF, ANIM_STAND, (actor->fid & 0xF000) >> 12, actor->rotation + 1);
+        }
+
+        int tile = playerActorFindFreeTileNear(gDude->tile, gDude->elevation);
+        objectSetLocation(actor, tile != -1 ? tile : gDude->tile, gDude->elevation, nullptr);
+        objectSetRotation(actor, gMapHeader.enteringRotation, nullptr);
+
+        objectSetLight(actor, 4, 0x10000, nullptr);
+        actor->flags |= OBJECT_NO_SAVE;
+        _dude_stand(actor, actor->rotation, actor->fid);
+    }
+
+    presenter()->mouseResetBouncingCursor();
+    presenter()->mouseObjectsShow();
 }
 
+// De-static'd for the map_render.cc TU split: called by the moved isoInit.
+// The definition stays in core; map_render.h exposes the prototype.
+//
 // NOTE: Inlined.
 //
 // 0x4841F0
-static void square_init()
+void square_init()
 {
     for (int elevation = 0; elevation < ELEVATION_COUNT; elevation++) {
         _square[elevation] = &(_square_data[elevation]);

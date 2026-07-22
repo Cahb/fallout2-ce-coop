@@ -90,7 +90,12 @@ bool fileFindNext(DirectoryFileFindData* findData)
 // 0x4E63CC
 bool findFindClose(DirectoryFileFindData* findData)
 {
-#if defined(_MSC_VER)
+// Must match file_find.h, which selects the struct layout on _WIN32 — not on
+// _MSC_VER. Under MinGW _WIN32 is defined but _MSC_VER is not, so this branch
+// used to compile the POSIX body (dir/closedir) against the Win32 struct
+// (hFind/ffd) and failed to build. Invisible upstream, where Windows is built
+// only with MSVC and the two spellings happen to coincide.
+#if defined(_WIN32)
     FindClose(findData->hFind);
 #else
     if (findData->dir != nullptr) {

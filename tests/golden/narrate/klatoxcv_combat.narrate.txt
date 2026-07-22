@@ -1,0 +1,66 @@
+[t=100] combatEnter initiator=218
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] attackResult attacker=18000 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=5 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=1 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=2 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=2 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=2 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=1 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=5 loc=3 dmg=0 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=5 loc=3 dmg=2 flags=0x0 extras=0
+[t=100] turnStart id=18000 Narg (player) ap=9
+[t=100] turnStart id=96 Little Gecko ap=6
+[t=100] attackResult attacker=96 defender=18000 hitMode=4 loc=3 dmg=5 flags=0x0 extras=0
+[t=100] attackResult attacker=96 defender=18000 hitMode=5 loc=3 dmg=5 flags=0x80 extras=0
+[t=100] combatExit
+[t=100] delta id=112 Golden Gecko: ap=0
+[t=100] delta id=96 Little Gecko: ap=0
+[t=100] delta id=18000 Narg: fid=0x013F003E flags=0x2000041C hp=0 rad=17 ap=9 results=0x80
+[t=100] delta id=88 Little Gecko: ap=0
+[t=100] delta id=122 Golden Gecko: ap=0
+[t=100] delta id=206 Rat: ap=0
+[t=100] delta id=104 Golden Gecko: ap=0
+[t=1200] delta id=238 Golden Gecko: rot=5
+[t=127200] delta id=246 Golden Gecko: rot=0
+[t=278100] delta id=230 Golden Gecko: rot=4
+[t=284100] delta id=88 Little Gecko: rot=2
+[t=336200] delta id=242 Golden Gecko: rot=0
+[t=342600] delta id=226 Golden Gecko: rot=0
+[t=368700] delta id=250 Golden Gecko: rot=1

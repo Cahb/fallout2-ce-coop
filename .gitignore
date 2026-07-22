@@ -392,3 +392,27 @@ FodyWeavers.xsd
 /out
 /build
 CMakeUserPresets.json
+
+# Local game data + personal working notes (rewrite/phase0 scratch)
+/FO2/
+/resume
+/f2_headers_manifest.txt
+/FILES_INDEX.md
+/MECHANICS.md
+/P5_CUTLIST_RECON.md
+# IDEAS.md is now a tracked steering doc (feature vision + architectural
+# constraints for the server rewrite), alongside REWRITE_PLAN.md / MP_PROTOCOL.md.
+
+# Persistent dev scratch (diagnostic wrappers, run logs) — never committed
+/scratch/
+build-asan/
+# Windows cross-build tree (scripts/check.sh builds it via cmake/mingw-w64-x86_64.cmake)
+build-win/
+# Editor swap/backup files. These are LIVE FILES while an editor has the buffer
+# open — they were once committed by a `git add -A`, and removing them from
+# history then deleted them out from under a running vim. Never track them.
+*.swp
+*.swo
+*.swn
+*~
+.*.sw?

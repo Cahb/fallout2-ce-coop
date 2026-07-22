@@ -44,6 +44,7 @@ void compat_resolve_path(char* path);
 int compat_access(const char* path, int mode);
 char* compat_strdup(const char* string);
 long getFileSize(FILE* stream);
+char* _strmfe(char* dest, const char* name, const char* ext);
 
 } // namespace fallout
 

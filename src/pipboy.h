@@ -11,6 +11,7 @@ typedef enum PipboyOpenIntent {
 } PipboyOpenIntent;
 
 int pipboyOpen(int intent);
+bool pipboyRestHeadless(int hours, int minutes, int kind);
 void pipboyInit();
 void pipboyReset();
 int pipboySave(File* stream);

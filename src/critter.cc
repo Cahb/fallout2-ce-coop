@@ -20,11 +20,14 @@
 #include "object.h"
 #include "party_member.h"
 #include "platform_compat.h"
+#include "presenter.h"
 #include "proto.h"
 #include "queue.h"
 #include "random.h"
 #include "reaction.h"
 #include "scripts.h"
+#include "server_loop.h"
+#include "server_players.h"
 #include "skill.h"
 #include "stat.h"
 #include "tile.h"
@@ -145,6 +148,103 @@ static MessageList gCritterMessageList;
 // 0x56D75C
 static char gDudeName[DUDE_NAME_MAX_LENGTH];
 
+// Names for EXTRA player actors, slots 1..kMaxPlayerActors-1 (index = slot - 1).
+// Slot 0 is gDudeName above — the same aliasing as every other sheet row
+// (PLAYER_SHEET_DESIGN.md §2), so with an empty registry nothing resolves here
+// and every existing name lookup is unchanged.
+static char gPlayerActorNames[kMaxPlayerActors - 1][DUDE_NAME_MAX_LENGTH];
+
+// The name row for `slot`. THE resolver — nothing else may index either array.
+static char* critterNameRow(int slot)
+{
+    if (slot > 0 && slot < kMaxPlayerActors) {
+        return gPlayerActorNames[slot - 1];
+    }
+
+    return gDudeName;
+}
+
+// The name of the player actor in `slot`.
+//
+// Exported so protoGetName can answer a SHEET PID without bouncing through
+// critterGetName: an extra has no script, so critterGetName's own fallback is
+// protoGetName(obj->pid), and the two would call each other forever.
+char* critterGetNameForSlot(int slot)
+{
+    return critterNameRow(slot);
+}
+
+// Set the name of the player actor in `slot`. Slot 0 is dudeSetName.
+int critterSetNameForSlot(int slot, const char* name)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return -1;
+    }
+
+    if (strlen(name) > DUDE_NAME_MAX_LENGTH) {
+        return -1;
+    }
+
+    strncpy(critterNameRow(slot), name, DUDE_NAME_MAX_LENGTH);
+
+    return 0;
+}
+
+// Copy the host's name into every extra actor's row — part of the stage-2
+// seeding set. Co-op v1 is one authored character, so an unnamed extra would
+// otherwise hover and fight as an empty string until per-actor character
+// creation supplies a real one.
+void critterPlayerActorSeedNames()
+{
+    for (int slot = 1; slot < kMaxPlayerActors; slot++) {
+        critterPlayerActorSeedNameSlot(slot);
+    }
+}
+
+// ONE slot, for the dynamic spawn-at-login path (ACCOUNT_IDENTITY_DESIGN.md §3).
+// ⚠ Never call the bulk seeder above with players live — it would rename every
+// connected player back to the host's name (trap 1). The login path overwrites
+// this with the account name immediately; seeding first keeps the row coherent if
+// that ever fails.
+void critterPlayerActorSeedNameSlot(int slot)
+{
+    if (slot < 1 || slot >= kMaxPlayerActors) {
+        return;
+    }
+
+    strncpy(gPlayerActorNames[slot - 1], gDudeName, DUDE_NAME_MAX_LENGTH);
+}
+
+// One actor's name (PLAYER_SHEET_DESIGN.md §5). Fixed width, so the row stays
+// self-delimiting like every other member of the block.
+int critterPlayerActorNameRowWrite(File* stream, int slot)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return -1;
+    }
+
+    return fileWrite(critterNameRow(slot), DUDE_NAME_MAX_LENGTH, 1, stream) == 1 ? 0 : -1;
+}
+
+int critterPlayerActorNameRowRead(File* stream, int slot)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return -1;
+    }
+
+    char* row = critterNameRow(slot);
+    if (fileRead(row, DUDE_NAME_MAX_LENGTH, 1, stream) != 1) {
+        return -1;
+    }
+
+    // A wire-supplied name is untrusted input and the row is handed straight to
+    // printf-style message formatting. Terminate it here rather than trusting
+    // the sender.
+    row[DUDE_NAME_MAX_LENGTH - 1] = '\0';
+
+    return 0;
+}
+
 // 0x56D77C
 static int _sneak_working;
 
@@ -234,8 +334,17 @@ void critterProtoDataCopy(CritterProtoData* dest, CritterProtoData* src)
 // 0x42D0A8
 char* critterGetName(Object* obj)
 {
-    if (obj == gDude) {
-        return gDudeName;
+    // EVERY player actor answers from its own name row, not just the host.
+    // playerActorSlotOf IS `obj == gDude ? 0 : -1` with an empty registry, so
+    // single-player, the client and the golden probe are unchanged.
+    //
+    // This must come before the script-name lookup below for the same reason the
+    // old `obj == gDude` check did: an extra carries a sheet pid that names no
+    // real proto, so falling through would hand it protoGetName's answer for a
+    // pid that is not in critters.lst.
+    int playerSlot = playerActorSlotOf(obj);
+    if (playerSlot >= 0) {
+        return critterGetNameForSlot(playerSlot);
     }
 
     if (obj->scriptIndex == -1) {
@@ -364,11 +473,11 @@ int critterAdjustPoison(Object* critter, int amount)
     }
 
     if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-        displayMonitorAddMessage(messageListItem.text);
+        presenter()->consoleMessage(messageListItem.text);
     }
 
     if (critter == gDude) {
-        indicatorBarRefresh();
+        presenter()->hudIndicatorBar();
     }
 
     return 0;
@@ -384,13 +493,13 @@ int poisonEventProcess(Object* obj, void* data)
     critterAdjustPoison(obj, -2);
     critterAdjustHitPoints(obj, -1);
 
-    interfaceRenderHitPoints(false);
+    presenter()->hudHitPoints(false);
 
     MessageListItem messageListItem;
     // You take damage from poison.
     messageListItem.num = 3001;
     if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-        displayMonitorAddMessage(messageListItem.text);
+        presenter()->consoleMessage(messageListItem.text);
     }
 
     // NOTE: Uninline.
@@ -456,7 +565,7 @@ int critterAdjustRadiation(Object* obj, int amount)
                 }
 
                 if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-                    displayMonitorAddMessage(messageListItem.text);
+                    presenter()->consoleMessage(messageListItem.text);
                 }
             }
         }
@@ -467,7 +576,7 @@ int critterAdjustRadiation(Object* obj, int amount)
         messageListItem.num = 1007;
 
         if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
     }
 
@@ -477,7 +586,7 @@ int critterAdjustRadiation(Object* obj, int amount)
     }
 
     if (obj == gDude) {
-        indicatorBarRefresh();
+        presenter()->hudIndicatorBar();
     }
 
     return 0;
@@ -585,7 +694,7 @@ void _process_rads(Object* obj, int radiationLevel, bool isHealing)
         }
 
         if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-            displayMonitorAddMessage(messageListItem.text);
+            presenter()->consoleMessage(messageListItem.text);
         }
     }
 
@@ -905,12 +1014,27 @@ void critterKill(Object* critter, int anim, bool a3)
     itemDestroyAllHidden(critter);
 
     if (a3) {
-        tileWindowRefreshRect(&updatedRect, elevation);
+        presenter()->worldInvalidateRect(&updatedRect, elevation);
     }
 
-    if (critter == gDude) {
-        endgameSetupDeathEnding(ENDGAME_DEATH_ENDING_REASON_DEATH);
-        _game_user_wants_to_quit = 2;
+    if (playerActorIs(critter)) {
+        if (serverDedicatedActive()) {
+            // THE dedicated-server survival rule (MP_PROPOSAL.md Ch 9): a player
+            // dying must NEVER terminate the server. This is the sole finalizer
+            // for combat deaths, HP-zero deaths (critterAdjustHitPoints) and
+            // radiation collapse, so writing quit=2 here means "any player death
+            // shuts the world down" — which is exactly what it used to do.
+            //
+            // No endgame, no quit: the world keeps beating and the corpse keeps
+            // streaming. What SHOULD happen instead (respawn/permadeath/
+            // spectate) is deliberately undesigned — playerActorDied is the
+            // policy seam, no-op by default (Ch 9.5).
+            playerActorDied(critter);
+        } else {
+            // Vanilla single-player: byte-identical to the original.
+            endgameSetupDeathEnding(ENDGAME_DEATH_ENDING_REASON_DEATH);
+            _game_user_wants_to_quit = 2;
+        }
     }
 }
 
@@ -1154,7 +1278,7 @@ void dudeDisableState(int state)
         queueRemoveEventsByType(gDude, EVENT_TYPE_SNEAK);
     }
 
-    indicatorBarRefresh();
+    presenter()->hudIndicatorBar();
 }
 
 // 0x42E26C
@@ -1169,7 +1293,7 @@ void dudeEnableState(int state)
         sneakEventProcess(nullptr, nullptr);
     }
 
-    indicatorBarRefresh();
+    presenter()->hudIndicatorBar();
 }
 
 // 0x42E2B0
@@ -1430,6 +1554,99 @@ void critter_flag_unset(int pid, int flag)
     protoGetProto(pid, &proto);
 
     proto->critter.data.flags &= ~flag;
+}
+
+// Relocated from animation.cc (f2_client) so the headless server (f2_core-only)
+// can drive them: both are pure sim-state mutators called from core map/
+// inventory/party/combat paths. _dude_stand's sole client tie is the
+// tileWindowRefreshRect tail, which resolves per target — the real refresh in
+// the client build, a benign no-op in f2_server (server_stubs.cc). See the P5
+// server de-stub cut-list, category C (RELOCATE client->core).
+
+// 0x418378
+void _dude_stand(Object* obj, int rotation, int fid)
+{
+    Rect rect;
+
+    objectSetRotation(obj, rotation, &rect);
+
+    int x = 0;
+    int y = 0;
+
+    int weaponAnimationCode = (obj->fid & 0xF000) >> 12;
+    if (weaponAnimationCode != 0) {
+        if (fid == -1) {
+            int takeOutFid = buildFid(FID_TYPE(obj->fid), obj->fid & 0xFFF, ANIM_TAKE_OUT, weaponAnimationCode, obj->rotation + 1);
+            CacheEntry* takeOutFrmHandle;
+            Art* takeOutFrm = artLock(takeOutFid, &takeOutFrmHandle);
+            if (takeOutFrm != nullptr) {
+                int frameCount = artGetFrameCount(takeOutFrm);
+                for (int frame = 0; frame < frameCount; frame++) {
+                    int offsetX;
+                    int offsetY;
+                    artGetFrameOffsets(takeOutFrm, frame, obj->rotation, &offsetX, &offsetY);
+                    x += offsetX;
+                    y += offsetY;
+                }
+                artUnlock(takeOutFrmHandle);
+
+                CacheEntry* standFrmHandle;
+                int standFid = buildFid(FID_TYPE(obj->fid), obj->fid & 0xFFF, ANIM_STAND, 0, obj->rotation + 1);
+                Art* standFrm = artLock(standFid, &standFrmHandle);
+                if (standFrm != nullptr) {
+                    int offsetX;
+                    int offsetY;
+                    if (artGetRotationOffsets(standFrm, obj->rotation, &offsetX, &offsetY) == 0) {
+                        x += offsetX;
+                        y += offsetY;
+                    }
+                    artUnlock(standFrmHandle);
+                }
+            }
+        }
+    }
+
+    if (fid == -1) {
+        int anim;
+        if (FID_ANIM_TYPE(obj->fid) == ANIM_FIRE_DANCE) {
+            anim = ANIM_FIRE_DANCE;
+        } else {
+            anim = ANIM_STAND;
+        }
+        fid = buildFid(FID_TYPE(obj->fid), (obj->fid & 0xFFF), anim, (obj->fid & 0xF000) >> 12, obj->rotation + 1);
+    }
+
+    Rect temp;
+    objectSetFid(obj, fid, &temp);
+    rectUnion(&rect, &temp, &rect);
+
+    objectSetLocation(obj, obj->tile, obj->elevation, &temp);
+    rectUnion(&rect, &temp, &rect);
+
+    objectSetFrame(obj, 0, &temp);
+    rectUnion(&rect, &temp, &rect);
+
+    _obj_offset(obj, x, y, &temp);
+    rectUnion(&rect, &temp, &rect);
+
+    tileWindowRefreshRect(&rect, obj->elevation);
+}
+
+// 0x418574
+void _dude_standup(Object* a1)
+{
+    reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+
+    int anim;
+    if (FID_ANIM_TYPE(a1->fid) == ANIM_FALL_BACK) {
+        anim = ANIM_BACK_TO_STANDING;
+    } else {
+        anim = ANIM_PRONE_TO_STANDING;
+    }
+
+    animationRegisterAnimate(a1, anim, 0);
+    reg_anim_end();
+    a1->data.critter.combat.results &= ~DAM_KNOCKED_DOWN;
 }
 
 } // namespace fallout

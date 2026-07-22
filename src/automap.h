@@ -30,6 +30,9 @@ typedef enum AutomapFlags {
     AUTOMAP_WITH_SCANNER = 0x04,
 } AutomapFlags;
 
+// Lives in automap_state.cc so the savegame driver in f2_core can reach it.
+extern int gAutomapFlags;
+
 typedef struct AutomapHeader {
     unsigned char version;
 

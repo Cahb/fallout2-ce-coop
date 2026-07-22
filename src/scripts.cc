@@ -21,14 +21,20 @@
 #include "game_mouse.h"
 #include "game_movie.h"
 #include "input.h"
+#include "map.h" // mapSetTransitionSuppressed — host-only transitions (Ch 14.2)
 #include "memory.h"
 #include "message.h"
 #include "object.h"
+#include "opcode_trace.h"
 #include "party_member.h"
 #include "platform_compat.h"
+#include "presenter.h"
 #include "proto.h"
+#include "server_players.h" // playerActorIs / playerActorMayTransit
 #include "proto_instance.h"
 #include "queue.h"
+#include "script_request_handler.h"
+#include "server_loop.h"
 #include "sfall_arrays.h"
 #include "sfall_config.h"
 #include "sfall_global_scripts.h"
@@ -367,8 +373,24 @@ void gameTimeAddTicks(int ticks)
 
     unsigned int year = gGameTime / GAME_TIME_TICKS_PER_YEAR;
     if (year >= 13) {
-        endgameSetupDeathEnding(ENDGAME_DEATH_ENDING_REASON_TIMEOUT);
-        _game_user_wants_to_quit = 2;
+        if (serverDedicatedActive()) {
+            // Server survival (MP_PROPOSAL.md Ch 9.2-S2): the sim clock advances
+            // every beat, so vanilla's 13-year timeout is reachable on a
+            // long-lived dedicated server — and quit=2 would take the whole
+            // server down under every connected player. Suppress + log; a
+            // freeplay policy hook is banked (OPEN-Q #10).
+            //
+            // Latched: this branch is re-entered on EVERY tick once the clock
+            // passes 13 years (vanilla never had to care — it quit).
+            static bool loggedYearLimit = false;
+            if (!loggedYearLimit) {
+                loggedYearLimit = true;
+                debugPrint("server: 13-year game-clock limit reached — vanilla endgame suppressed\n");
+            }
+        } else {
+            endgameSetupDeathEnding(ENDGAME_DEATH_ENDING_REASON_TIMEOUT);
+            _game_user_wants_to_quit = 2;
+        }
     }
 
     // FIXME: This condition will never be true.
@@ -493,7 +515,7 @@ int _scriptsCheckGameEvents(int* moviePtr, int window)
     if (endgame) {
         _game_user_wants_to_quit = 2;
     } else {
-        tileWindowRefresh();
+        presenter()->worldInvalidate();
     }
 
     if (moviePtr != nullptr) {
@@ -915,12 +937,12 @@ int scriptsHandleRequests()
 
     if ((gScriptsRequests & SCRIPT_REQUEST_TOWN_MAP) != 0) {
         gScriptsRequests &= ~SCRIPT_REQUEST_TOWN_MAP;
-        wmTownMap();
+        scriptRequestHandler()->townMap();
     }
 
     if ((gScriptsRequests & SCRIPT_REQUEST_WORLD_MAP) != 0) {
         gScriptsRequests &= ~SCRIPT_REQUEST_WORLD_MAP;
-        wmWorldMap();
+        scriptRequestHandler()->worldMap();
     }
 
     if ((gScriptsRequests & SCRIPT_REQUEST_ELEVATOR) != 0) {
@@ -930,8 +952,8 @@ int scriptsHandleRequests()
 
         gScriptsRequests &= ~SCRIPT_REQUEST_ELEVATOR;
 
-        if (elevatorSelectLevel(gScriptsRequestedElevatorType, &map, &elevation, &tile) != -1) {
-            automapSaveCurrent();
+        if (scriptRequestHandler()->elevatorSelect(gScriptsRequestedElevatorType, &map, &elevation, &tile) != -1) {
+            scriptRequestHandler()->automapSave();
 
             if (map == gMapHeader.index) {
                 if (elevation == gElevation) {
@@ -1006,23 +1028,22 @@ int scriptsHandleRequests()
 
     if ((gScriptsRequests & SCRIPT_REQUEST_DIALOG) != 0) {
         gScriptsRequests &= ~SCRIPT_REQUEST_DIALOG;
-        gameDialogEnter(gScriptsRequestedDialogWith, 0);
+        scriptRequestHandler()->dialogEnter(gScriptsRequestedDialogWith);
     }
 
     if ((gScriptsRequests & SCRIPT_REQUEST_ENDGAME) != 0) {
         gScriptsRequests &= ~SCRIPT_REQUEST_ENDGAME;
-        endgamePlaySlideshow();
-        endgamePlayMovie();
+        scriptRequestHandler()->endgame();
     }
 
     if ((gScriptsRequests & SCRIPT_REQUEST_LOOTING) != 0) {
         gScriptsRequests &= ~SCRIPT_REQUEST_LOOTING;
-        inventoryOpenLooting(gScriptsRequestedLootingBy, gScriptsRequestedLootingFrom);
+        scriptRequestHandler()->looting(gScriptsRequestedLootingBy, gScriptsRequestedLootingFrom);
     }
 
     if ((gScriptsRequests & SCRIPT_REQUEST_STEALING) != 0) {
         gScriptsRequests &= ~SCRIPT_REQUEST_STEALING;
-        inventoryOpenStealing(gScriptsRequestedStealingBy, gScriptsRequestedStealingFrom);
+        scriptRequestHandler()->stealing(gScriptsRequestedStealingBy, gScriptsRequestedStealingFrom);
     }
 
     DeleteAllTempArrays();
@@ -1038,8 +1059,8 @@ int _scripts_check_state_in_combat()
         int elevation = gScriptsRequestedElevatorLevel;
         int tile = -1;
 
-        if (elevatorSelectLevel(gScriptsRequestedElevatorType, &map, &elevation, &tile) != -1) {
-            automapSaveCurrent();
+        if (scriptRequestHandler()->elevatorSelect(gScriptsRequestedElevatorType, &map, &elevation, &tile) != -1) {
+            scriptRequestHandler()->automapSave();
 
             if (map == gMapHeader.index) {
                 if (elevation == gElevation) {
@@ -1087,7 +1108,7 @@ int _scripts_check_state_in_combat()
     }
 
     if ((gScriptsRequests & SCRIPT_REQUEST_LOOTING) != 0) {
-        inventoryOpenLooting(gScriptsRequestedLootingBy, gScriptsRequestedLootingFrom);
+        scriptRequestHandler()->looting(gScriptsRequestedLootingBy, gScriptsRequestedLootingFrom);
     }
 
     // NOTE: Uninline.
@@ -1455,6 +1476,28 @@ static int scriptsGetFileName(int scriptIndex, char* name, size_t size)
     return 0;
 }
 
+// F2_TRACE_LVAR=1: name every script that allocates a local-var block, and where
+// in the array it landed. A script only allocates when its localVarsOffset is -1,
+// i.e. it was freshly scriptAdd'ed rather than restored with an offset from a
+// save -- so on a LOAD this prints exactly the scripts that are being
+// re-instantiated instead of adopted, which is what makes the array grow.
+// fprintf, not debugPrint: neither f2_server nor the probe registers a debug proc.
+void scriptTraceLvarAlloc(const char* how, Script* script)
+{
+    if (getenv("F2_TRACE_LVAR") == nullptr) {
+        return;
+    }
+
+    char name[64] = "(unknown)";
+    if (script->index != -1) {
+        scriptsGetFileName(script->index & 0xFFFFFF, name, sizeof(name));
+    }
+
+    fprintf(stderr, "f2-trace: lvar alloc %-4s sid=0x%08X script=%-16s count=%d offset=%d total=%d\n",
+        how, script->sid, name, script->localVarsCount,
+        script->localVarsOffset, gMapLocalVarsLength);
+}
+
 // scr_set_dude_script
 // 0x4A4F90
 int scriptsSetDudeScript()
@@ -1529,6 +1572,11 @@ int scriptsInit()
     _scr_remove_all();
     _interpretOutputFunc(_win_debug);
     interpreterRegisterOpcodeHandlers();
+
+    // Tap the interpreter's hook seam (opcode_trace.h) once the handler table is
+    // built. A pure consumer of the public API — no tracing logic lives in the
+    // interpreter — and it installs nothing unless F2_TRACE_OPCODE is set.
+    opcodeTraceInstall();
     _scr_header_load();
 
     // NOTE: Uninline.
@@ -2117,7 +2165,19 @@ int scriptGetScript(int sid, Script** scriptPtr)
         return -1;
     }
 
-    ScriptList* scriptList = &(gScriptLists[SID_TYPE(sid)]);
+    // Bounds-check the script type BEFORE indexing the fixed gScriptLists array.
+    // SID_TYPE is the top byte of a sid, and a sid reaches here from wire/blob-loaded
+    // objects (objectLoadAll during a rebaseline) — a trust boundary. A corrupt or
+    // out-of-range type byte would otherwise read gScriptLists out of bounds (ASAN:
+    // global-buffer-overflow). Fail the lookup instead; the caller drops the object's
+    // sid and logs "Error connecting object to script", which is the existing graceful
+    // path. Valid sids always have an in-range type, so this never fires in SP/golden.
+    int scriptType = SID_TYPE(sid);
+    if (scriptType < 0 || scriptType >= SCRIPT_TYPE_COUNT) {
+        return -1;
+    }
+
+    ScriptList* scriptList = &(gScriptLists[scriptType]);
     ScriptListExtent* scriptListExtent = scriptList->head;
 
     while (scriptListExtent != nullptr) {
@@ -2229,6 +2289,12 @@ static int scriptsRemoveLocalVars(Script* script)
 {
     if (script == nullptr) {
         return -1;
+    }
+
+    if (getenv("F2_TRACE_LVAR") != nullptr) {
+        fprintf(stderr, "f2-trace: lvar FREE     sid=0x%08X count=%d offset=%d total=%d%s\n",
+            script->sid, script->localVarsCount, script->localVarsOffset, gMapLocalVarsLength,
+            (script->localVarsCount == 0 || script->localVarsOffset < 0) ? "   <-- FREES NOTHING" : "");
     }
 
     if (script->localVarsCount != 0) {
@@ -2537,6 +2603,28 @@ bool scriptsExecSpatialProc(Object* object, int tile, int elevation)
 
     _scr_SpatialsEnabled = false;
 
+    // Exit grids are spatial scripts, so this is where "who stepped on it" is
+    // known — the only place it is. An extra player still RUNS the procs (traps
+    // must hurt everyone); only the travel is denied (MP_PROPOSAL Ch 14.2). Asked
+    // as a policy question, never as a slot test.
+    bool suppressTransition = playerActorIs(object) && !playerActorMayTransit(object);
+    if (suppressTransition) {
+        mapSetTransitionSuppressed(true);
+    }
+
+    // ...and it is also the one passive dispatch point where the acting player
+    // IS known, so the procs run scoped to whoever stepped: a trap damages the
+    // player who tripped it, not the host (MP_PROPOSAL Ch 10.4 O2). A non-player
+    // stepper passes nullptr, which makes the scope a no-op and leaves the
+    // enclosing context alone.
+    //
+    // ⚠ SERVER ONLY, and not merely for tidiness: the scope's destructor restores
+    // gDude to slot 0, and on an EXTRA's viewer slot 0 is the HOST's actor while
+    // gDude is that client's own role (rebindLocalActor) — engaging there would
+    // hand the viewer the host's body. Nothing is lost off-server: at one actor
+    // the scope is the identity.
+    ServerActorScope spatialScope(serverDedicatedActive() && playerActorIs(object) ? object : nullptr);
+
     int builtTile = builtTileCreate(tile, elevation);
 
     for (Script* script = scriptGetFirstSpatialScript(elevation); script != nullptr; script = scriptGetNextSpatialScript()) {
@@ -2557,7 +2645,20 @@ bool scriptsExecSpatialProc(Object* object, int tile, int elevation)
             scriptSetObjects(script->sid, object, nullptr);
         }
 
+        // F2_TRACE_SPATIAL: the only observable a spatial proc has from outside —
+        // whatever the script does is invisible unless you already know which gvar
+        // to watch. This line is what proves the stepped walker fires per-tile
+        // procs at all (server_anim.cc), and is the hook a future regression gate
+        // would grep. Cheap: off unless the env var is set.
+        if (getenv("F2_TRACE_SPATIAL") != nullptr) {
+            fprintf(stderr, "[spatial] FIRE sid=%d obj=%p tile=%d elev=%d radius=%d\n",
+                script->sid, (void*)object, tile, elevation, script->sp.radius);
+        }
         scriptExecProc(script->sid, SCRIPT_PROC_SPATIAL);
+    }
+
+    if (suppressTransition) {
+        mapSetTransitionSuppressed(false);
     }
 
     _scr_SpatialsEnabled = true;
@@ -2761,6 +2862,8 @@ char* _scr_get_msg_str_speech(int messageListId, int messageId, int a3)
                 if (messageListItem.flags & 0x01) {
                     gameDialogStartLips(nullptr);
                 } else {
+                    strncpy(gDialogPendingAudio, messageListItem.audio, 15);
+                    gDialogPendingAudio[15] = '\0';
                     gameDialogStartLips(messageListItem.audio);
                 }
             } else {
@@ -2803,6 +2906,7 @@ int scriptGetLocalVar(int sid, int variable, ProgramValue& value)
     if (script->localVarsCount > 0) {
         if (script->localVarsOffset == -1) {
             script->localVarsOffset = _map_malloc_local_var(script->localVarsCount);
+            scriptTraceLvarAlloc("get", script);
         }
 
         if (mapGetLocalVar(script->localVarsOffset + variable, value) == -1) {
@@ -2834,6 +2938,7 @@ int scriptSetLocalVar(int sid, int variable, ProgramValue& value)
 
     if (script->localVarsOffset == -1) {
         script->localVarsOffset = _map_malloc_local_var(script->localVarsCount);
+        scriptTraceLvarAlloc("set", script);
     }
 
     mapSetLocalVar(script->localVarsOffset + variable, value);

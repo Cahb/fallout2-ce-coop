@@ -20,9 +20,38 @@ extern int gGameGlobalVarsLength;
 extern const char* asc_5186C8;
 extern int _game_user_wants_to_quit;
 
+// True only for a TERMINAL quit — the dude died, the endgame ran, a load is
+// pending (values 2/3). Value 1 is NOT a quit: it is the engine's in-band
+// "break out of the combat loop now" signal, set by op_terminate_combat and by
+// the isInCombat()-guarded map/elevation/worldmap-request paths, and cleared
+// again by combatTeardown. Long-lived loops that must survive a fight ending
+// (serverServe, the dialog pump) have to test THIS, not `!= 0`.
+bool gameTerminalQuitRequested();
+
 extern MessageList gMiscMessageList;
 
+// Boot/teardown primitives defined in game.cc (core). Formerly file-static
+// helpers of gameInitWithOptions/gameExit; exported when the client lifecycle
+// orchestrators moved to game_lifecycle.cc so both that TU and the eventual
+// headless server boot path can reuse the core DB + global-vars init/free.
+int gameDbInit();
+int gameLoadGlobalVars();
+void gameFreeGlobalVars();
+
 int gameInitWithOptions(const char* windowTitle, bool isMapper, int a3, int a4, int argc, char** argv);
+
+// The simulation half of `gameReset` (game.cc, core): every module reset that
+// a load has to run whether or not a screen exists — object list, scripts,
+// queue, map, protos, stats/skills/perks, savegame scratch. The client's
+// `gameReset` is this plus the chrome (palette, sound, movies, mouse, the
+// character/pipboy/automap/options screens); the server's is this alone.
+//
+// ⚠ Splitting it moved the chrome calls after the sim calls; relative order
+// WITHIN each half is unchanged. Each of these zeroes its own module statics,
+// so nothing here reads what another writes — but this is the one behavioural
+// difference from the original single ordered list.
+void gameResetSim();
+
 void gameReset();
 void gameExit();
 int gameHandleKey(int eventCode, bool isInCombatMode);

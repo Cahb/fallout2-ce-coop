@@ -7,6 +7,7 @@
 #include "object.h"
 #include "platform_compat.h"
 #include "skill.h"
+#include "server_players.h" // playerActorSlotOf — per-actor trait rows
 #include "stat.h"
 
 namespace fallout {
@@ -33,6 +34,22 @@ static MessageList gTraitsMessageList;
 //
 // 0x66BE40
 static int gSelectedTraits[TRAITS_MAX_SELECTED_COUNT];
+
+// Traits for EXTRA player actors, slots 1..kMaxPlayerActors-1 (index = slot - 1).
+// Slot 0 is gSelectedTraits above — the same aliasing as the sheet's proto row
+// and the PC-stat row, for the same degeneracy reason (PLAYER_SHEET_DESIGN.md
+// §2): with an empty registry no subject resolves here.
+static int gPlayerActorTraits[kMaxPlayerActors - 1][TRAITS_MAX_SELECTED_COUNT];
+
+// The trait row for `subject`. THE resolver — nothing else may index either
+// array. nullptr means "no subject in hand" and resolves to gDude, which is
+// today's behavior verbatim and why the ~25 unconverted traitIsSelected callers
+// keep working.
+static int* traitRow(Object* subject)
+{
+    int slot = playerActorSlotOf(subject != nullptr ? subject : gDude);
+    return slot > 0 ? gPlayerActorTraits[slot - 1] : gSelectedTraits;
+}
 
 // 0x51DB84
 static TraitDescription gTraitDescriptions[TRAIT_COUNT] = {
@@ -96,6 +113,15 @@ void traitsReset()
     for (int index = 0; index < TRAITS_MAX_SELECTED_COUNT; index++) {
         gSelectedTraits[index] = -1;
     }
+
+    // Extras reset with the host — file statics, not malloc'd per run, so a new
+    // game would otherwise inherit the previous one's traits (same trap as
+    // perkResetRanks and pcStatsReset).
+    for (int slot = 0; slot < kMaxPlayerActors - 1; slot++) {
+        for (int index = 0; index < TRAITS_MAX_SELECTED_COUNT; index++) {
+            gPlayerActorTraits[slot][index] = -1;
+        }
+    }
 }
 
 // 0x4B3AF8
@@ -124,19 +150,127 @@ int traitsSave(File* stream)
 // Sets selected traits.
 //
 // 0x4B3B48
-void traitsSetSelected(int trait1, int trait2)
+void traitsSetSelected(int trait1, int trait2, Object* subject)
 {
-    gSelectedTraits[0] = trait1;
-    gSelectedTraits[1] = trait2;
+    int* row = traitRow(subject);
+    row[0] = trait1;
+    row[1] = trait2;
+}
+
+// Copy the host's traits into every extra player actor's row — the fourth member
+// of the seeding set (protoPlayerActorSheetsSeed, perkPlayerActorSeedRanks,
+// pcPlayerActorSeedStats). Traits are chosen at character creation and co-op v1
+// is one authored character, so an extra must carry the host's.
+void traitsPlayerActorSeed()
+{
+    for (int slot = 1; slot < kMaxPlayerActors; slot++) {
+        traitsPlayerActorSeedSlot(slot);
+    }
+}
+
+// ONE slot, for the dynamic spawn-at-login path (ACCOUNT_IDENTITY_DESIGN.md §3).
+// ⚠ Never call the bulk seeder above with players live (trap 1).
+// ⚠ Takes an ACTOR SLOT (1..kMaxPlayerActors-1); the array is indexed slot-1.
+void traitsPlayerActorSeedSlot(int slot)
+{
+    if (slot < 1 || slot >= kMaxPlayerActors) {
+        return;
+    }
+
+    for (int index = 0; index < TRAITS_MAX_SELECTED_COUNT; index++) {
+        gPlayerActorTraits[slot - 1][index] = gSelectedTraits[index];
+    }
+}
+
+// One actor's selected traits (PLAYER_SHEET_DESIGN.md §5). Slot 0 is
+// gSelectedTraits — the bare global traitsSave already writes.
+static int* traitsPlayerActorRow(int slot)
+{
+    if (slot == 0) {
+        return gSelectedTraits;
+    }
+
+    if (slot < 1 || slot >= kMaxPlayerActors) {
+        return nullptr;
+    }
+
+    return gPlayerActorTraits[slot - 1];
+}
+
+int traitsPlayerActorRowWrite(File* stream, int slot)
+{
+    int* row = traitsPlayerActorRow(slot);
+    if (row == nullptr) {
+        return -1;
+    }
+
+    return fileWriteInt32List(stream, row, TRAITS_MAX_SELECTED_COUNT);
+}
+
+int traitsPlayerActorRowRead(File* stream, int slot)
+{
+    int* row = traitsPlayerActorRow(slot);
+    if (row == nullptr) {
+        return -1;
+    }
+
+    return fileReadInt32List(stream, row, TRAITS_MAX_SELECTED_COUNT);
 }
 
 // Returns selected traits.
 //
 // 0x4B3B54
-void traitsGetSelected(int* trait1, int* trait2)
+void traitsGetSelected(int* trait1, int* trait2, Object* subject)
 {
-    *trait1 = gSelectedTraits[0];
-    *trait2 = gSelectedTraits[1];
+    int* row = traitRow(subject);
+    *trait1 = row[0];
+    *trait2 = row[1];
+}
+
+// Ledger H-47 (extracted from the character editor's Mutate! perk dialog):
+// drop the trait the player chose to lose. `traits` is the caller's working
+// pair (-1 = empty slot), `traitCount` the caller's session trait count
+// (2 minus leading empty slots, as the dialog computes it), `pickedLine`
+// the picked line in the (alphabetically sorted) display list and
+// `firstListedTrait` the trait shown on its first line — the last two
+// together identify which slot the player picked.
+void traitsMutateDrop(int* traits, int traitCount, int pickedLine, int firstListedTrait)
+{
+    if (pickedLine == 0) {
+        if (traitCount == 1) {
+            traits[0] = -1;
+            traits[1] = -1;
+        } else {
+            if (firstListedTrait == traits[0]) {
+                traits[0] = traits[1];
+                traits[1] = -1;
+            } else {
+                traits[1] = -1;
+            }
+        }
+    } else {
+        if (firstListedTrait == traits[0]) {
+            traits[1] = -1;
+        } else {
+            traits[0] = traits[1];
+            traits[1] = -1;
+        }
+    }
+}
+
+// Ledger H-47 (extracted from the character editor's Mutate! perk dialog):
+// gain the newly picked trait and commit the swap. `traitCount` is the
+// session count from before the drop (the dialog does not recompute it).
+void traitsMutateGain(int* traits, int traitCount, int newTrait)
+{
+    if (traitCount != 0) {
+        traits[1] = newTrait;
+    } else {
+        traits[0] = newTrait;
+        traits[1] = -1;
+    }
+
+    traitsSetSelected(traits[0], traits[1]);
 }
 
 // Returns a name of the specified trait, or `NULL` if the specified trait is
@@ -169,107 +303,116 @@ int traitGetFrmId(int trait)
 // Returns `true` if the specified trait is selected.
 //
 // 0x4B3BC8
-bool traitIsSelected(int trait)
+bool traitIsSelected(int trait, Object* subject)
 {
-    return gSelectedTraits[0] == trait || gSelectedTraits[1] == trait;
+    int* row = traitRow(subject);
+    return row[0] == trait || row[1] == trait;
+}
+
+// Subject-first spelling of traitIsSelected, for the two modifier switches
+// below: they test ~21 traits between them, and reading the actor before the
+// trait keeps "whose trait" impossible to lose in the noise.
+static bool traitHas(Object* subject, int trait)
+{
+    return traitIsSelected(trait, subject);
 }
 
 // Returns stat modifier depending on selected traits.
 //
 // 0x4B3C7C
-int traitGetStatModifier(int stat)
+int traitGetStatModifier(int stat, Object* subject)
 {
     int modifier = 0;
 
     switch (stat) {
     case STAT_STRENGTH:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
-        if (traitIsSelected(TRAIT_BRUISER)) {
+        if (traitHas(subject, TRAIT_BRUISER)) {
             modifier += 2;
         }
         break;
     case STAT_PERCEPTION:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_ENDURANCE:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_CHARISMA:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_INTELLIGENCE:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_AGILITY:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
-        if (traitIsSelected(TRAIT_SMALL_FRAME)) {
+        if (traitHas(subject, TRAIT_SMALL_FRAME)) {
             modifier += 1;
         }
         break;
     case STAT_LUCK:
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        if (traitHas(subject, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_MAXIMUM_ACTION_POINTS:
-        if (traitIsSelected(TRAIT_BRUISER)) {
+        if (traitHas(subject, TRAIT_BRUISER)) {
             modifier -= 2;
         }
         break;
     case STAT_ARMOR_CLASS:
-        if (traitIsSelected(TRAIT_KAMIKAZE)) {
+        if (traitHas(subject, TRAIT_KAMIKAZE)) {
             modifier -= critterGetBaseStat(gDude, STAT_ARMOR_CLASS);
         }
         break;
     case STAT_MELEE_DAMAGE:
-        if (traitIsSelected(TRAIT_HEAVY_HANDED)) {
+        if (traitHas(subject, TRAIT_HEAVY_HANDED)) {
             modifier += 4;
         }
         break;
     case STAT_CARRY_WEIGHT:
-        if (traitIsSelected(TRAIT_SMALL_FRAME)) {
+        if (traitHas(subject, TRAIT_SMALL_FRAME)) {
             modifier -= 10 * critterGetBaseStat(gDude, STAT_STRENGTH);
         }
         break;
     case STAT_SEQUENCE:
-        if (traitIsSelected(TRAIT_KAMIKAZE)) {
+        if (traitHas(subject, TRAIT_KAMIKAZE)) {
             modifier += 5;
         }
         break;
     case STAT_HEALING_RATE:
-        if (traitIsSelected(TRAIT_FAST_METABOLISM)) {
+        if (traitHas(subject, TRAIT_FAST_METABOLISM)) {
             modifier += 2;
         }
         break;
     case STAT_CRITICAL_CHANCE:
-        if (traitIsSelected(TRAIT_FINESSE)) {
+        if (traitHas(subject, TRAIT_FINESSE)) {
             modifier += 10;
         }
         break;
     case STAT_BETTER_CRITICALS:
-        if (traitIsSelected(TRAIT_HEAVY_HANDED)) {
+        if (traitHas(subject, TRAIT_HEAVY_HANDED)) {
             modifier -= 30;
         }
         break;
     case STAT_RADIATION_RESISTANCE:
-        if (traitIsSelected(TRAIT_FAST_METABOLISM)) {
+        if (traitHas(subject, TRAIT_FAST_METABOLISM)) {
             modifier -= critterGetBaseStat(gDude, STAT_RADIATION_RESISTANCE);
         }
         break;
     case STAT_POISON_RESISTANCE:
-        if (traitIsSelected(TRAIT_FAST_METABOLISM)) {
+        if (traitHas(subject, TRAIT_FAST_METABOLISM)) {
             modifier -= critterGetBaseStat(gDude, STAT_POISON_RESISTANCE);
         }
         break;
@@ -281,15 +424,15 @@ int traitGetStatModifier(int stat)
 // Returns skill modifier depending on selected traits.
 //
 // 0x4B40FC
-int traitGetSkillModifier(int skill)
+int traitGetSkillModifier(int skill, Object* subject)
 {
     int modifier = 0;
 
-    if (traitIsSelected(TRAIT_GIFTED)) {
+    if (traitHas(subject, TRAIT_GIFTED)) {
         modifier -= 10;
     }
 
-    if (traitIsSelected(TRAIT_GOOD_NATURED)) {
+    if (traitHas(subject, TRAIT_GOOD_NATURED)) {
         switch (skill) {
         case SKILL_SMALL_GUNS:
         case SKILL_BIG_GUNS:

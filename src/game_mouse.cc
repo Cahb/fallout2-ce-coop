@@ -308,7 +308,9 @@ static Object* gGameMousePointedObject;
 static int _gmouse_get_click_to_scroll();
 static void _gmouse_3d_enable_modes();
 static int gameMouseSetBouncingCursorFid(int fid);
-static Object* gameMouseGetObjectUnderCursor(int objectType, bool a2, int elevation);
+// gameMouseGetObjectUnderCursor is declared in game_mouse.h (exposed for the wire
+// viewer's crosshair click path, which resolves the target the same way vanilla's
+// in-window handler does — game_mouse.cc:1001).
 static int gameMouseRenderAccuracy(const char* string, int color);
 static int gameMouseRenderActionPoints(const char* string, int color);
 static int gameMouseObjectsInit();
@@ -892,6 +894,150 @@ bool gameMouseClickOnInterfaceBar()
     return _mouse_click_in(interfaceBarWindowRectLeft, interfaceBarWindowRect.top, interfaceBarWindowRectRight, interfaceBarWindowRect.bottom);
 }
 
+// Build the vanilla action menu for `target` into `actionMenuItems` (room for 6),
+// returning the item count. Verbatim from _gmouse_handle_event's ARROW block so
+// the legacy path and the wire viewer share one source (INTERACTION_UX_DESIGN.md
+// §3.2). Pure reads (item type, proto action flags, critter aliveness, push-check).
+int gameMouseBuildActionMenu(Object* target, int* actionMenuItems)
+{
+    int actionMenuItemsCount = 0;
+    switch (FID_TYPE(target->fid)) {
+    case OBJ_TYPE_ITEM:
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
+        if (itemGetType(target) == ITEM_TYPE_CONTAINER) {
+            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
+            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL;
+        }
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
+        break;
+    case OBJ_TYPE_CRITTER:
+        if (target == gDude) {
+            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_ROTATE;
+        } else {
+            if (_obj_action_can_talk_to(target)) {
+                if (!isInCombat()) {
+                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_TALK;
+                }
+            } else {
+                if (!_critter_flag_check(target->pid, CRITTER_NO_STEAL)) {
+                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE;
+                }
+            }
+
+            if (actionCheckPush(gDude, target)) {
+                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_PUSH;
+            }
+        }
+
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
+        break;
+    case OBJ_TYPE_SCENERY:
+        if (_obj_action_can_use(target)) {
+            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE;
+        }
+
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL;
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
+        break;
+    case OBJ_TYPE_WALL:
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
+        if (_obj_action_can_use(target)) {
+            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
+        }
+        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
+        break;
+    }
+    return actionMenuItemsCount;
+}
+
+// Show the action menu at (mouseX,mouseY) and run the vanilla hold/highlight/
+// release loop; returns the selected GAME_MOUSE_ACTION_MENU_ITEM_* (CANCEL=0), or
+// -1 if the menu could not be shown (render / flat-fid setup failed). Owns the
+// cursor chrome (flat-fid, iso disable/enable, hex-cursor restore) exactly as the
+// inline vanilla code did. Extracted from _gmouse_handle_event (§3.2); the caller
+// performs the selected action.
+int gameMouseRunActionMenu(int mouseX, int mouseY, int* actionMenuItems, int actionMenuItemsCount)
+{
+    if (gameMouseRenderActionMenuItems(mouseX, mouseY, actionMenuItems, actionMenuItemsCount, _scr_size.right - _scr_size.left + 1, _scr_size.bottom - _scr_size.top - 99) != 0) {
+        return -1;
+    }
+
+    Rect cursorRect;
+    int fid = buildFid(OBJ_TYPE_INTERFACE, 283, 0, 0, 0);
+    // NOTE: Uninline.
+    if (gmouse_3d_set_flat_fid(fid, &cursorRect) != 0 || _gmouse_3d_move_to(mouseX, mouseY, gElevation, &cursorRect) != 0) {
+        return -1;
+    }
+
+    tileWindowRefreshRect(&cursorRect, gElevation);
+    isoDisable();
+
+    int newMouseY = mouseY;
+    int actionIndex = 0;
+    while ((mouseGetEvent() & MOUSE_EVENT_LEFT_BUTTON_UP) == 0) {
+        sharedFpsLimiter.mark();
+
+        inputGetInput();
+
+        if (_game_user_wants_to_quit != 0) {
+            actionMenuItems[actionIndex] = 0;
+        }
+
+        int updatedMouseX;
+        int updatedMouseY;
+        mouseGetPosition(&updatedMouseX, &updatedMouseY);
+
+        if (abs(updatedMouseY - newMouseY) > 10) {
+            if (newMouseY >= updatedMouseY) {
+                actionIndex -= 1;
+            } else {
+                actionIndex += 1;
+            }
+
+            // Clamp to the valid item range. Without this actionIndex drifts past
+            // the menu ends on continued mouse movement (highlight just no-ops
+            // out of range), and the `return actionMenuItems[actionIndex]` at the
+            // end then reads off the end of the caller's fixed array — ASAN
+            // stack-buffer-overflow, hit by dragging past the action menu's edge.
+            // count is always >= 1 (CANCEL is always present).
+            if (actionIndex < 0) {
+                actionIndex = 0;
+            } else if (actionIndex >= actionMenuItemsCount) {
+                actionIndex = actionMenuItemsCount - 1;
+            }
+
+            if (gameMouseHighlightActionMenuItemAtIndex(actionIndex) == 0) {
+                tileWindowRefreshRect(&cursorRect, gElevation);
+            }
+            newMouseY = updatedMouseY;
+        }
+
+        renderPresent();
+        sharedFpsLimiter.throttle();
+    }
+
+    isoEnable();
+
+    _gmouse_3d_hover_test = false;
+    gGameMouseLastX = mouseX;
+    gGameMouseLastY = mouseY;
+    _gmouse_3d_last_move_time = getTicks();
+
+    _mouse_set_position(mouseX, newMouseY);
+
+    if (gameMouseUpdateHexCursorFid(&cursorRect) == 0) {
+        tileWindowRefreshRect(&cursorRect, gElevation);
+    }
+
+    return actionMenuItems[actionIndex];
+}
+
 // 0x44BFA8
 void _gmouse_handle_event(int mouseX, int mouseY, int mouseState)
 {
@@ -1067,185 +1213,87 @@ void _gmouse_handle_event(int mouseX, int mouseY, int mouseState)
     if ((mouseState & MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT) == MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT && gGameMouseMode == GAME_MOUSE_MODE_ARROW) {
         Object* targetObj = gameMouseGetObjectUnderCursor(-1, true, gElevation);
         if (targetObj != nullptr) {
-            int actionMenuItemsCount = 0;
+            // Build + run the vanilla menu via the shared helpers (§3.2); execute
+            // the picked item here (legacy local action path). selectedItem < 0 =
+            // the menu could not be shown, CANCEL(0) has no case = no-op.
             int actionMenuItems[6];
-            switch (FID_TYPE(targetObj->fid)) {
-            case OBJ_TYPE_ITEM:
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
-                if (itemGetType(targetObj) == ITEM_TYPE_CONTAINER) {
-                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
-                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL;
-                }
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
-                break;
-            case OBJ_TYPE_CRITTER:
-                if (targetObj == gDude) {
-                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_ROTATE;
-                } else {
-                    if (_obj_action_can_talk_to(targetObj)) {
-                        if (!isInCombat()) {
-                            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_TALK;
-                        }
-                    } else {
-                        if (!_critter_flag_check(targetObj->pid, CRITTER_NO_STEAL)) {
-                            actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE;
-                        }
+            int actionMenuItemsCount = gameMouseBuildActionMenu(targetObj, actionMenuItems);
+            int selectedItem = gameMouseRunActionMenu(mouseX, mouseY, actionMenuItems, actionMenuItemsCount);
+            if (selectedItem >= 0) {
+                switch (selectedItem) {
+                case GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY:
+                    inventoryOpenUseItemOn(targetObj);
+                    break;
+                case GAME_MOUSE_ACTION_MENU_ITEM_LOOK:
+                    if (_obj_examine(gDude, targetObj) == -1) {
+                        _obj_look_at(gDude, targetObj);
                     }
-
-                    if (actionCheckPush(gDude, targetObj)) {
-                        actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_PUSH;
+                    break;
+                case GAME_MOUSE_ACTION_MENU_ITEM_ROTATE: {
+                    // cursorRect in the old inline code was just scratch reused for
+                    // the rotate's dirty rect; a fresh local is behavior-identical.
+                    Rect rect;
+                    if (objectRotateClockwise(targetObj, &rect) == 0) {
+                        tileWindowRefreshRect(&rect, targetObj->elevation);
                     }
+                    break;
                 }
-
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
-                break;
-            case OBJ_TYPE_SCENERY:
-                if (_obj_action_can_use(targetObj)) {
-                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE;
-                }
-
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL;
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
-                break;
-            case OBJ_TYPE_WALL:
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
-                if (_obj_action_can_use(targetObj)) {
-                    actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY;
-                }
-                actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_CANCEL;
-                break;
-            }
-
-            if (gameMouseRenderActionMenuItems(mouseX, mouseY, actionMenuItems, actionMenuItemsCount, _scr_size.right - _scr_size.left + 1, _scr_size.bottom - _scr_size.top - 99) == 0) {
-                Rect cursorRect;
-                int fid = buildFid(OBJ_TYPE_INTERFACE, 283, 0, 0, 0);
-                // NOTE: Uninline.
-                if (gmouse_3d_set_flat_fid(fid, &cursorRect) == 0 && _gmouse_3d_move_to(mouseX, mouseY, gElevation, &cursorRect) == 0) {
-                    tileWindowRefreshRect(&cursorRect, gElevation);
-                    isoDisable();
-
-                    int newMouseY = mouseY;
-                    int actionIndex = 0;
-                    while ((mouseGetEvent() & MOUSE_EVENT_LEFT_BUTTON_UP) == 0) {
-                        sharedFpsLimiter.mark();
-
-                        inputGetInput();
-
-                        if (_game_user_wants_to_quit != 0) {
-                            actionMenuItems[actionIndex] = 0;
-                        }
-
-                        int updatedMouseX;
-                        int updatedMouseY;
-                        mouseGetPosition(&updatedMouseX, &updatedMouseY);
-
-                        if (abs(updatedMouseY - newMouseY) > 10) {
-                            if (newMouseY >= updatedMouseY) {
-                                actionIndex -= 1;
-                            } else {
-                                actionIndex += 1;
-                            }
-
-                            if (gameMouseHighlightActionMenuItemAtIndex(actionIndex) == 0) {
-                                tileWindowRefreshRect(&cursorRect, gElevation);
-                            }
-                            newMouseY = updatedMouseY;
-                        }
-
-                        renderPresent();
-                        sharedFpsLimiter.throttle();
+                case GAME_MOUSE_ACTION_MENU_ITEM_TALK:
+                    actionTalk(gDude, targetObj);
+                    break;
+                case GAME_MOUSE_ACTION_MENU_ITEM_USE:
+                    switch (FID_TYPE(targetObj->fid)) {
+                    case OBJ_TYPE_SCENERY:
+                        _action_use_an_object(gDude, targetObj);
+                        break;
+                    case OBJ_TYPE_CRITTER:
+                        _action_loot_container(gDude, targetObj);
+                        break;
+                    default:
+                        actionPickUp(gDude, targetObj);
+                        break;
                     }
+                    break;
+                case GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL:
+                    if (1) {
+                        int skill = -1;
 
-                    isoEnable();
-
-                    _gmouse_3d_hover_test = false;
-                    gGameMouseLastX = mouseX;
-                    gGameMouseLastY = mouseY;
-                    _gmouse_3d_last_move_time = getTicks();
-
-                    _mouse_set_position(mouseX, newMouseY);
-
-                    if (gameMouseUpdateHexCursorFid(&cursorRect) == 0) {
-                        tileWindowRefreshRect(&cursorRect, gElevation);
-                    }
-
-                    switch (actionMenuItems[actionIndex]) {
-                    case GAME_MOUSE_ACTION_MENU_ITEM_INVENTORY:
-                        inventoryOpenUseItemOn(targetObj);
-                        break;
-                    case GAME_MOUSE_ACTION_MENU_ITEM_LOOK:
-                        if (_obj_examine(gDude, targetObj) == -1) {
-                            _obj_look_at(gDude, targetObj);
-                        }
-                        break;
-                    case GAME_MOUSE_ACTION_MENU_ITEM_ROTATE:
-                        if (objectRotateClockwise(targetObj, &cursorRect) == 0) {
-                            tileWindowRefreshRect(&cursorRect, targetObj->elevation);
-                        }
-                        break;
-                    case GAME_MOUSE_ACTION_MENU_ITEM_TALK:
-                        actionTalk(gDude, targetObj);
-                        break;
-                    case GAME_MOUSE_ACTION_MENU_ITEM_USE:
-                        switch (FID_TYPE(targetObj->fid)) {
-                        case OBJ_TYPE_SCENERY:
-                            _action_use_an_object(gDude, targetObj);
+                        int rc = skilldexOpen();
+                        switch (rc) {
+                        case SKILLDEX_RC_SNEAK:
+                            _action_skill_use(SKILL_SNEAK);
                             break;
-                        case OBJ_TYPE_CRITTER:
-                            _action_loot_container(gDude, targetObj);
+                        case SKILLDEX_RC_LOCKPICK:
+                            skill = SKILL_LOCKPICK;
                             break;
-                        default:
-                            actionPickUp(gDude, targetObj);
+                        case SKILLDEX_RC_STEAL:
+                            skill = SKILL_STEAL;
+                            break;
+                        case SKILLDEX_RC_TRAPS:
+                            skill = SKILL_TRAPS;
+                            break;
+                        case SKILLDEX_RC_FIRST_AID:
+                            skill = SKILL_FIRST_AID;
+                            break;
+                        case SKILLDEX_RC_DOCTOR:
+                            skill = SKILL_DOCTOR;
+                            break;
+                        case SKILLDEX_RC_SCIENCE:
+                            skill = SKILL_SCIENCE;
+                            break;
+                        case SKILLDEX_RC_REPAIR:
+                            skill = SKILL_REPAIR;
                             break;
                         }
-                        break;
-                    case GAME_MOUSE_ACTION_MENU_ITEM_USE_SKILL:
-                        if (1) {
-                            int skill = -1;
 
-                            int rc = skilldexOpen();
-                            switch (rc) {
-                            case SKILLDEX_RC_SNEAK:
-                                _action_skill_use(SKILL_SNEAK);
-                                break;
-                            case SKILLDEX_RC_LOCKPICK:
-                                skill = SKILL_LOCKPICK;
-                                break;
-                            case SKILLDEX_RC_STEAL:
-                                skill = SKILL_STEAL;
-                                break;
-                            case SKILLDEX_RC_TRAPS:
-                                skill = SKILL_TRAPS;
-                                break;
-                            case SKILLDEX_RC_FIRST_AID:
-                                skill = SKILL_FIRST_AID;
-                                break;
-                            case SKILLDEX_RC_DOCTOR:
-                                skill = SKILL_DOCTOR;
-                                break;
-                            case SKILLDEX_RC_SCIENCE:
-                                skill = SKILL_SCIENCE;
-                                break;
-                            case SKILLDEX_RC_REPAIR:
-                                skill = SKILL_REPAIR;
-                                break;
-                            }
-
-                            if (skill != -1) {
-                                actionUseSkill(gDude, targetObj, skill);
-                            }
+                        if (skill != -1) {
+                            actionUseSkill(gDude, targetObj, skill);
                         }
-                        break;
-                    case GAME_MOUSE_ACTION_MENU_ITEM_PUSH:
-                        actionPush(gDude, targetObj);
-                        break;
                     }
+                    break;
+                case GAME_MOUSE_ACTION_MENU_ITEM_PUSH:
+                    actionPush(gDude, targetObj);
+                    break;
                 }
             }
         }

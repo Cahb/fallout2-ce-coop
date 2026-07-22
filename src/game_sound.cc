@@ -1,6 +1,7 @@
 #include "game_sound.h"
 
 #include <stdio.h>
+#include <stdlib.h> // getenv — F2_NO_MUSIC
 #include <string.h>
 
 #include "animation.h"
@@ -28,11 +29,6 @@
 #include "worldmap.h"
 
 namespace fallout {
-
-typedef enum SoundEffectActionType {
-    SOUND_EFFECT_ACTION_TYPE_ACTIVE,
-    SOUND_EFFECT_ACTION_TYPE_PASSIVE,
-} SoundEffectActionType;
 
 // 0x5035BC
 static char _aSoundSfx[] = "sound\\sfx\\";
@@ -79,24 +75,6 @@ static SoundEndCallback* gBackgroundSoundEndCallback = nullptr;
 // 0x518E5C
 static SoundEndCallback* gSpeechEndCallback = nullptr;
 
-// 0x518E60
-static char _snd_lookup_weapon_type[WEAPON_SOUND_EFFECT_COUNT] = {
-    'R', // Ready
-    'A', // Attack
-    'O', // Out of ammo
-    'F', // Firing
-    'H', // Hit
-};
-
-// 0x518E65
-static char _snd_lookup_scenery_action[SCENERY_SOUND_EFFECT_COUNT] = {
-    'O', // Open
-    'C', // Close
-    'L', // Lock
-    'N', // Unlock
-    'U', // Use
-};
-
 // 0x518E6C
 static int _background_storage_requested = -1;
 
@@ -135,9 +113,6 @@ static int _lastTime_1 = 0;
 
 // 0x596EB0
 static char _background_fname_copied[COMPAT_MAX_PATH];
-
-// 0x596FB5
-static char _sfx_file_name[13];
 
 // NOTE: I'm mot sure about it's size. Why not MAX_PATH?
 //
@@ -602,13 +577,36 @@ int backgroundSoundLoad(const char* fileName, int a2, int a3, int a4)
     _background_storage_requested = a3;
     _background_loop_requested = a4;
 
-    strcpy(gBackgroundSoundFileName, fileName);
+    // backgroundSoundRestart passes gBackgroundSoundFileName back in as fileName, so
+    // this can be a self-copy (dst == src) — undefined behavior for strcpy, which ASAN
+    // traps as strcpy-param-overlap (seen on co-op dialog exit). The buffer already
+    // holds the right value in that case, so skipping the copy is equivalent.
+    if (fileName != gBackgroundSoundFileName) {
+        strcpy(gBackgroundSoundFileName, fileName);
+    }
 
     if (!gGameSoundInitialized) {
         return -1;
     }
 
     if (!gMusicEnabled) {
+        return -1;
+    }
+
+    // F2_NO_MUSIC=1 — a mute switch for people running SEVERAL CLIENTS ON ONE BOX,
+    // where every viewer starts the same map track a beat apart and the result is
+    // mush. There is no options menu on the wire-viewer path (you drop straight
+    // into the world), so an env var is the only place to put this.
+    //
+    // Deliberately HERE, at the one choke point every background track passes
+    // through, rather than at the wire decode: this also silences the boot/menu
+    // track and the endgame slideshow, which are client-local and never touch the
+    // wire. Music only — sfx/speech are untouched. Cached: called per map load.
+    static const bool musicMuted = []() {
+        const char* value = getenv("F2_NO_MUSIC");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (musicMuted) {
         return -1;
     }
 
@@ -1311,174 +1309,6 @@ int _gsound_compute_relative_volume(Object* obj)
     }
 
     return v3;
-}
-
-// sfx_build_char_name
-// 0x451604
-char* sfxBuildCharName(Object* a1, int anim, int extra)
-{
-    char v7[13];
-    char v8;
-    char v9;
-
-    if (artCopyFileName(FID_TYPE(a1->fid), a1->fid & 0xFFF, v7) == -1) {
-        return nullptr;
-    }
-
-    if (anim == ANIM_TAKE_OUT) {
-        if (_art_get_code(anim, extra, &v8, &v9) == -1) {
-            return nullptr;
-        }
-    } else {
-        if (_art_get_code(anim, (a1->fid & 0xF000) >> 12, &v8, &v9) == -1) {
-            return nullptr;
-        }
-    }
-
-    // TODO: Check.
-    if (anim == ANIM_FALL_FRONT || anim == ANIM_FALL_BACK) {
-        if (extra == CHARACTER_SOUND_EFFECT_PASS_OUT) {
-            v8 = 'Y';
-        } else if (extra == CHARACTER_SOUND_EFFECT_DIE) {
-            v8 = 'Z';
-        }
-    } else if ((anim == ANIM_THROW_PUNCH || anim == ANIM_KICK_LEG) && extra == CHARACTER_SOUND_EFFECT_CONTACT) {
-        v8 = 'Z';
-    }
-
-    snprintf(_sfx_file_name, sizeof(_sfx_file_name), "%s%c%c", v7, v8, v9);
-    compat_strupr(_sfx_file_name);
-    return _sfx_file_name;
-}
-
-// sfx_build_ambient_name
-// 0x4516F0
-char* gameSoundBuildAmbientSoundEffectName(const char* a1)
-{
-    snprintf(_sfx_file_name, sizeof(_sfx_file_name), "A%6s%1d", a1, 1);
-    compat_strupr(_sfx_file_name);
-    return _sfx_file_name;
-}
-
-// sfx_build_interface_name
-// 0x451718
-char* gameSoundBuildInterfaceName(const char* a1)
-{
-    snprintf(_sfx_file_name, sizeof(_sfx_file_name), "N%6s%1d", a1, 1);
-    compat_strupr(_sfx_file_name);
-    return _sfx_file_name;
-}
-
-// sfx_build_weapon_name
-// 0x451760
-char* sfxBuildWeaponName(int effectType, Object* weapon, int hitMode, Object* target)
-{
-    int soundVariant;
-    char weaponSoundCode;
-    char effectTypeCode;
-    char materialCode;
-    Proto* proto;
-
-    weaponSoundCode = weaponGetSoundId(weapon);
-    effectTypeCode = _snd_lookup_weapon_type[effectType];
-
-    if (effectType != WEAPON_SOUND_EFFECT_READY
-        && effectType != WEAPON_SOUND_EFFECT_OUT_OF_AMMO) {
-        if (hitMode != HIT_MODE_LEFT_WEAPON_PRIMARY
-            && hitMode != HIT_MODE_RIGHT_WEAPON_PRIMARY
-            && hitMode != HIT_MODE_PUNCH) {
-            soundVariant = 2;
-        } else {
-            soundVariant = 1;
-        }
-    } else {
-        soundVariant = 1;
-    }
-
-    int damageType = weaponGetDamageType(nullptr, weapon);
-
-    // SFALL
-    if (effectTypeCode != 'H' || target == nullptr || damageType == explosionGetDamageType() || damageType == DAMAGE_TYPE_PLASMA || damageType == DAMAGE_TYPE_EMP) {
-        materialCode = 'X';
-    } else {
-        const int type = FID_TYPE(target->fid);
-        int material;
-        switch (type) {
-        case OBJ_TYPE_ITEM:
-            protoGetProto(target->pid, &proto);
-            material = proto->item.material;
-            break;
-        case OBJ_TYPE_SCENERY:
-            protoGetProto(target->pid, &proto);
-            material = proto->scenery.field_2C;
-            break;
-        case OBJ_TYPE_WALL:
-            protoGetProto(target->pid, &proto);
-            material = proto->wall.material;
-            break;
-        default:
-            material = -1;
-            break;
-        }
-
-        switch (material) {
-        case MATERIAL_TYPE_GLASS:
-        case MATERIAL_TYPE_METAL:
-        case MATERIAL_TYPE_PLASTIC:
-            materialCode = 'M';
-            break;
-        case MATERIAL_TYPE_WOOD:
-            materialCode = 'W';
-            break;
-        case MATERIAL_TYPE_DIRT:
-        case MATERIAL_TYPE_STONE:
-        case MATERIAL_TYPE_CEMENT:
-            materialCode = 'S';
-            break;
-        default:
-            materialCode = 'F';
-            break;
-        }
-    }
-
-    snprintf(_sfx_file_name, sizeof(_sfx_file_name), "W%c%c%1d%cXX%1d", effectTypeCode, weaponSoundCode, soundVariant, materialCode, 1);
-    compat_strupr(_sfx_file_name);
-    return _sfx_file_name;
-}
-
-// sfx_build_scenery_name
-// 0x451898
-char* sfxBuildSceneryName(int actionType, int action, const char* name)
-{
-    char actionTypeCode = actionType == SOUND_EFFECT_ACTION_TYPE_PASSIVE ? 'P' : 'A';
-    char actionCode = _snd_lookup_scenery_action[action];
-
-    snprintf(_sfx_file_name, sizeof(_sfx_file_name), "S%c%c%4s%1d", actionTypeCode, actionCode, name, 1);
-    compat_strupr(_sfx_file_name);
-
-    return _sfx_file_name;
-}
-
-// sfx_build_open_name
-// 0x4518D
-char* sfxBuildOpenName(Object* object, int action)
-{
-    if (FID_TYPE(object->fid) == OBJ_TYPE_SCENERY) {
-        char scenerySoundId;
-        Proto* proto;
-        if (protoGetProto(object->pid, &proto) != -1) {
-            scenerySoundId = proto->scenery.field_34;
-        } else {
-            scenerySoundId = 'A';
-        }
-        snprintf(_sfx_file_name, sizeof(_sfx_file_name), "S%cDOORS%c", _snd_lookup_scenery_action[action], scenerySoundId);
-    } else {
-        Proto* proto;
-        protoGetProto(object->pid, &proto);
-        snprintf(_sfx_file_name, sizeof(_sfx_file_name), "I%cCNTNR%c", _snd_lookup_scenery_action[action], proto->item.field_80);
-    }
-    compat_strupr(_sfx_file_name);
-    return _sfx_file_name;
 }
 
 // 0x451970

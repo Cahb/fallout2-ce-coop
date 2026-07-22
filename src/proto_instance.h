@@ -24,6 +24,7 @@ int _obj_use(Object* user, Object* targetObj);
 int _obj_use_door(Object* user, Object* doorObj, bool animateOnly = false);
 int _obj_use_container(Object* critter, Object* item);
 int _obj_use_skill_on(Object* a1, Object* a2, int skill);
+void _obj_arm_explosive(Object* explosive, int seconds);
 bool objectIsLocked(Object* obj);
 int objectLock(Object* obj);
 int objectUnlock(Object* obj);
@@ -35,6 +36,9 @@ int objectUnjamLock(Object* obj);
 int objectUnjamAll();
 int _obj_attempt_placement(Object* obj, int tile, int elevation, int radius);
 int _objPMAttemptPlacement(Object* obj, int tile, int elevation);
+
+// See server_anim.cc's state-bearing-callback allowlist.
+void* protoInstanceDoorCloseCallbackPtr();
 
 } // namespace fallout
 

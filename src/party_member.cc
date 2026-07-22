@@ -21,6 +21,7 @@
 #include "memory.h"
 #include "message.h"
 #include "object.h"
+#include "presenter.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "queue.h"
@@ -586,7 +587,7 @@ static int _partyMemberPrepLoadInstance(PartyMemberListItem* a1)
 
     a1->script = (Script*)internal_malloc(sizeof(*script));
     if (a1->script == nullptr) {
-        showMesageBox("\n  Error!: partyMemberPrepLoad: Out of memory!");
+        presenter()->errorBox("\n  Error!: partyMemberPrepLoad: Out of memory!");
         exit(1);
     }
 
@@ -595,7 +596,7 @@ static int _partyMemberPrepLoadInstance(PartyMemberListItem* a1)
     if (script->localVarsCount != 0 && script->localVarsOffset != -1) {
         a1->vars = (int*)internal_malloc(sizeof(*a1->vars) * script->localVarsCount);
         if (a1->vars == nullptr) {
-            showMesageBox("\n  Error!: partyMemberPrepLoad: Out of memory!");
+            presenter()->errorBox("\n  Error!: partyMemberPrepLoad: Out of memory!");
             exit(1);
         }
 
@@ -667,7 +668,7 @@ int _partyMemberRecoverLoad()
 static int _partyMemberRecoverLoadInstance(PartyMemberListItem* a1)
 {
     if (a1->script == nullptr) {
-        showMesageBox("\n  Error!: partyMemberRecoverLoadInstance: No script!");
+        presenter()->errorBox("\n  Error!: partyMemberRecoverLoadInstance: No script!");
         return 0;
     }
 
@@ -678,13 +679,13 @@ static int _partyMemberRecoverLoadInstance(PartyMemberListItem* a1)
 
     int v1 = -1;
     if (scriptAdd(&v1, scriptType) == -1) {
-        showMesageBox("\n  Error!: partyMemberRecoverLoad: Can't create script!");
+        presenter()->errorBox("\n  Error!: partyMemberRecoverLoad: Can't create script!");
         exit(1);
     }
 
     Script* script;
     if (scriptGetScript(v1, &script) == -1) {
-        showMesageBox("\n  Error!: partyMemberRecoverLoad: Can't find script!");
+        presenter()->errorBox("\n  Error!: partyMemberRecoverLoad: Can't find script!");
         exit(1);
     }
 
@@ -843,6 +844,242 @@ int _partyMemberRestingHeal(int a1)
     return 1;
 }
 
+// Ledger H-41 (extracted from the pipboy rest screen): rest-heal cadence —
+// the party heals one step per 180 accumulated rest minutes. The accumulator
+// is reset when a rest session starts.
+static int gRestHealAccumulatedMinutes = 0;
+
+void restHealReset()
+{
+    gRestHealAccumulatedMinutes = 0;
+}
+
+// rest_time accrual; true = a heal step is due (accumulator consumed).
+bool restHealCheck(int minutes)
+{
+    gRestHealAccumulatedMinutes += minutes;
+
+    if (gRestHealAccumulatedMinutes < 180) {
+        return false;
+    }
+
+    debugPrint("\n health added!\n");
+    gRestHealAccumulatedMinutes = 0;
+
+    return true;
+}
+
+// One rest-heal step; true = the dude is fully healed.
+bool restHealApply()
+{
+    _partyMemberRestingHeal(3);
+
+    int currentHp = critterGetHitPoints(gDude);
+    int maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
+    return currentHp == maxHp;
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): rest-sim pacing — a
+// timed rest of [hours]:[minutes] plays out over (v2 * 20) animation frames,
+// [minutesPhaseFrames] of them in the minutes phase and [hoursPhaseFrames]
+// in the hours phase. The frame counts also divide the per-frame clock
+// interpolation and heal accrual, so they are sim state, not just UI pacing.
+void restSimPacing(int hours, int minutes, double* minutesPhaseFrames, double* hoursPhaseFrames)
+{
+    int hoursInMinutes = hours * 60;
+    double v1 = (double)hoursInMinutes + (double)minutes;
+    double v2 = v1 * (1.0 / 1440.0) * 3.5 + 0.25;
+    double v3 = (double)minutes / v1 * v2;
+
+    *minutesPhaseFrames = v3 * 20.0;
+    *hoursPhaseFrames = (v2 - v3) * 20.0;
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): one minutes-phase
+// rest-sim step — frame [frame] of [frameCount] interpolates the game clock
+// across [minutes] game minutes (600 ticks each) from [startTime]. When the
+// interpolated clock reaches the next queued event, the clock is set just
+// past the event and the queue is processed first: a triggering event
+// interrupts the rest (REST_SIM_TICK_EVENT), a raised user-quit flag stops
+// it (REST_SIM_TICK_QUIT). Otherwise the clock advances to the interpolated
+// time.
+int restSimMinutesTick(unsigned int startTime, int frame, double frameCount, int minutes)
+{
+    unsigned int target = (unsigned int)((double)frame / frameCount * ((double)minutes * 600.0) + (double)startTime);
+    unsigned int nextEventTime = queueGetNextEventTime();
+    if (target >= nextEventTime) {
+        gameTimeSetTime(nextEventTime + 1);
+        if (queueProcessEvents()) {
+            return REST_SIM_TICK_EVENT;
+        }
+
+        if (_game_user_wants_to_quit != 0) {
+            return REST_SIM_TICK_QUIT;
+        }
+    }
+
+    gameTimeSetTime(target);
+
+    return REST_SIM_TICK_ADVANCED;
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): minutes-phase finish —
+// snap the clock to the full rest length and accrue the whole phase into the
+// rest-heal cadence. Only reached when no tick interrupted the phase.
+void restSimMinutesFinish(unsigned int startTime, int minutes)
+{
+    gameTimeSetTime(startTime + 600 * minutes);
+
+    if (restHealCheck(minutes)) {
+        // NOTE: Uninline.
+        restHealApply();
+    }
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): one hours-phase
+// rest-sim step — same clock interpolation / queue-event interrupt rule as
+// the minutes phase (GAME_TIME_TICKS_PER_HOUR per hour), plus the per-frame
+// heal accrual: each frame feeds (hours * 60) / frameCount rest minutes into
+// the rest-heal cadence.
+int restSimHoursTick(unsigned int startTime, int frame, double frameCount, int hours)
+{
+    unsigned int target = (unsigned int)((double)frame / frameCount * (hours * GAME_TIME_TICKS_PER_HOUR) + startTime);
+    unsigned int nextEventTime = queueGetNextEventTime();
+    if (target >= nextEventTime) {
+        gameTimeSetTime(nextEventTime + 1);
+
+        if (queueProcessEvents()) {
+            return REST_SIM_TICK_EVENT;
+        }
+
+        if (_game_user_wants_to_quit != 0) {
+            return REST_SIM_TICK_QUIT;
+        }
+    }
+
+    gameTimeSetTime(target);
+
+    int hoursInMinutes = hours * 60;
+    int healthToAdd = (int)((double)hoursInMinutes / frameCount);
+    if (restHealCheck(healthToAdd)) {
+        // NOTE: Uninline.
+        restHealApply();
+    }
+
+    return REST_SIM_TICK_ADVANCED;
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): hours-phase finish —
+// snap the clock to the full rest length. Only reached when no tick
+// interrupted the phase (the heal cadence was already fed per-frame).
+void restSimHoursFinish(unsigned int startTime, int hours)
+{
+    gameTimeSetTime(startTime + GAME_TIME_TICKS_PER_HOUR * hours);
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): end-of-rest flush —
+// if the clock passed a queued event, process the queue; true = an event
+// triggered (the rest screen bails out).
+bool restSimOverdueEvents()
+{
+    if (gameTimeGetTime() > queueGetNextEventTime()) {
+        if (queueProcessEvents()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Ledger H-40 (extracted from the pipboy rest screen): rest-until-healed
+// duration — hours needed for the dude to fully heal at the resting cadence
+// (one healing-rate step per 3 rest hours).
+int restUntilHealedDuration()
+{
+    int currentHp = critterGetHitPoints(gDude);
+    int maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
+    int hpToHeal = maxHp - currentHp;
+    int healingRate = critterGetStat(gDude, STAT_HEALING_RATE);
+    return (int)((double)hpToHeal / (double)healingRate * 3.0);
+}
+
+// Ledger H-42 (extracted from the pipboy alarm-clock screen; was _ClacTime):
+// returns [hours] and [minutes] needed to rest until [wakeUpHour].
+void restUntilHourDuration(int* hours, int* minutes, int wakeUpHour)
+{
+    int gameTimeHour = gameTimeGetHour();
+
+    *hours = gameTimeHour / 100;
+    *minutes = gameTimeHour % 100;
+
+    if (*hours != wakeUpHour || *minutes != 0) {
+        *hours = wakeUpHour - *hours;
+        if (*hours < 0) {
+            *hours += 24;
+            if (*minutes != 0) {
+                *hours -= 1;
+                *minutes = 60 - *minutes;
+            }
+        } else {
+            if (*minutes != 0) {
+                *hours -= 1;
+                *minutes = 60 - *minutes;
+                if (*hours < 0) {
+                    *hours = 23;
+                }
+            }
+        }
+    } else {
+        *hours = 24;
+    }
+}
+
+// Ledger H-42 (extracted from the pipboy alarm-clock screen): rest-intent
+// decoder — maps a chosen rest-duration option to the [hours]:[minutes] rest
+// length and rest [kind] (0 = timed rest, or one of the until-healed kinds)
+// consumed by the rest sim. Fixed options are table values; the
+// until-morning/noon/evening/midnight options use the restUntilHourDuration
+// wall-clock math.
+void restOptionDecode(int option, int* hours, int* minutes, int* kind)
+{
+    *hours = 0;
+    *minutes = 0;
+    *kind = 0;
+
+    switch (option) {
+    case PIPBOY_REST_DURATION_TEN_MINUTES:
+        *minutes = 10;
+        break;
+    case PIPBOY_REST_DURATION_THIRTY_MINUTES:
+        *minutes = 30;
+        break;
+    case PIPBOY_REST_DURATION_ONE_HOUR:
+    case PIPBOY_REST_DURATION_TWO_HOURS:
+    case PIPBOY_REST_DURATION_THREE_HOURS:
+    case PIPBOY_REST_DURATION_FOUR_HOURS:
+    case PIPBOY_REST_DURATION_FIVE_HOURS:
+    case PIPBOY_REST_DURATION_SIX_HOURS:
+        *hours = option - 1;
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_MORNING:
+        restUntilHourDuration(hours, minutes, 8);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_NOON:
+        restUntilHourDuration(hours, minutes, 12);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_EVENING:
+        restUntilHourDuration(hours, minutes, 18);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_MIDNIGHT:
+        restUntilHourDuration(hours, minutes, 0);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_HEALED:
+    case PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED:
+        *kind = option;
+        break;
+    }
+}
+
 // 0x494F24
 Object* partyMemberFindByPid(int pid)
 {
@@ -994,7 +1231,7 @@ static int _partyMemberPrepItemSave(Object* object)
     if (object->sid != -1) {
         Script* script;
         if (scriptGetScript(object->sid, &script) == -1) {
-            showMesageBox("\n  Error!: partyMemberPrepItemSaveAll: Can't find script!");
+            presenter()->errorBox("\n  Error!: partyMemberPrepItemSaveAll: Can't find script!");
             exit(1);
         }
 
@@ -1016,7 +1253,7 @@ static int _partyMemberItemSave(Object* object)
     if (object->sid != -1) {
         Script* script;
         if (scriptGetScript(object->sid, &script) == -1) {
-            showMesageBox("\n  Error!: partyMemberItemSave: Can't find script!");
+            presenter()->errorBox("\n  Error!: partyMemberItemSave: Can't find script!");
             exit(1);
         }
 
@@ -1027,7 +1264,7 @@ static int _partyMemberItemSave(Object* object)
 
         PartyMemberListItem* node = (PartyMemberListItem*)internal_malloc(sizeof(*node));
         if (node == nullptr) {
-            showMesageBox("\n  Error!: partyMemberItemSave: Out of memory!");
+            presenter()->errorBox("\n  Error!: partyMemberItemSave: Out of memory!");
             exit(1);
         }
 
@@ -1035,7 +1272,7 @@ static int _partyMemberItemSave(Object* object)
 
         node->script = (Script*)internal_malloc(sizeof(*script));
         if (node->script == nullptr) {
-            showMesageBox("\n  Error!: partyMemberItemSave: Out of memory!");
+            presenter()->errorBox("\n  Error!: partyMemberItemSave: Out of memory!");
             exit(1);
         }
 
@@ -1044,7 +1281,7 @@ static int _partyMemberItemSave(Object* object)
         if (script->localVarsCount != 0 && script->localVarsOffset != -1) {
             node->vars = (int*)internal_malloc(sizeof(*node->vars) * script->localVarsCount);
             if (node->vars == nullptr) {
-                showMesageBox("\n  Error!: partyMemberItemSave: Out of memory!");
+                presenter()->errorBox("\n  Error!: partyMemberItemSave: Out of memory!");
                 exit(1);
             }
 
@@ -1073,13 +1310,13 @@ static int _partyMemberItemRecover(PartyMemberListItem* a1)
 {
     int sid = -1;
     if (scriptAdd(&sid, SCRIPT_TYPE_ITEM) == -1) {
-        showMesageBox("\n  Error!: partyMemberItemRecover: Can't create script!");
+        presenter()->errorBox("\n  Error!: partyMemberItemRecover: Can't create script!");
         exit(1);
     }
 
     Script* script;
     if (scriptGetScript(sid, &script) == -1) {
-        showMesageBox("\n  Error!: partyMemberItemRecover: Can't find script!");
+        presenter()->errorBox("\n  Error!: partyMemberItemRecover: Can't find script!");
         exit(1);
     }
 
@@ -1465,7 +1702,6 @@ int _partyMemberIncLevels()
     char* text;
     MessageListItem msg;
     char str[260];
-    Rect levelUpMessageRect;
 
     memberIndex = -1;
     for (i = 1; i < gPartyMembersLength; i++) {
@@ -1542,7 +1778,7 @@ int _partyMemberIncLevels()
         // %s has gained in some abilities.
         text = getmsg(&gMiscMessageList, &msg, 9000);
         snprintf(str, sizeof(str), text, name);
-        displayMonitorAddMessage(str);
+        presenter()->consoleMessage(str);
 
         debugPrint(str);
 
@@ -1551,8 +1787,7 @@ int _partyMemberIncLevels()
         if (messageListGetItem(&gMiscMessageList, &msg)) {
             name = critterGetName(obj);
             snprintf(str, sizeof(str), msg.text, name);
-            textObjectAdd(obj, str, 101, _colorTable[0x7FFF], _colorTable[0], &levelUpMessageRect);
-            tileWindowRefreshRect(&levelUpMessageRect, obj->elevation);
+            presenter()->floatText(obj, str, 101, _colorTable[0x7FFF], _colorTable[0]);
         }
     }
 

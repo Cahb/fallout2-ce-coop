@@ -22,6 +22,19 @@ char* critterGetName(Object* obj);
 void critterProtoDataCopy(CritterProtoData* dest, CritterProtoData* src);
 int dudeSetName(const char* name);
 void dudeResetName();
+
+// Per-actor names (PLAYER_SHEET_DESIGN.md §8). Slot 0 is gDudeName, i.e.
+// dudeSetName / dudeResetName above.
+//
+// The GETTER is the storage accessor, not a convenience wrapper: protoGetName
+// must answer a sheet pid without calling critterGetName, or the two recurse.
+char* critterGetNameForSlot(int slot);
+int critterSetNameForSlot(int slot, const char* name);
+void critterPlayerActorSeedNames();
+// ONE slot, for spawn-at-login (see ACCOUNT_IDENTITY_DESIGN.md trap 1).
+void critterPlayerActorSeedNameSlot(int slot);
+int critterPlayerActorNameRowWrite(File* stream, int slot);
+int critterPlayerActorNameRowRead(File* stream, int slot);
 int critterGetHitPoints(Object* critter);
 int critterAdjustHitPoints(Object* critter, int hp);
 int critterGetPoison(Object* critter);

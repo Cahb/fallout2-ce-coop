@@ -1,0 +1,394 @@
+[t=1100] delta id=42 Brahmin: rot=4
+[t=4100] delta id=46 Brahmin: rot=1
+[t=5100] delta id=42 Brahmin: rot=1
+[t=6100] delta id=50 Brahmin: rot=3
+[t=7100] delta id=54 Brahmin: rot=3
+[t=9100] delta id=50 Brahmin: rot=1
+[t=9100] delta id=46 Brahmin: rot=3
+[t=12100] delta id=50 Brahmin: rot=4
+[t=13100] delta id=42 Brahmin: rot=5
+[t=15100] delta id=50 Brahmin: rot=5
+[t=17100] delta id=54 Brahmin: rot=4
+[t=18100] delta id=50 Brahmin: rot=0
+[t=18100] delta id=42 Brahmin: rot=0
+[t=18100] delta id=46 Brahmin: rot=4
+[t=21100] delta id=42 Brahmin: rot=5
+[t=22100] delta id=54 Brahmin: rot=5
+[t=22100] delta id=50 Brahmin: rot=1
+[t=25100] delta id=54 Brahmin: rot=0
+[t=25100] delta id=42 Brahmin: rot=2
+[t=25100] delta id=46 Brahmin: rot=2
+[t=27100] delta id=50 Brahmin: rot=0
+[t=28100] delta id=42 Brahmin: rot=4
+[t=28100] delta id=46 Brahmin: rot=4
+[t=29000] spawn id=18 pid=0x000000F1 .223 Pistol tile=-1 netid=1859
+[t=29000] disconn id=18 pid=0x000000F1 .223 Pistol netid=1859
+[t=29100] delta id=18000 Narg: inv=1
+[t=29500] spawn id=20 pid=0x00000022 .223 FMJ tile=-1 netid=1860
+[t=29500] disconn id=20 pid=0x00000022 .223 FMJ netid=1860
+[t=29600] delta id=18000 Narg: inv=2
+[t=30100] delta id=54 Brahmin: rot=1
+[t=30100] delta id=50 Brahmin: rot=1
+[t=30100] delta id=18000 Narg: inv=2
+[t=31100] delta id=46 Brahmin: rot=0
+[t=32100] delta id=42 Brahmin: rot=5
+[t=34100] delta id=46 Brahmin: rot=5
+[t=35100] delta id=42 Brahmin: rot=0
+[t=35100] delta id=50 Brahmin: rot=5
+[t=38100] delta id=54 Brahmin: rot=2
+[t=39100] delta id=46 Brahmin: rot=4
+[t=40100] delta id=50 Brahmin: rot=1
+[t=42100] delta id=54 Brahmin: rot=0
+[t=44100] delta id=50 Brahmin: rot=4
+[t=45100] delta id=54 Brahmin: rot=2
+[t=47100] delta id=50 Brahmin: rot=5
+[t=48100] delta id=46 Brahmin: rot=1
+[t=50100] combatEnter initiator=68
+[t=50100] turnStart id=68 Arroyo Villager ap=8
+[t=50100] attackResult attacker=68 defender=18000 hitMode=5 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=68 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] attackResult attacker=18000 defender=68 hitMode=2 loc=3 dmg=30 flags=0x0 extras=0
+[t=50100] turnStart id=20 Arroyo Elder ap=7
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] turnStart id=68 Arroyo Villager ap=8
+[t=50100] attackResult attacker=68 defender=18000 hitMode=4 loc=3 dmg=5 flags=0x0 extras=0
+[t=50100] attackResult attacker=68 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=1 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=4 dmg=0 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] attackResult attacker=18000 defender=68 hitMode=2 loc=3 dmg=28 flags=0x80 extras=0
+[t=50100] turnStart id=20 Arroyo Elder ap=7
+[t=50100] attackResult attacker=20 defender=18000 hitMode=2 loc=3 dmg=1 flags=0x0 extras=0
+[t=50100] attackResult attacker=20 defender=18000 hitMode=2 loc=3 dmg=6 flags=0x0 extras=0
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] attackResult attacker=18000 defender=20 hitMode=2 loc=3 dmg=27 flags=0x80 extras=0
+[t=50100] turnStart id=20 Arroyo Elder ap=7
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] attackResult attacker=24 defender=18000 hitMode=4 loc=6 dmg=2 flags=0x0 extras=0
+[t=50100] attackResult attacker=24 defender=18000 hitMode=4 loc=3 dmg=2 flags=0x0 extras=0
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=4 dmg=1 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] attackResult attacker=18000 defender=24 hitMode=2 loc=3 dmg=20 flags=0x0 extras=0
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] attackResult attacker=24 defender=18000 hitMode=5 loc=3 dmg=2 flags=0x0 extras=0
+[t=50100] attackResult attacker=24 defender=18000 hitMode=4 loc=3 dmg=3 flags=0x0 extras=0
+[t=50100] attackResult attacker=24 defender=18000 hitMode=5 loc=3 dmg=1 flags=0x0 extras=0
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=0 dmg=6 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=5 loc=3 dmg=2 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] attackResult attacker=18000 defender=24 hitMode=2 loc=3 dmg=22 flags=0x0 extras=0
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=4 dmg=0 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=4 dmg=5 flags=0x0 extras=0
+[t=50100] turnStart id=18000 Narg (player) ap=9
+[t=50100] turnStart id=24 Arroyo Villager ap=9
+[t=50100] turnStart id=62 Arroyo Villager ap=9
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=0 flags=0x0 extras=0
+[t=50100] attackResult attacker=62 defender=18000 hitMode=4 loc=3 dmg=1 flags=0x80 extras=0
+[t=50100] combatExit
+[t=50100] delta id=266 Warrior: ap=0
+[t=50100] delta id=16 Spore Plant: ap=0
+[t=50100] delta id=14 Spore Plant: ap=0
+[t=50100] delta id=42 Brahmin: ap=0
+[t=50100] delta id=50 Brahmin: ap=0
+[t=50100] delta id=18 Hakunin: ap=0
+[t=50100] delta id=46 Brahmin: ap=0
+[t=50100] delta id=54 Brahmin: ap=0
+[t=50100] delta id=18 Nagor: ap=0
+[t=50100] delta id=102 Arroyo Villager: ap=0
+[t=50100] delta id=54 Arroyo Warrior: ap=0
+[t=50100] delta id=20 Arroyo Elder: fid=0x013F101F rot=3 flags=0x20000018 hp=0 ap=0 results=0x80 inv=2
+[t=50100] delta id=18000 Narg: fid=0x013F000B flags=0x2000041C hp=0 ap=9 results=0x80 inv=2
+[t=50100] delta id=68 Arroyo Villager: fid=0x013F003F rot=0 flags=0x20000018 hp=0 ap=0 results=0x80
+[t=50100] delta id=62 Arroyo Villager: rot=5 ap=0
+[t=50100] delta id=24 Feargus: ap=0
+[t=50100] delta id=20 Jordan: ap=0
+[t=50100] delta id=74 Arroyo Villager: ap=0
+[t=50100] delta id=24 Arroyo Villager: rot=3 hp=8 ap=0
+[t=50100] delta id=46 Arroyo Warrior: ap=0
+[t=50100] delta id=18 Lucas: ap=0
+[t=50100] delta id=16 Aunt Morlis: ap=0
+[t=50300] delta id=50 Brahmin: rot=0
+[t=50300] delta id=42 Brahmin: rot=2
+[t=50300] delta id=46 Brahmin: rot=4
+[t=50300] delta id=54 Brahmin: rot=1
+[t=53300] delta id=50 Brahmin: rot=2
+[t=53300] delta id=46 Brahmin: rot=0
+[t=57300] delta id=54 Brahmin: rot=5
+[t=58300] delta id=50 Brahmin: rot=3
+[t=58300] delta id=46 Brahmin: rot=3
+[t=60300] delta id=42 Brahmin: rot=3
+[t=61300] delta id=50 Brahmin: rot=1
+[t=62300] delta id=46 Brahmin: rot=5
+[t=63300] delta id=42 Brahmin: rot=5
+[t=64300] delta id=50 Brahmin: rot=3
+[t=66300] delta id=54 Brahmin: rot=4
+[t=67300] delta id=42 Brahmin: rot=4
+[t=67300] delta id=50 Brahmin: rot=4
+[t=67300] delta id=46 Brahmin: rot=1
+[t=70300] delta id=54 Brahmin: rot=2
+[t=72300] delta id=50 Brahmin: rot=0
+[t=72300] delta id=46 Brahmin: rot=0
+[t=74300] delta id=54 Brahmin: rot=5
+[t=75300] delta id=46 Brahmin: rot=1
+[t=76300] delta id=50 Brahmin: rot=2
+[t=77300] delta id=42 Brahmin: rot=1
+[t=77300] delta id=54 Brahmin: rot=2
+[t=78300] delta id=46 Brahmin: rot=4
+[t=81500] delta id=62 Arroyo Villager: flags=0x20002000
+[t=82300] delta id=42 Brahmin: rot=0
+[t=82300] delta id=46 Brahmin: rot=3
+[t=82300] delta id=54 Brahmin: rot=3
+[t=84300] delta id=50 Brahmin: rot=4
+[t=87300] delta id=46 Brahmin: rot=4
+[t=87300] delta id=54 Brahmin: rot=0
+[t=89300] delta id=50 Brahmin: rot=1
+[t=92300] delta id=54 Brahmin: rot=3
+[t=93400] delta id=54 Arroyo Warrior: flags=0x20002000
+[t=94300] delta id=50 Brahmin: rot=0
+[t=94300] delta id=46 Brahmin: rot=1
+[t=97300] delta id=50 Brahmin: rot=3
+[t=97300] delta id=54 Brahmin: rot=4
+[t=98400] delta id=54 Arroyo Warrior: rot=5
+[t=99300] delta id=46 Brahmin: rot=2
+[t=100300] delta id=54 Brahmin: rot=0
+[t=101300] delta id=50 Brahmin: rot=2
+[t=103800] delta id=102 Arroyo Villager: flags=0x20002000
+[t=104300] delta id=54 Brahmin: rot=3
+[t=104300] delta id=46 Brahmin: rot=3
+[t=109300] delta id=42 Brahmin: rot=2
+[t=109300] delta id=54 Brahmin: rot=1
+[t=110300] delta id=50 Brahmin: rot=3
+[t=111000] delta id=24 Arroyo Villager: flags=0x20002000
+[t=112300] delta id=54 Brahmin: rot=0
+[t=114300] delta id=50 Brahmin: rot=0
+[t=116300] delta id=42 Brahmin: rot=5
+[t=116300] delta id=46 Brahmin: rot=2
+[t=118300] delta id=50 Brahmin: rot=3
+[t=121300] delta id=54 Brahmin: rot=5
+[t=122300] delta id=42 Brahmin: rot=3
+[t=124300] delta id=54 Brahmin: rot=1
+[t=125300] delta id=46 Brahmin: rot=0
+[t=126300] delta id=42 Brahmin: rot=5
+[t=126300] delta id=50 Brahmin: rot=5
+[t=129300] delta id=54 Brahmin: rot=3
+[t=129300] delta id=50 Brahmin: rot=1
+[t=130300] delta id=42 Brahmin: rot=2
+[t=132300] delta id=54 Brahmin: rot=2
+[t=133300] delta id=50 Brahmin: rot=0
+[t=134300] delta id=42 Brahmin: rot=4
+[t=134300] delta id=46 Brahmin: rot=4
+[t=135300] delta id=54 Brahmin: rot=3
+[t=137300] delta id=42 Brahmin: rot=5
+[t=137300] delta id=46 Brahmin: rot=3
+[t=138300] delta id=54 Brahmin: rot=0
+[t=138300] delta id=50 Brahmin: rot=3
+[t=140300] delta id=46 Brahmin: rot=2
+[t=143300] delta id=46 Brahmin: rot=1
+[t=145300] delta id=42 Brahmin: rot=1
+[t=148300] delta id=42 Brahmin: rot=4
+[t=149300] delta id=46 Brahmin: rot=4
+[t=150300] delta id=50 Brahmin: rot=5
+[t=151300] delta id=54 Brahmin: rot=3
+[t=153300] delta id=46 Brahmin: rot=3
+[t=153300] delta id=50 Brahmin: rot=2
+[t=154300] delta id=54 Brahmin: rot=2
+[t=157300] delta id=50 Brahmin: rot=0
+[t=158500] delta id=62 Arroyo Villager: rot=4
+[t=159300] delta id=46 Brahmin: rot=1
+[t=160300] delta id=50 Brahmin: rot=5
+[t=162300] delta id=42 Brahmin: rot=0
+[t=163300] delta id=50 Brahmin: rot=3
+[t=163300] delta id=54 Brahmin: rot=4
+[t=166300] delta id=50 Brahmin: rot=1
+[t=171300] delta id=42 Brahmin: rot=2
+[t=171300] delta id=50 Brahmin: rot=5
+[t=174300] delta id=54 Brahmin: rot=5
+[t=175300] delta id=42 Brahmin: rot=5
+[t=176300] delta id=50 Brahmin: rot=4
+[t=179300] delta id=54 Brahmin: rot=4
+[t=180300] delta id=50 Brahmin: rot=2
+[t=181300] delta id=46 Brahmin: rot=5
+[t=183300] delta id=54 Brahmin: rot=1
+[t=183300] delta id=50 Brahmin: rot=0
+[t=185300] delta id=42 Brahmin: rot=2
+[t=185300] delta id=46 Brahmin: rot=2
+[t=187300] delta id=54 Brahmin: rot=4
+[t=188300] delta id=42 Brahmin: rot=4
+[t=188300] delta id=50 Brahmin: rot=2
+[t=191300] delta id=54 Brahmin: rot=3
+[t=191300] delta id=50 Brahmin: rot=0
+[t=193300] delta id=42 Brahmin: rot=2
+[t=195300] delta id=50 Brahmin: rot=3
+[t=198300] delta id=42 Brahmin: rot=1
+[t=198300] delta id=50 Brahmin: rot=1
+[t=199300] delta id=46 Brahmin: rot=0
+[t=202500] delta id=62 Arroyo Villager: rot=3
+[t=203300] delta id=42 Brahmin: rot=3
+[t=204300] delta id=54 Brahmin: rot=5
+[t=204300] delta id=46 Brahmin: rot=1
+[t=206000] delta id=24 Arroyo Villager: rot=0
+[t=206300] delta id=42 Brahmin: rot=4
+[t=212300] delta id=54 Brahmin: rot=1
+[t=213300] delta id=50 Brahmin: rot=5
+[t=215300] delta id=42 Brahmin: rot=3
+[t=216300] delta id=54 Brahmin: rot=3
+[t=216800] delta id=102 Arroyo Villager: rot=3
+[t=217300] delta id=50 Brahmin: rot=4
+[t=217300] delta id=46 Brahmin: rot=4
+[t=220300] delta id=42 Brahmin: rot=0
+[t=220300] delta id=54 Brahmin: rot=2
+[t=220300] delta id=50 Brahmin: rot=2
+[t=222300] delta id=46 Brahmin: rot=0
+[t=223300] delta id=54 Brahmin: rot=0
+[t=225300] delta id=42 Brahmin: rot=1
+[t=225300] delta id=46 Brahmin: rot=2
+[t=225300] delta id=50 Brahmin: rot=1
+[t=228300] delta id=50 Brahmin: rot=5
+[t=228300] delta id=54 Brahmin: rot=3
+[t=229300] delta id=42 Brahmin: rot=5
+[t=229300] delta id=46 Brahmin: rot=5
+[t=231300] delta id=50 Brahmin: rot=3
+[t=232300] delta id=46 Brahmin: rot=2
+[t=232300] delta id=54 Brahmin: rot=2
+[t=233300] delta id=42 Brahmin: rot=0
+[t=234300] delta id=50 Brahmin: rot=5
+[t=236300] delta id=46 Brahmin: rot=0
+[t=236300] delta id=54 Brahmin: rot=1
+[t=239300] delta id=54 Brahmin: rot=3
+[t=242300] delta id=42 Brahmin: rot=3
+[t=242300] delta id=54 Brahmin: rot=2
+[t=243300] delta id=50 Brahmin: rot=4
+[t=245300] delta id=42 Brahmin: rot=0
+[t=246300] delta id=54 Brahmin: rot=5
+[t=246300] delta id=46 Brahmin: rot=3
+[t=248300] delta id=50 Brahmin: rot=3
+[t=249300] delta id=42 Brahmin: rot=2
+[t=250300] delta id=54 Brahmin: rot=1
+[t=251300] delta id=50 Brahmin: rot=5
+[t=252300] delta id=42 Brahmin: rot=5
+[t=253300] delta id=54 Brahmin: rot=5
+[t=253300] delta id=46 Brahmin: rot=5
+[t=255300] delta id=50 Brahmin: rot=0
+[t=256300] delta id=42 Brahmin: rot=3
+[t=257300] delta id=54 Brahmin: rot=1
+[t=258300] delta id=46 Brahmin: rot=2
+[t=261300] delta id=42 Brahmin: rot=4
+[t=261300] delta id=54 Brahmin: rot=3
+[t=265300] delta id=50 Brahmin: rot=2
+[t=266300] delta id=54 Brahmin: rot=5
+[t=271300] delta id=54 Brahmin: rot=1
+[t=273300] delta id=50 Brahmin: rot=1
+[t=274300] delta id=54 Brahmin: rot=0
+[t=274300] delta id=46 Brahmin: rot=0
+[t=277300] delta id=54 Brahmin: rot=5
+[t=278800] delta id=102 Arroyo Villager: rot=2
+[t=279300] delta id=46 Brahmin: rot=4
+[t=281300] delta id=54 Brahmin: rot=2
+[t=284300] delta id=46 Brahmin: rot=1
+[t=284400] delta id=54 Arroyo Warrior: rot=0
+[t=286300] delta id=42 Brahmin: rot=3
+[t=286300] delta id=54 Brahmin: rot=0
+[t=289300] delta id=54 Brahmin: rot=1
+[t=289300] delta id=46 Brahmin: rot=0
+[t=291300] delta id=42 Brahmin: rot=1
+[t=292300] delta id=46 Brahmin: rot=5
+[t=292300] delta id=50 Brahmin: rot=4
+[t=295300] delta id=42 Brahmin: rot=2
+[t=295300] delta id=50 Brahmin: rot=3
+[t=297300] delta id=46 Brahmin: rot=0
+[t=298300] delta id=42 Brahmin: rot=0
+[t=299300] delta id=54 Brahmin: rot=2
+[t=299300] delta id=50 Brahmin: rot=1
+[t=301300] delta id=42 Brahmin: rot=3
+[t=303300] delta id=50 Brahmin: rot=0
+[t=304300] delta id=54 Brahmin: rot=4
+[t=305300] delta id=42 Brahmin: rot=4
+[t=306300] delta id=50 Brahmin: rot=4
+[t=307300] delta id=46 Brahmin: rot=5
+[t=309300] delta id=42 Brahmin: rot=5
+[t=309300] delta id=54 Brahmin: rot=0
+[t=309300] delta id=50 Brahmin: rot=3
+[t=311300] delta id=46 Brahmin: rot=2
+[t=312300] delta id=50 Brahmin: rot=5
+[t=314300] delta id=54 Brahmin: rot=4
+[t=316300] delta id=50 Brahmin: rot=1
+[t=318300] delta id=46 Brahmin: rot=1
+[t=319300] delta id=54 Brahmin: rot=0
+[t=319300] delta id=42 Brahmin: rot=2
+[t=323300] delta id=54 Brahmin: rot=3
+[t=323300] delta id=46 Brahmin: rot=5
+[t=324300] delta id=42 Brahmin: rot=4
+[t=326300] delta id=54 Brahmin: rot=5
+[t=326500] delta id=62 Arroyo Villager: rot=0
+[t=327300] delta id=46 Brahmin: rot=3
+[t=329300] delta id=42 Brahmin: rot=0
+[t=330300] delta id=54 Brahmin: rot=2
+[t=332300] delta id=46 Brahmin: rot=4
+[t=333300] delta id=42 Brahmin: rot=4
+[t=334300] delta id=54 Brahmin: rot=1
+[t=336300] delta id=42 Brahmin: rot=1
+[t=340300] delta id=42 Brahmin: rot=3
+[t=340300] delta id=54 Brahmin: rot=3
+[t=342300] delta id=46 Brahmin: rot=1
+[t=342300] delta id=50 Brahmin: rot=5
+[t=343300] delta id=54 Brahmin: rot=0
+[t=344300] delta id=42 Brahmin: rot=0
+[t=345300] delta id=50 Brahmin: rot=3
+[t=346300] delta id=54 Brahmin: rot=4
+[t=348300] delta id=42 Brahmin: rot=5
+[t=349300] delta id=54 Brahmin: rot=1
+[t=349300] delta id=50 Brahmin: rot=0
+[t=352300] delta id=54 Brahmin: rot=5
+[t=352300] delta id=50 Brahmin: rot=4
+[t=352300] delta id=46 Brahmin: rot=0
+[t=356300] delta id=54 Brahmin: rot=3
+[t=357300] delta id=46 Brahmin: rot=3
+[t=361300] delta id=54 Brahmin: rot=2
+[t=362300] delta id=46 Brahmin: rot=1
+[t=364300] delta id=50 Brahmin: rot=5
+[t=364300] delta id=54 Brahmin: rot=4
+[t=365300] delta id=42 Brahmin: rot=3
+[t=367300] delta id=54 Brahmin: rot=1
+[t=367300] delta id=46 Brahmin: rot=2
+[t=368300] delta id=50 Brahmin: rot=2
+[t=369300] delta id=42 Brahmin: rot=2
+[t=371300] delta id=50 Brahmin: rot=0
+[t=371300] delta id=46 Brahmin: rot=0
+[t=372300] delta id=42 Brahmin: rot=1
+[t=375300] delta id=50 Brahmin: rot=2
+[t=375300] delta id=46 Brahmin: rot=3
+[t=377300] delta id=54 Brahmin: rot=3
+[t=379300] delta id=42 Brahmin: rot=4
+[t=380300] delta id=46 Brahmin: rot=0
+[t=382300] delta id=42 Brahmin: rot=1
+[t=385300] delta id=42 Brahmin: rot=5
+[t=385300] delta id=50 Brahmin: rot=4
+[t=388300] delta id=50 Brahmin: rot=3
+[t=388300] delta id=46 Brahmin: rot=3
+[t=391300] delta id=42 Brahmin: rot=2
+[t=394300] delta id=42 Brahmin: rot=0
+[t=395300] delta id=54 Brahmin: rot=5
+[t=395300] delta id=50 Brahmin: rot=2
+[t=396300] delta id=46 Brahmin: rot=5
+[t=398300] delta id=42 Brahmin: rot=5
+[t=398300] delta id=54 Brahmin: rot=2

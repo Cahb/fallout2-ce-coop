@@ -285,6 +285,7 @@ typedef struct Object {
     int sid; // obj_sid
     Object* owner;
     int scriptIndex;
+    int netId;
 } Object;
 
 typedef struct ObjectListNode {

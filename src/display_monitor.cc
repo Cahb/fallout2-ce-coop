@@ -14,6 +14,7 @@
 #include "input.h"
 #include "interface.h"
 #include "memory.h"
+#include "msg_channel.h"
 #include "sfall_config.h"
 #include "svga.h"
 #include "text_font.h"
@@ -70,6 +71,42 @@ static int gDisplayMonitorScrollUpButton = -1;
 // 0x56DBFC
 static char gDisplayMonitorLines[DISPLAY_MONITOR_LINES_CAPACITY][DISPLAY_MONITOR_LINE_LENGTH];
 
+// The channel each stored line was added on, indexed in lockstep with
+// gDisplayMonitorLines. A parallel array rather than a field because the two wrap
+// loops below write ROWS, not messages: a long message is shredded into several
+// rows at insert time and nothing downstream remembers they belonged together. So
+// the style is stamped per row, and a wrapped message simply carries its channel
+// onto each of its rows — which is the behaviour we want anyway.
+//
+// (The purist version wraps at RENDER time off a ring of whole messages. That is a
+// rewrite of vanilla's two loops for no visible gain; revisit only if a style ever
+// needs to know where a message STARTS — e.g. indenting continuation rows.)
+static unsigned char gDisplayMonitorLineChannels[DISPLAY_MONITOR_LINES_CAPACITY];
+
+// How each channel is painted. CLIENT-OWNED: the wire carries a channel, never a
+// colour (msg_channel.h). Colours are 15-bit RGB through _colorTable, i.e. quantized
+// to the game's 256-entry palette — asking for a colour the palette cannot hold gets
+// you its nearest neighbour, not an error, so eyeball new entries in game.
+//
+// `font` of -1 means "the monitor's own font" (101). Overriding it is legal but
+// costs a line-height mismatch: _max_disp is computed once from font 101, so a
+// taller font will overlap its neighbour. Use flags for emphasis instead unless you
+// mean it.
+struct MessageChannelStyle {
+    int r, g, b; // 0-31 each
+    int flags; // FONT_SHADOW / FONT_UNDERLINE / FONT_MONO
+    int font; // -1 = DISPLAY_MONITOR_FONT
+};
+
+static const MessageChannelStyle gMessageChannelStyles[kMsgChannelCount] = {
+    /* kMsgChannelDefault */ { 0, 31, 0, 0, -1 }, // vanilla green (_colorTable[992])
+    /* kMsgChannelCombat  */ { 31, 20, 0, 0, -1 }, // amber — the fight narrating itself
+    /* kMsgChannelRefusal */ { 20, 20, 20, 0, -1 }, // grey — nothing happened; recede
+    /* kMsgChannelSystem  */ { 10, 24, 31, FONT_SHADOW, -1 }, // pale blue — not the game world
+    /* kMsgChannelChat    */ { 31, 31, 31, 0, -1 }, // white — a person is talking
+    /* kMsgChannelReward  */ { 31, 31, 10, FONT_UNDERLINE, -1 }, // yellow — you gained something
+};
+
 // 0x56FB3C
 static unsigned char* gDisplayMonitorBackgroundFrmData;
 
@@ -94,6 +131,12 @@ static int _disp_start;
 // 0x56FB58
 static unsigned int gDisplayMonitorLastBeepTimestamp;
 
+// Row pitch, captured from DISPLAY_MONITOR_FONT at init alongside _max_disp. Held
+// because a per-line style may swap the font mid-refresh, and the rows must keep
+// stepping by the height _max_disp was derived from or the last one leaves the
+// rectangle.
+static int gDisplayMonitorLineHeight;
+
 static std::ofstream gConsoleFileStream;
 static int gConsoleFilePrintCount = 0;
 
@@ -112,7 +155,8 @@ int displayMonitorInit()
         fontSetCurrent(DISPLAY_MONITOR_FONT);
 
         gDisplayMonitorLinesCapacity = DISPLAY_MONITOR_LINES_CAPACITY;
-        _max_disp = DISPLAY_MONITOR_HEIGHT / fontGetLineHeight();
+        gDisplayMonitorLineHeight = fontGetLineHeight();
+        _max_disp = DISPLAY_MONITOR_HEIGHT / gDisplayMonitorLineHeight;
         _disp_start = 0;
         _disp_curr = 0;
         fontSetCurrent(oldFont);
@@ -231,9 +275,20 @@ void displayMonitorExit()
 // 0x43186C
 void displayMonitorAddMessage(char* str)
 {
+    displayMonitorAddMessageStyled(str, kMsgChannelDefault);
+}
+
+void displayMonitorAddMessageStyled(char* str, int channel)
+{
     if (!gDisplayMonitorInitialized) {
         return;
     }
+
+    // An unknown channel is a viewer that is older than whatever emitted it (or a
+    // mod's). Render it plainly rather than indexing off the end of the table.
+    unsigned char style = (channel >= 0 && channel < kMsgChannelCount)
+        ? static_cast<unsigned char>(channel)
+        : static_cast<unsigned char>(kMsgChannelDefault);
 
     // SFALL
     consoleFileAddMessage(str);
@@ -272,6 +327,7 @@ void displayMonitorAddMessage(char* str)
             }
             strncpy(temp, str, length);
             gDisplayMonitorLines[_disp_start][DISPLAY_MONITOR_LINE_LENGTH - 1] = '\0';
+            gDisplayMonitorLineChannels[_disp_start] = style;
             _disp_start = (_disp_start + 1) % gDisplayMonitorLinesCapacity;
 
             if (v1 == nullptr) {
@@ -314,6 +370,7 @@ void displayMonitorAddMessage(char* str)
     strncpy(temp, str, length);
 
     gDisplayMonitorLines[_disp_start][DISPLAY_MONITOR_LINE_LENGTH - 1] = '\0';
+    gDisplayMonitorLineChannels[_disp_start] = style;
     _disp_start = (_disp_start + 1) % gDisplayMonitorLinesCapacity;
 
     fontSetCurrent(oldFont);
@@ -331,6 +388,7 @@ static void display_clear()
     if (gDisplayMonitorInitialized) {
         for (index = 0; index < gDisplayMonitorLinesCapacity; index++) {
             gDisplayMonitorLines[index][0] = '\0';
+            gDisplayMonitorLineChannels[index] = kMsgChannelDefault;
         }
 
         _disp_start = 0;
@@ -364,7 +422,22 @@ static void displayMonitorRefresh()
 
     for (int index = 0; index < _max_disp; index++) {
         int stringIndex = (_disp_curr + gDisplayMonitorLinesCapacity + index - _max_disp) % gDisplayMonitorLinesCapacity;
-        fontDrawText(buf + index * _intface_full_width * fontGetLineHeight(), gDisplayMonitorLines[stringIndex], DISPLAY_MONITOR_WIDTH, _intface_full_width, _colorTable[992]);
+
+        // Per-line style. Vanilla drew every row with _colorTable[992] — that is
+        // exactly what kMsgChannelDefault still resolves to, so an unstyled log is
+        // pixel-identical to before.
+        const MessageChannelStyle& style = gMessageChannelStyles[gDisplayMonitorLineChannels[stringIndex]];
+        if (style.font >= 0) {
+            fontSetCurrent(style.font);
+        } else if (fontGetCurrent() != DISPLAY_MONITOR_FONT) {
+            fontSetCurrent(DISPLAY_MONITOR_FONT);
+        }
+        int color = _colorTable[(style.r << 10) | (style.g << 5) | style.b] | style.flags;
+
+        // The row PITCH stays the monitor font's line height even when a style
+        // overrides the font: _max_disp was computed from it, so walking by
+        // anything else would drift the last row out of the rectangle.
+        fontDrawText(buf + index * _intface_full_width * gDisplayMonitorLineHeight, gDisplayMonitorLines[stringIndex], DISPLAY_MONITOR_WIDTH, _intface_full_width, color);
 
         // Even though the display monitor is rectangular, it's graphic is not.
         // To give a feel of depth it's covered by some metal canopy and

@@ -6,6 +6,8 @@
 
 #include <SDL.h>
 
+#include "game_movie.h" // gameMovieIsPlaying — keep the movie audio-clock alive when unfocused
+
 namespace fallout {
 
 #define AUDIO_ENGINE_SOUND_BUFFERS 8
@@ -48,7 +50,18 @@ static void audioEngineMixin(void* userData, Uint8* stream, int length)
 {
     memset(stream, gAudioEngineSpec.silence, length);
 
-    if (!gProgramIsActive) {
+    // When the window is unfocused we normally emit nothing AND stop consuming the
+    // sound buffers. That is fine for gameplay but FATAL for a movie: the MVE player
+    // is slaved to the audio PLAY CURSOR (soundBuffer->pos), which advances ONLY in
+    // this callback, so freezing it strands _MVE_sndSync in a busy-spin forever
+    // inside the viewer's blocking movie loop — the co-op "alt-tab wedges the movie,
+    // kill -9 to recover" bug. So during a movie we keep RUNNING the mix regardless
+    // of focus (the cursor must advance for playback to progress); we just render
+    // the OUTPUT silent while unfocused, so on a two-players-one-PC box only the
+    // focused window is audible (owner ruling 2026-07-23: play-through-muted).
+    // Outside a movie, unfocused stays silent-and-frozen exactly as before.
+    bool focused = gProgramIsActive;
+    if (!focused && !gameMovieIsPlaying()) {
         return;
     }
 
@@ -76,7 +89,8 @@ static void audioEngineMixin(void* userData, Uint8* stream, int length)
                     break;
                 }
 
-                SDL_MixAudioFormat(stream + pos, buffer, gAudioEngineSpec.format, bytesRead, soundBuffer->volume);
+                // volume 0 while unfocused = advance the clock, emit silence (mute).
+                SDL_MixAudioFormat(stream + pos, buffer, gAudioEngineSpec.format, bytesRead, focused ? soundBuffer->volume : 0);
 
                 if (soundBuffer->pos >= soundBuffer->size) {
                     if (soundBuffer->looping) {
