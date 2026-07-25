@@ -43,6 +43,14 @@ enum ObjectDeltaField {
     // charges) — the last catches firing/depletion with no membership change. Detected
     // by a fingerprint diff; the presenter reads owner->data.inventory to serialize.
     OBJECT_DELTA_INVENTORY = 1 << 8,
+    // The object's art FRAME changed (objectSetFrame). Scripts swap frames to show
+    // state — a dug grave, an opened door/container, a thrown lever — via op_anim's
+    // frame subcommand. obj->frame is a top-level field (NOT part of obj->flags), so
+    // without this bit a frame swap never streamed and only "fixed" on a map reload.
+    OBJECT_DELTA_FRAME = 1 << 9,
+    // The object's own light emission changed (obj->lightDistance/lightIntensity, set by
+    // op_obj_set_light_level) — scripted lamps/glow. Not otherwise streamed.
+    OBJECT_DELTA_LIGHT = 1 << 10,
 };
 
 // Bits for Presenter::worldDelta (MP_PROTOCOL.md §2 worldDelta). Global sim
@@ -51,6 +59,9 @@ enum WorldDeltaField {
     // In-game clock (gameTimeGetTime) advanced. gvars/mvars are server-only in
     // v1 (MP_PROTOCOL.md §2), so they are not a wire field yet.
     WORLD_DELTA_GAMETIME = 1 << 0,
+    // Global ambient light level changed (op_set_light_level) — scripted map darkness/
+    // brightness. Carries the new intensity; the client applies it to its own lighting.
+    WORLD_DELTA_LIGHT = 1 << 1,
 };
 
 // Phase 1 presenter seam (REWRITE_PLAN.md 1.2, WORKLIST_P1.md).
@@ -121,6 +132,14 @@ public:
     // rolling on until each skips itself. [[movie-playback-coop]]
     virtual void movieStop() {}
 
+    // Co-op random-encounter prompt (dedicated server). encounterPrompt streams the
+    // title + description and the server then block-and-pumps for the first viewer's
+    // accept/decline (worldmapEncounterAnswer). encounterClose fires when the barrier
+    // releases, so any OTHER viewer still in the prompt box breaks out. No-op by
+    // default: SP / golden reach showDialogBox directly.
+    virtual void encounterPrompt(const char* title, const char* body) {}
+    virtual void encounterClose() {}
+
     // World-state lifecycle (P5-B, MP_PROTOCOL.md §2 STATE primitives). These
     // are the authoritative object spawn/move/destroy deltas — the world-state
     // channel ARCHITECTURE.md assumed the seam already carried but did not.
@@ -186,6 +205,15 @@ public:
     // objectMoved. Includes a top-level inventory-changed bit; worldDelta
     // (gametime/gvars) is separate (deferred).
     virtual void objectDelta(Object* obj, unsigned int changedFields) {}
+
+    // A player actor's CHARACTER SHEET row changed at runtime (drug/chem stat
+    // mod, level-up, trait/perk change) and must stream to viewers — the sheet
+    // lives in the per-slot proto row, not on the Object, so OBJECT_DELTA cannot
+    // carry it. `data`/`len` are a one-slot PSHT block (playerSheetBlockWriteOne),
+    // applied by the viewer with playerSheetBlockRead. Gated by wantsSheetDeltas
+    // so non-network presenters (single-player, golden) do zero work.
+    virtual bool wantsSheetDeltas() { return false; }
+    virtual void playerSheetDelta(int slot, const unsigned char* data, int len) {}
 
     // The active tactical map finished loading (MP_PROTOCOL.md §2 SESSION/MAP
     // control). Hooked at the UNIVERSAL choke point mapLoad (map.cc:628, the site

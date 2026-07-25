@@ -258,6 +258,18 @@ const unsigned char* presRecordData();
 int presRecordSize();
 int presRecordOpCount();
 
+// Feature A (per-actor action gate). The wall-clock duration, in ms, this recorded
+// action should keep its acting actor visibly "busy" — the summed animation-cycle
+// duration within the BUSIEST owner lane (sum within one owner, MAX across owners),
+// clamped to [100, 3000]ms. Returns 0 when the section recorded no animating op (a
+// pure fid/sfx swap has no draw to wait out). ANIMATE / ANIMATE_REV / ANIMATE_FOREVER
+// (one cycle) / TAKE_OUT / the MOVE_* leaves contribute; SET_FID / SFX / PING / CALL
+// do not. Duration comes from the leaf's own art (artGetFrameCount * 1000 /
+// artGetFramesPerSecond); a small fallback covers an artLock miss. Valid alongside
+// presRecordData(), and accumulated only while a record section is open — so it is
+// inert (0) in the client/golden binary, where nothing records.
+int presRecordCostMs();
+
 // ---- leaf record emitters (called from server_anim.cc leaves) ----
 void presRecordSeqBegin(int flags);
 void presRecordSeqEnd();

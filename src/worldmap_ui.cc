@@ -150,6 +150,10 @@ static int wmWorldMapFunc(int a1)
 
     wmMatchWorldPosToArea(wmGenData.worldPosX, wmGenData.worldPosY, &(wmGenData.currentAreaId));
 
+    // SFALL CarPlacedTileFix — the solo/host half of the pair (the dedicated server
+    // does it in worldmapServerDriver). No-ops for a viewer, which does not own gvars.
+    wmCarClearPlacedTile();
+
     unsigned int partyHealTime = 0;
     int map = -1;
     int rc = 0;
@@ -291,7 +295,7 @@ static int wmWorldMapFunc(int a1)
                         if (wmGenData.isInCar) {
                             wmGenData.isInCar = false;
                             if (wmGenData.currentAreaId == -1) {
-                                wmMatchAreaContainingMapIdx(map, &(wmGenData.currentCarAreaId));
+                                wmCarParkAtMapArea(map);
                             } else {
                                 wmGenData.currentCarAreaId = wmGenData.currentAreaId;
                             }
@@ -332,7 +336,7 @@ static int wmWorldMapFunc(int a1)
                         if (map != -1) {
                             if (wmGenData.isInCar) {
                                 wmGenData.isInCar = false;
-                                wmMatchAreaContainingMapIdx(map, &(wmGenData.currentCarAreaId));
+                                wmCarParkAtMapArea(map);
                             }
 
                             wmFadeOut();

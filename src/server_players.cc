@@ -1,7 +1,12 @@
 #include "server_players.h"
 
+#include <cstdlib> // getenv — the action-gate kill switch
+#include <cstring> // strcmp
+
 #include "critter.h"
 #include "debug.h"
+#include "input.h" // getTicks / getTicksBetween — wall-clock busy window (feature A)
+#include "inventory.h" // HAND_LEFT / HAND_RIGHT — the active-hand default
 #include "object.h"
 #include "scripts.h" // scriptGetSelf — the O3 nearest-player anchor
 #include "server_loop.h" // serverDedicatedActive — O3 is server-only
@@ -76,6 +81,90 @@ int playerActorSlotOf(Object* obj)
     }
 
     return -1;
+}
+
+// ---- Per-actor action gate + active hand (feature A; see server_players.h) --
+
+// Wall-clock busy window: the tick a mark was made, and how long from it the actor
+// stays busy. Zero-init = never marked = never busy (getTicksBetween(now, 0) is huge,
+// which is >= a zero duration), the default the client/probe/goldens observe.
+static unsigned int gActorBusyMarkAt[kMaxPlayerActors];
+static unsigned int gActorBusyDurMs[kMaxPlayerActors];
+
+// Active weapon hand per slot. Listed so the DEFAULT is HAND_RIGHT (right-hand-first,
+// preserving serverDudeHitMode) rather than the zero-init HAND_LEFT.
+static_assert(kMaxPlayerActors == 8, "gActorActiveHand initializer lists one value per slot");
+static int gActorActiveHand[kMaxPlayerActors] = {
+    HAND_RIGHT, HAND_RIGHT, HAND_RIGHT, HAND_RIGHT,
+    HAND_RIGHT, HAND_RIGHT, HAND_RIGHT, HAND_RIGHT,
+};
+
+void serverActorBusyMark(int slot, int durMs, const char* what)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors || durMs <= 0) {
+        return;
+    }
+    gActorBusyMarkAt[slot] = getTicks();
+    gActorBusyDurMs[slot] = (unsigned int)durMs;
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        debugPrint("[actiongate] slot %d busy %dms (%s)\n", slot, durMs,
+            what != nullptr ? what : "");
+    }
+}
+
+void serverActorBusyMarkByNetId(int actorNetId, int durMs)
+{
+    if (actorNetId == 0) {
+        return;
+    }
+    Object* actor = objectFindByNetId(actorNetId);
+    int slot = actor != nullptr ? playerActorSlotOf(actor) : -1;
+    if (slot >= 0) {
+        serverActorBusyMark(slot, durMs, "seq");
+    }
+}
+
+bool serverActorBusyIs(int slot)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return false;
+    }
+    return getTicksBetween(getTicks(), gActorBusyMarkAt[slot]) < gActorBusyDurMs[slot];
+}
+
+void serverActorBusyClearAll()
+{
+    for (int i = 0; i < kMaxPlayerActors; i++) {
+        gActorBusyMarkAt[i] = 0;
+        gActorBusyDurMs[i] = 0;
+    }
+}
+
+int serverActorActiveHand(int slot)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return HAND_RIGHT;
+    }
+    return gActorActiveHand[slot] == HAND_LEFT ? HAND_LEFT : HAND_RIGHT;
+}
+
+void serverActorSetActiveHand(int slot, int hand)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return;
+    }
+    gActorActiveHand[slot] = hand == HAND_LEFT ? HAND_LEFT : HAND_RIGHT;
+}
+
+bool serverActionGateEnabled()
+{
+    // Default ON. Disabled only by an explicit F2_SERVER_ACTION_GATE=0 (the "0" form
+    // matches the other numeric kill switches; any other value stays enabled).
+    static bool enabled = []() {
+        const char* v = getenv("F2_SERVER_ACTION_GATE");
+        return v == nullptr || strcmp(v, "0") != 0;
+    }();
+    return enabled;
 }
 
 int playerActorRegister(Object* actor)
@@ -157,13 +246,15 @@ bool playerActorAnyAlive()
 
 bool playerActorMayTransit(Object* actor)
 {
-    // v1 BODY, and the callers must not know it: only the host travels. The
-    // question this answers is "is this actor the transit authority for its
-    // group", which stops being a slot comparison the moment there are multiple
-    // live maps, per-map groups, or a client joining a map the host is not on
-    // (MP_PROPOSAL Ch 14.2). Keep the policy here; keep call sites asking the
-    // question, not testing the slot.
-    return actor != nullptr && actor == playerActorAt(0);
+    // ANY player actor may transit: whoever crosses an exit grid leads the whole
+    // party to the new map (mapHandleTransition still places the group from slot
+    // 0). This reverses the host-only rule (MP_PROPOSAL Ch 14.2) by owner decision
+    // 2026-07-23 — the anti-grief / no-unconsented-travel asymmetry is dropped in
+    // favor of any co-op player being able to lead travel. The question this
+    // answers stays "is this actor the transit authority for its group", so when
+    // there are multiple live maps or per-map groups it grows a real body HERE,
+    // still without any call site testing a slot.
+    return playerActorIs(actor);
 }
 
 int playerActorFindFreeTileNear(int center, int elevation)

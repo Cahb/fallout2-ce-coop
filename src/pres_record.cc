@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "actions.h" // actionShowDeathCallbackPtr — the one RECORD callback in v1
+#include "animation.h" // ANIM_TAKE_OUT — the take-out leaf's anim (feature A cost)
+#include "art.h" // buildFid / artLock / artGetFrameCount — per-op anim duration (feature A cost)
 #include "obj_types.h"
 #include "object.h" // objectGetNextNetId — the created-this-beat watermark
 #include "random.h" // RandomState / randomSnapshot / randomRestore
@@ -46,6 +48,60 @@ static int gNextHandle = -1;
 static int gBeatNetIdWatermark = 0; // objectGetNextNetId() at beat start (serverTick top)
 
 static bool gBackendActive = false;
+
+// ---- feature A: per-owner animation-cost tally (presRecordCostMs) ----------
+// Accumulated as ops are recorded: each animating leaf adds its anim-cycle duration
+// to its OWNER's lane (keyed by the wire ref resolveRef returned); the reported cost
+// is the MAX lane, clamped. Reset with the buffer at every Section/Ambient begin, so
+// it is scoped to exactly the section presRecordData() describes. Inert off the
+// recording backend (the leaves only run while a section is open).
+static std::unordered_map<int, unsigned int> gCostByRef;
+static unsigned int gCostMaxMs = 0;
+
+static const int kCostClampMinMs = 100;
+static const int kCostClampMaxMs = 3000;
+static const int kCostFallbackDrawMs = 1200; // weapon take-out, when artLock misses
+static const int kCostFallbackAnimMs = 1000; // gesture / door / knockdown fallback
+
+// One animation's on-screen duration for `owner`'s art: frames / fps. weaponCode < 0
+// = read the owner's current weapon-animation nibble; >= 0 = the leaf's explicit code
+// (a take-out draws the code being switched TO, which owner->fid does not yet carry).
+// Returns -1 when the art cannot be locked, so the caller can substitute a fallback.
+static int animDurationMs(Object* owner, int anim, int weaponCode)
+{
+    if (owner == nullptr) {
+        return -1;
+    }
+    int code = weaponCode >= 0 ? weaponCode : ((owner->fid & 0xF000) >> 12);
+    int fid = buildFid(FID_TYPE(owner->fid), owner->fid & 0xFFF, anim, code, owner->rotation + 1);
+    CacheEntry* handle;
+    Art* art = artLock(fid, &handle);
+    if (art == nullptr) {
+        return -1;
+    }
+    int fps = artGetFramesPerSecond(art);
+    int frames = artGetFrameCount(art);
+    artUnlock(handle);
+    if (fps <= 0 || frames <= 0) {
+        return -1;
+    }
+    return frames * 1000 / fps;
+}
+
+static void costAccrue(Object* owner, int ref, int anim, int weaponCode, int fallbackMs)
+{
+    int ms = animDurationMs(owner, anim, weaponCode);
+    if (ms <= 0) {
+        ms = fallbackMs;
+    }
+    if (ms <= 0) {
+        return;
+    }
+    unsigned int lane = (gCostByRef[ref] += (unsigned int)ms);
+    if (lane > gCostMaxMs) {
+        gCostMaxMs = lane;
+    }
+}
 
 void presRecordSetBackendActive(bool active)
 {
@@ -195,6 +251,8 @@ void presRecordSectionBegin()
     gNextHandle = -1;
     gAdoptObj = nullptr; // never carry an adopt-netId across sections
     gAdoptNetId = 0;
+    gCostByRef.clear();
+    gCostMaxMs = 0;
     randomSnapshot(&gRngSnapshot);
 }
 
@@ -240,6 +298,8 @@ void presRecordAmbientBegin()
     gOpCount = 0;
     gHandles.clear();
     gNextHandle = -1;
+    gCostByRef.clear();
+    gCostMaxMs = 0;
 }
 
 void presRecordAmbientEnd()
@@ -283,6 +343,21 @@ int presRecordOpCount()
     return gOpCount;
 }
 
+int presRecordCostMs()
+{
+    if (gCostMaxMs == 0) {
+        return 0;
+    }
+    unsigned int ms = gCostMaxMs;
+    if (ms < (unsigned int)kCostClampMinMs) {
+        ms = kCostClampMinMs;
+    }
+    if (ms > (unsigned int)kCostClampMaxMs) {
+        ms = kCostClampMaxMs;
+    }
+    return (int)ms;
+}
+
 // ---- leaf emitters --------------------------------------------------------
 
 void presRecordSeqBegin(int flags)
@@ -305,6 +380,12 @@ void presRecordPriority(int n)
 static void recordAnimLike(unsigned char op, Object* owner, int anim, int delay)
 {
     int ref = resolveRef(owner);
+    // ANIMATE / _REV / _FOREVER are on-screen busy time (one cycle each — FOREVER is
+    // clamped by the busy window anyway); ANIMATE_AND_HIDE is the explosion cloud, a
+    // transient's fadeout, not the actor's action, so it does not gate the actor.
+    if (op == PRES_OP_ANIMATE || op == PRES_OP_ANIMATE_REV || op == PRES_OP_ANIMATE_FOREVER) {
+        costAccrue(owner, ref, anim, -1, kCostFallbackAnimMs);
+    }
     beginOp(op);
     appendI32(ref);
     appendI32(anim);
@@ -352,6 +433,7 @@ void presRecordUnsetFlag(Object* owner, int flag, int delay)
 static void recordMoveStraight(unsigned char op, Object* owner, int tile, int elev, int anim, int delay)
 {
     int ref = resolveRef(owner);
+    costAccrue(owner, ref, anim, -1, kCostFallbackAnimMs);
     beginOp(op);
     appendI32(ref);
     appendI32(tile);
@@ -368,6 +450,10 @@ void presRecordMoveStraightWait(Object* owner, int tile, int elev, int anim, int
 void presRecordMoveToTile(Object* owner, int tile, int elev, int anim, int actionPoints, int preWalkAp, int delay)
 {
     int ref = resolveRef(owner);
+    // Pathed walk: exact duration is path-length dependent (and the outbox already
+    // meters live moves per-actor); accrue one locomotion cycle so a MOVE_* leaf still
+    // contributes a bounded amount to the busy window. The overall clamp caps it.
+    costAccrue(owner, ref, anim, -1, kCostFallbackAnimMs);
     beginOp(PRES_OP_MOVE_TO_TILE);
     appendI32(ref);
     appendI32(tile);
@@ -384,6 +470,7 @@ void presRecordMoveToObject(Object* owner, Object* target, int anim, int actionP
 {
     int ref = resolveRef(owner);
     int targetRef = resolveRef(target);
+    costAccrue(owner, ref, anim, -1, kCostFallbackAnimMs);
     beginOp(PRES_OP_MOVE_TO_OBJ);
     appendI32(ref);
     appendI32(targetRef);
@@ -415,6 +502,9 @@ void presRecordSetLight(Object* owner, int dist, int intensity, int delay)
 void presRecordTakeOut(Object* owner, int weaponAnimCode, int delay)
 {
     int ref = resolveRef(owner);
+    // The take-out draws the weapon being switched TO (weaponAnimCode), which owner->fid
+    // does not yet carry — pass the code explicitly rather than reading the nibble.
+    costAccrue(owner, ref, ANIM_TAKE_OUT, weaponAnimCode, kCostFallbackDrawMs);
     beginOp(PRES_OP_TAKE_OUT);
     appendI32(ref);
     appendI32(weaponAnimCode);

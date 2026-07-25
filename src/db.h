@@ -18,6 +18,8 @@ int dbGetFileSize(const char* filePath, int* sizePtr);
 int dbGetFileContents(const char* filePath, void* ptr);
 int fileClose(File* stream);
 File* fileOpen(const char* filename, const char* mode);
+// Open a READ-ONLY File over an in-memory copy of [data] — no disk, no path.
+File* fileOpenMemory(const void* data, size_t size);
 int filePrintFormatted(File* stream, const char* format, ...);
 int fileReadChar(File* stream);
 char* fileReadString(char* str, size_t size, File* stream);

@@ -15,10 +15,10 @@ current active pivot). Phase-1/Batch-7/Phase-2/server-loop bring-up is long done
 the changelog.
 
 ## DOCS OF RECORD (repo root)
-`REWRITE_PLAN.md` (phases/gates), `SYSTEM_MAP.md` (coupling), `WORKLIST_P1.md` (conversion
-checklist), `WORKLIST_P1_LEDGER.md` (hidden-rule tickets), `ARCHITECTURE.md` (client/server
+`REWRITE_PLAN.md (deleted)` (phases/gates), `docs/SYSTEM_MAP.md` (coupling), `WORKLIST_P1.md (deleted)` (conversion
+checklist), `WORKLIST_P1_LEDGER.md (deleted)` (hidden-rule tickets), `docs/ARCHITECTURE.md` (client/server
 TL;DR). The THREE coverage maps that together bound the whole headless surface:
-`SCRIPT_OPCODE_MAP.md` + `PLAYER_ACTION_MAP.md` + `PASSIVE_SIM_MAP.md`.
+`docs/SCRIPT_OPCODE_MAP.md` + `PLAYER_ACTION_MAP.md (deleted)` + `PASSIVE_SIM_MAP.md (deleted)`.
 
 ## THE 3-SURFACE MODEL (durable framing — the sim is driven three ways, don't treat the
 opcode map as the whole picture):

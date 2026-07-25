@@ -59,6 +59,13 @@ void queueInit();
 int queueExit();
 int queueLoad(File* stream);
 int queueSave(File* stream);
+// Persist / restore every queued event owned by ONE object (remaining delay +
+// type + type-specific data). Used by the co-op appendix to keep extra player
+// actors' timed effects atomic with their sheet, because the vanilla queueSave/
+// queueLoad rebinds by object id inside the save handler loop — before the
+// appendix reconstructs the extras — which would orphan an extra-owned event.
+int queueSaveEventsForOwner(File* stream, Object* owner);
+int queueLoadEventsForOwner(File* stream, Object* owner);
 int queueAddEvent(int delay, Object* owner, void* data, int eventType);
 int queueRemoveEvents(Object* owner);
 int queueRemoveEventsByType(Object* owner, int eventType);

@@ -5,8 +5,10 @@
 #include <unordered_map>
 
 #include "game.h"
+#include "light.h" // lightGetAmbientIntensity — global ambient-light worldDelta
 #include "map.h"
 #include "object.h"
+#include "party_member.h"
 #include "presenter.h"
 #include "proto_types.h"
 #include "scripts.h"
@@ -19,6 +21,9 @@ namespace fallout {
 // critter-only fields are 0 for non-critters (never diffed for them).
 struct ObjectShadow {
     int fid;
+    int frame; // art frame index (obj->frame) — scripted frame swaps (graves/doors/levers)
+    int lightDistance; // per-object light emission (op_obj_set_light_level)
+    int lightIntensity;
     int rotation;
     unsigned int flags;
     // Critter scalars.
@@ -103,6 +108,8 @@ static std::unordered_map<Object*, ObjectShadow> gShadow;
 static unsigned int gLastMapGeneration = 0;
 // worldDelta baseline: last emitted in-game clock (MP_PROTOCOL.md §2 worldDelta).
 static unsigned int gLastGameTime = 0;
+// worldDelta baseline: last emitted global ambient light level (-1 = uninitialized).
+static int gLastAmbient = -1;
 
 static bool objectIsCritter(Object* obj)
 {
@@ -113,31 +120,32 @@ static bool objectIsCritter(Object* obj)
 // egg) — those carry OBJECT_NO_SAVE. The dude is OBJECT_NO_SAVE too but IS the
 // primary actor, so it is always included (mirrors state_dump's dude handling).
 //
-// KNOWN LIMITATION (deferred to P5-C, review 2026-07-13): party members ALSO
-// carry OBJECT_NO_SAVE while recruited (party_member.cc), so companion deltas
-// are not tracked and recruit/dismiss is a membership-toggle gap (a recruited
-// critter goes untracked with no objectDestroyed; a dismissed one is baselined
-// with no objectCreated). This is CONSISTENT with the snapshot oracle
-// (state_dump also skips NO_SAVE except the dude), so it is a deferral aligned
-// with "party is a removable v1 behavior" ([[mp-actor-architecture-principle]]),
-// not a delta-vs-snapshot divergence. When party actors become first-class
-// (PlayerActor), track by an explicit syncable set rather than this
-// runtime-mutable flag. Likewise, objectFindFirst (below) only walks the by-tile
-// buckets and skips art-type-hidden fids, so an object parked at tile -1 or one
-// whose FID_TYPE flips to a hidden category is invisible to the scan for that
-// span — also shared with the snapshot oracle, so no join-vs-stream divergence.
+// Recruited party members carry OBJECT_NO_SAVE (party_member.cc:401) but ARE in
+// the sync domain: the join blob rides them in the map body under a prep bracket
+// (mapSaveToStream), the netId walk numbers them inline, and the baseline snapshot
+// covers them — the three domain-alignment sites (CLIENT_JOIN_DESIGN.md §C) all
+// include them. Tracking their deltas here keeps recruit a wire non-event (the
+// critter already holds its map-object netId and shadow, continuous through the
+// flags flip) and turns on companion HP/flags/inventory sync so a viewer sees them
+// move, take damage, and be lootable. NOTE: objectFindFirst (below) only walks the
+// by-tile buckets and skips art-type-hidden fids, so an object parked at tile -1 or
+// one whose FID_TYPE flips to a hidden category is invisible to the scan for that
+// span — shared with the snapshot oracle, so no join-vs-stream divergence.
 static bool objectIsSyncable(Object* obj)
 {
     // Player actors are NO_SAVE but ARE in the sync domain — they ride the join
     // blob's actor appendix and take a netId slot each (MP_PROPOSAL.md Ch 5.2).
     // With an empty registry this is verbatim the old `obj == gDude`.
-    return (obj->flags & OBJECT_NO_SAVE) == 0 || playerActorIs(obj);
+    return (obj->flags & OBJECT_NO_SAVE) == 0 || playerActorIs(obj) || objectIsPartyMember(obj);
 }
 
 static ObjectShadow objectCaptureShadow(Object* obj)
 {
     ObjectShadow shadow = {};
     shadow.fid = obj->fid;
+    shadow.frame = obj->frame;
+    shadow.lightDistance = obj->lightDistance;
+    shadow.lightIntensity = obj->lightIntensity;
     shadow.rotation = obj->rotation;
     shadow.flags = obj->flags;
     // data.inventory is a always-live field (not in the type union), valid for
@@ -157,6 +165,9 @@ static unsigned int objectDiffShadow(const ObjectShadow& before, const ObjectSha
 {
     unsigned int mask = 0;
     if (before.fid != after.fid) mask |= OBJECT_DELTA_FID;
+    if (before.frame != after.frame) mask |= OBJECT_DELTA_FRAME;
+    if (before.lightDistance != after.lightDistance || before.lightIntensity != after.lightIntensity)
+        mask |= OBJECT_DELTA_LIGHT;
     if (before.rotation != after.rotation) mask |= OBJECT_DELTA_ROTATION;
     // Whole-word flags diff: fires on ANY bit including client-local/render bits.
     // Harmless (the wire carries the current word), but the P5-C NetworkPresenter
@@ -188,6 +199,21 @@ void objectDeltaReset()
     }
     gLastMapGeneration = mapGetLoadGeneration();
     gLastGameTime = gameTimeGetTime();
+    gLastAmbient = lightGetAmbientIntensity();
+}
+
+void objectDeltaNotePresentedFrame(Object* obj)
+{
+    if (obj == nullptr) {
+        return;
+    }
+    // Sync the shadow to the (already-updated) current frame so this beat's diff sees no
+    // change → no OBJECT_DELTA_FRAME. No-op if the object has no shadow yet (client, or a
+    // just-spawned object whose birth SPAWN already carries its state).
+    auto it = gShadow.find(obj);
+    if (it != gShadow.end()) {
+        it->second.frame = obj->frame;
+    }
 }
 
 void objectDeltaScan()
@@ -230,7 +256,7 @@ void objectDeltaScan()
                 // existence; objectDelta = authoritative state). No-op under the null
                 // presenter (goldens unaffected); does not move the object, so the
                 // netstream position profile is unchanged.
-                unsigned int mask = OBJECT_DELTA_FID | OBJECT_DELTA_ROTATION | OBJECT_DELTA_FLAGS;
+                unsigned int mask = OBJECT_DELTA_FID | OBJECT_DELTA_FRAME | OBJECT_DELTA_LIGHT | OBJECT_DELTA_ROTATION | OBJECT_DELTA_FLAGS;
                 if (objectIsCritter(obj)) {
                     mask |= OBJECT_DELTA_HP | OBJECT_DELTA_RADIATION | OBJECT_DELTA_POISON
                         | OBJECT_DELTA_AP | OBJECT_DELTA_COMBAT_RESULTS;
@@ -244,11 +270,22 @@ void objectDeltaScan()
 
     gShadow.swap(next);
 
-    // worldDelta: in-game clock advance (gvars/mvars stay server-only in v1).
+    // worldDelta: in-game clock advance + global ambient light (gvars/mvars stay
+    // server-only in v1). Coalesced into one event so a beat that changes both sends
+    // one worldDelta; the presenter reads each field's value itself when its bit is set.
+    unsigned int worldMask = 0;
     unsigned int gameTime = gameTimeGetTime();
     if (gameTime != gLastGameTime) {
         gLastGameTime = gameTime;
-        presenter()->worldDelta(WORLD_DELTA_GAMETIME);
+        worldMask |= WORLD_DELTA_GAMETIME;
+    }
+    int ambient = lightGetAmbientIntensity();
+    if (ambient != gLastAmbient) {
+        gLastAmbient = ambient;
+        worldMask |= WORLD_DELTA_LIGHT;
+    }
+    if (worldMask != 0) {
+        presenter()->worldDelta(worldMask);
     }
 }
 

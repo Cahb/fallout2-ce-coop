@@ -31,6 +31,7 @@
 #include "interface.h"
 #include "item.h"
 #include "kb.h"
+#include "loot_highlight.h"
 #include "map.h"
 #include "memory.h"
 #include "message.h"
@@ -248,6 +249,10 @@ int lsgSaveGame(int mode)
     ScopedGameMode gm(GameMode::kSaveGame);
 
     MessageListItem messageListItem;
+
+    // Drop any highlight-lootables outlines so they are not written into the
+    // object stream (obj->outline is serialized).
+    lootHighlightClear();
 
     savegameResetErrorCode();
     savegameRefreshPatchesPath();

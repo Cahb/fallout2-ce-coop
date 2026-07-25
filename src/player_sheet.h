@@ -5,6 +5,8 @@
 
 namespace fallout {
 
+struct Object;
+
 // Serialization for per-actor CHARACTER SHEETS (PLAYER_SHEET_DESIGN.md §5).
 //
 // A "sheet" is the four members stage 2 seeds together — skills + base/bonus
@@ -77,6 +79,19 @@ int playerActorAppendixSave(File* stream);
 // SEEDS the sheet rows and registers slot 0 = gDude itself, mirroring the proven
 // wire path (client_net.cc), so the caller need not pre-populate the registry.
 int playerActorAppendixLoad(File* stream);
+
+// Mark a player actor's sheet row dirty so the next server beat streams it to
+// viewers as an EVENT_PLAYER_SHEET delta. No-op for a non-player-actor object.
+// Call it wherever a runtime sheet mutation lands (the stat setters do). Cheap —
+// it only sets a bit; the per-beat drain coalesces a burst (a drug touches
+// several stats + a derived recompute in one chain) into one row emit.
+void playerSheetMarkDirty(Object* critter);
+
+// Drain the dirty set: ship each dirty slot's row as a one-slot PSHT block via
+// presenter()->playerSheetDelta. No-op unless the presenter wants sheet deltas
+// (network only) — so single-player / golden paths clear the bits and emit
+// nothing. Call once per server beat, next to objectDeltaScan.
+void playerSheetDeltaEmit();
 
 } // namespace fallout
 

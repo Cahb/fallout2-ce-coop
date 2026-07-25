@@ -75,7 +75,7 @@ fear party-member as if it causes them. They are orthogonal, roadmap-inherent co
 UI-DRIVING COROLLARY (user 2026-07-16, raised during combat-presentation design)
 ════════════════════════════════════════════════════════════════════════════════
 Driving the client's VANILLA UI from local state (the P3 combat-presentation model,
-[[p5-server-plan]] / COMBAT_CLIENT_DESIGN.md) surfaces the gDude-singleton wall in the
+[[p5-server-plan]] / docs/COMBAT_CLIENT_DESIGN.md) surfaces the gDude-singleton wall in the
 presentation layer. The resolution:
 - gDude is a per-client ROLE = "the actor THIS client controls", filled by a DIFFERENT
   networked object on each client (its ORIGINAL meaning: "the local player character").

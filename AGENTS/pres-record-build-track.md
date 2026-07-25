@@ -13,7 +13,7 @@ reg_anim) is the presentation engine for every DISCRETE action. Gesture, door, h
 weapon-draw, the full attack family (melee/ranged/throw), and in-combat MOVE are migrated; git +
 `src/pres_record.h` hold the details. The whole-turn/combat framing lives in
 [[combat-full-record-channel]]; the current active pivot is [[dialog-streaming-track]].
-Spec = PRESENTATION_RECORD_REPLAY_SPEC.md; recipe = PRESENTATION_RECORD_REPLAY_COOKBOOK.md.
+Spec = docs/PRESENTATION_RECORD_REPLAY_SPEC.md; recipe = docs/PRESENTATION_RECORD_REPLAY_COOKBOOK.md.
 
 ## THE ONE-SCREEN SCOPE MAP lives in src/pres_record.h
 A deliberate COVERAGE MANIFEST (family table → composite site → ops/callbacks → the bespoke quirk

@@ -1,11 +1,15 @@
 #include "player_sheet.h"
 
+#include <stdlib.h> // getenv — sheet-delta temp-file path
+
 #include "critter.h"
 #include "db.h"
 #include "debug.h"
 #include "object.h"
 #include "perk.h"
+#include "presenter.h"
 #include "proto.h"
+#include "queue.h"
 #include "server_accounts.h"
 #include "server_players.h"
 #include "skill.h"
@@ -35,6 +39,19 @@ static constexpr int kPlayerSheetBlockMagic = 0x50534854; // 'PSHT'
 // loading the save as a host-only single-player game (NO version bump).
 static constexpr int kPlayerActorAppendixMagic = 0x50414354; // 'PACT' (v1)
 static constexpr int kPlayerActorAppendixMagicV2 = 0x50414332; // 'PAC2' (v2)
+// Tail section carrying each extra's queued timed effects (drug/rad/poison/etc.).
+// Appended AFTER the sheet block; a save written before this section existed (or a
+// vanilla save) simply hits EOF there, which the loader treats as "no events" — so
+// no appendix-magic bump is needed, same self-delimiting nicety as the appendix
+// itself.
+static constexpr int kPlayerActorEventsMagic = 0x50414556; // 'PAEV'
+
+// Per-slot "sheet row changed this beat" bits, set by playerSheetMarkDirty and
+// drained by playerSheetDeltaEmit. A runtime sheet mutation (drug, level-up,
+// trait/perk change) sets the bit; the beat coalesces a whole burst into one
+// row emit. Slot 0 (host) rides it too — a viewer joined after the host leveled
+// needs the host's live sheet just as much.
+static bool gPlayerSheetDirty[kMaxPlayerActors] = { false };
 
 // The members, in the order stage 2 seeds them (protoPlayerActorSheetsSeed,
 // perkPlayerActorSeedRanks, pcPlayerActorSeedStats, traitsPlayerActorSeed,
@@ -212,7 +229,26 @@ int playerActorAppendixSave(File* stream)
 
     // Sheets from slot 1 — slot 0 (the host) is already on disk via the legacy
     // critterSave / statsSave / perksSave / traitsSave / skillsSave handlers.
-    return playerSheetBlockWrite(stream, 1);
+    if (playerSheetBlockWrite(stream, 1) == -1) {
+        return -1;
+    }
+
+    // Extras' queued timed effects. The appendix OWNS these (queueSave is filtered
+    // to skip slot >= 1 owners) because the vanilla queueLoad rebinds owners by id
+    // inside the save handler loop, before this tail step reconstructs the extras —
+    // so an extra-owned event would otherwise orphan to owner==nullptr on load
+    // (permanent stat penalty, or a null-critter crash when it fires).
+    if (fileWriteInt32(stream, kPlayerActorEventsMagic) == -1) {
+        return -1;
+    }
+
+    for (int slot = 1; slot <= extras; slot++) {
+        if (queueSaveEventsForOwner(stream, playerActorAt(slot)) == -1) {
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 int playerActorAppendixLoad(File* stream)
@@ -320,7 +356,113 @@ int playerActorAppendixLoad(File* stream)
     // Applied AFTER the registry is populated: the block is keyed by slot, and
     // slot 0's row is gDudeProto itself, so a misread here corrupts the live
     // host — fail loud, never half-apply.
-    return playerSheetBlockRead(stream);
+    if (playerSheetBlockRead(stream) == -1) {
+        return -1;
+    }
+
+    // Re-queue each extra's timed effects now that the bodies exist and are
+    // registered (queueAddEvent binds to the fresh Object*). EOF here = a save
+    // written before this section existed → nothing to re-queue, not an error.
+    int eventsMagic;
+    if (fileReadInt32(stream, &eventsMagic) == -1) {
+        return 0;
+    }
+
+    if (eventsMagic != kPlayerActorEventsMagic) {
+        debugPrint("player_sheet: bad appendix events magic 0x%08x\n", eventsMagic);
+        return -1;
+    }
+
+    for (int slot = 1; slot <= extras; slot++) {
+        if (queueLoadEventsForOwner(stream, playerActorAt(slot)) == -1) {
+            debugPrint("player_sheet: slot %d event reload failed\n", slot);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// A one-slot PSHT block, byte-compatible with playerSheetBlockRead (magic +
+// firstSlot=slot + count=1 + the row). Used by the live delta channel.
+static int playerSheetBlockWriteOne(File* stream, int slot)
+{
+    if (fileWriteInt32(stream, kPlayerSheetBlockMagic) == -1) {
+        return -1;
+    }
+    if (fileWriteInt32(stream, slot) == -1) {
+        return -1;
+    }
+    if (fileWriteInt32(stream, 1) == -1) {
+        return -1;
+    }
+    return playerSheetRowWrite(stream, slot);
+}
+
+void playerSheetMarkDirty(Object* critter)
+{
+    if (critter == nullptr) {
+        return;
+    }
+    int slot = playerActorSlotOf(critter);
+    if (slot >= 0 && slot < kMaxPlayerActors) {
+        gPlayerSheetDirty[slot] = true;
+    }
+}
+
+void playerSheetDeltaEmit()
+{
+    // Network only. On any other presenter (single-player, golden probe) clear the
+    // bits and emit nothing, so the stat setters' mark calls are free there.
+    bool wanted = presenter()->wantsSheetDeltas();
+
+    int count = playerActorCount();
+    if (count > kMaxPlayerActors) {
+        count = kMaxPlayerActors;
+    }
+
+    for (int slot = 0; slot < count; slot++) {
+        if (!gPlayerSheetDirty[slot]) {
+            continue;
+        }
+        gPlayerSheetDirty[slot] = false;
+
+        if (!wanted) {
+            continue;
+        }
+
+        // Serialize the one-slot block through a temp file, same idiom as
+        // serverEmitJoinBlob — XFILE_TYPE_MEMORY is read-only, so there is no
+        // in-memory File to write into.
+        const char* tmpPath = getenv("F2_SHEET_TMP");
+        if (tmpPath == nullptr) {
+            tmpPath = "/tmp/f2ce_sheet_srv.bin";
+        }
+
+        File* out = fileOpen(tmpPath, "wb");
+        if (out == nullptr) {
+            continue;
+        }
+        int rc = playerSheetBlockWriteOne(out, slot);
+        int len = (int)fileTell(out);
+        fileClose(out);
+        if (rc == -1 || len <= 0) {
+            continue;
+        }
+
+        File* in = fileOpen(tmpPath, "rb");
+        if (in == nullptr) {
+            continue;
+        }
+        std::vector<unsigned char> buf((size_t)len);
+        size_t got = fileRead(buf.data(), 1, (size_t)len, in);
+        fileClose(in);
+        if ((int)got != len) {
+            continue;
+        }
+
+        presenter()->playerSheetDelta(slot, buf.data(), len);
+    }
 }
 
 } // namespace fallout

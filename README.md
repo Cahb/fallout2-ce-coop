@@ -59,7 +59,7 @@ Native co-op of the original Fallout 2 — the real game, shared, not a rewrite:
 - **Host-controlled transitions** — slot 0 (`F2_SERVER_HOST=`) is the host body and the only one
   that drives map transitions, worldmap travel and dialog, keeping the shared world coherent.
 
-See [`DEDICATED_HOWTO.md`](DEDICATED_HOWTO.md) and the design docs in the repo root for launch
+See [`DEDICATED_HOWTO.md`](DEDICATED_HOWTO.md) and the design docs in [`docs/`](docs/) for launch
 details, the full env-var/verb reference, and current edges and known limitations.
 
 ## Media

@@ -126,8 +126,16 @@ def main():
                         dude_turn_seen = True
                         # A nonzero deadline confirms the barrier is holding the turn
                         # open for us (the claimant) — no TURN_WAIT env is set.
+                        # Re-inject on EVERY dude turn. This map's premade dude has a
+                        # base critter art that cannot wield the ranged test weapon,
+                        # so it fights unarmed = PUNCH (range ~1). A bare cattack
+                        # auto-targets the nearest hostile, which starts out of range;
+                        # the aggro'd melee enemy closes each turn and a punch lands
+                        # once it is adjacent → the dude ATTACK_RESULT this gate
+                        # asserts. A single shot never lands (a failed attack keeps the
+                        # turn but drains the queue in one beat).
+                        wire.sendall(b"cattack\n")  # the viewer's 'A' key, verbatim
                         if not cattack_sent:
-                            wire.sendall(b"cattack\n")  # the viewer's 'A' key, verbatim
                             cattack_sent = True
                             print("injected bare cattack over the WIRE (deadlineMs=%d)" % deadline_ms)
                 elif etype == E_ATTACK_RESULT and len(body) >= 4:

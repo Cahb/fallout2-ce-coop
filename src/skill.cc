@@ -24,6 +24,7 @@
 #include "proto.h"
 #include "random.h"
 #include "scripts.h"
+#include "player_sheet.h" // playerSheetMarkDirty — stream book/quest skill bumps
 #include "server_players.h" // playerActorIs — the N-actor "is this the PC" predicate
 #include "settings.h"
 #include "stat.h"
@@ -452,6 +453,10 @@ int skillAddForce(Object* obj, int skill)
 
     proto->critter.data.skills[skill] += 1;
 
+    // Skill row is per-actor sheet state written directly here (not via a hooked
+    // stat setter) — stream it so a book/quest bump shows on the actor's client.
+    playerSheetMarkDirty(obj);
+
     return 0;
 }
 
@@ -667,7 +672,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
     int maximumHpToHeal = 0;
     int minimumHpToHeal = 0;
 
-    if (obj == gDude) {
+    if (playerActorIs(obj)) {
         if (skill == SKILL_FIRST_AID || skill == SKILL_DOCTOR) {
             int healerRank = perkGetRank(obj, PERK_HEALER);
             minimumHpToHeal = 4 * healerRank;
@@ -778,7 +783,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
             }
         }
 
-        if (obj == gDude) {
+        if (playerActorIs(obj)) {
             gameTimeAddSeconds(1800);
         }
 
@@ -939,7 +944,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
             }
         }
 
-        if (obj == gDude) {
+        if (playerActorIs(obj)) {
             gameTimeAddSeconds(3600 * damageHealingAttempts);
         }
 
@@ -1113,7 +1118,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
             }
         }
 
-        if (obj == gDude) {
+        if (playerActorIs(obj)) {
             gameTimeAddSeconds(1800 * damageHealingAttempts);
         }
 

@@ -128,11 +128,20 @@ def main():
                         if dude_deadline == 0:
                             dude_deadline = deadline_ms
                             print("saw dude TURN_START deadlineMs=%d" % deadline_ms)
-                        # Genuinely mid-fight: inject the attack now.
-                        if enter_seq is not None and not cattack_sent:
-                            cmd.sendall(b"cattack 60\n")
-                            cattack_sent = True
-                            print("injected cattack 60 mid-fight")
+                        # Genuinely mid-fight: inject a punch on EVERY dude turn.
+                        # This map's premade dude has a base critter art that
+                        # cannot wield the ranged test weapon (artExists → wield
+                        # fails), so it fights unarmed = PUNCH (range ~1). A whole
+                        # attack queue drains in the first beat (a failed shot keeps
+                        # the turn), so one-shot injection never lands. The aggro'd
+                        # enemy is melee and closes each turn; re-injecting a punch
+                        # every dude turn lands one once the enemy is adjacent →
+                        # the EVENT_ATTACK_RESULT this gate asserts.
+                        if enter_seq is not None:
+                            cmd.sendall(b"cattack 3\n")
+                            if not cattack_sent:
+                                cattack_sent = True
+                                print("injected cattack mid-fight")
                 elif etype == E_ATTACK_RESULT and len(body) >= 8:
                     attacker_net = struct.unpack_from("<i", body, 0)[0]
                     if cattack_sent and dude_net is not None and attacker_net == dude_net:

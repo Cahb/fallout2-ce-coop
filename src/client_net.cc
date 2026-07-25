@@ -33,7 +33,9 @@
 #include "inventory.h" // _inven_reset_dude — re-anchor the inventory on a local-actor rebind
 #include "inventory_ui.h" // gInventory{Left,Right}HandItem/Armor — parked-equip detach check (Slice 3b)
 #include "item.h" // critterGetWeaponForHitMode — ATTACK_RESULT reconstruct (§3.c)
+#include "dbox.h" // showDialogBox / DIALOG_BOX_* — streamed random-encounter prompt
 #include "kb.h" // KEY_ESCAPE — force-close a viewer modal on combat/rebaseline
+#include "light.h" // lightSetAmbientIntensity — streamed global ambient-light delta
 #include "map.h"
 #include "actions.h" // actionExplodeReplay + actionPresReplayShowDeath — viewer explosion replay
 #include "animation.h" // reg_anim_* / animationRegister* — the real engine the recorded stream drives
@@ -105,6 +107,13 @@ static Object* gClientHostDude = nullptr;
 // than the blob can still be resolved (the two orderings are both legal).
 static std::vector<PlayerRosterRow> gClientRoster;
 
+// Feature A: latched when the server streams a REFUSAL aimed at THIS actor (a
+// kMsgChannelRefusal console line addressed to our netId). The out-of-combat input
+// block polls it (clientViewerTakeRefusal) to undo an optimistic local hand flip the
+// server rejected as busy — see main.cc. A plain edge flag (not a queue): the block
+// allows only one pending hand switch at a time, so at most one refusal is relevant.
+static bool gViewerRefusalPending = false;
+
 namespace {
 
 // Wire event tags — MUST match presenter_network.cc's EventType enum.
@@ -149,6 +158,9 @@ enum : unsigned char {
     EVENT_BARTER_END = 45, // trade closed — tear the mirrors down
     EVENT_MOVIE_SEEN_STATE = 46, // co-op world state: the movie seen ledger (vault-suit look)
     EVENT_MOVIE_STOP = 47, // stop local movie playback (another player skipped the cutscene)
+    EVENT_PLAYER_SHEET = 48, // co-op: live per-actor sheet-row delta (chem stat mod, level-up)
+    EVENT_ENCOUNTER_PROMPT = 49, // random-encounter accept/decline prompt (title+body) — we answer encaccept/encdecline
+    EVENT_ENCOUNTER_CLOSE = 50, // another viewer answered — break out of our prompt box
 };
 
 // crc32 (IEEE, reflected) — MUST match server_loop.cc's joinBlobCrc32.
@@ -280,6 +292,14 @@ private:
     bool _overflow;
 };
 
+// Set while this viewer is parked in the streamed encounter prompt box. The
+// dismiss (onEncounterClose) only injects its force-close ESC when this is set,
+// so a CLOSE that arrives late (RTT: another viewer answered, but by the time the
+// broadcast reaches us we already answered and moved on) can NEVER close an
+// unrelated modal — or the player's game — that they opened afterward. General
+// rule for any broadcast force-close: gate the ESC on "am I actually in THAT modal".
+static bool gEncounterPromptActive = false;
+
 // The decoder's live index: wire netId -> local Object*. Seeded from the loaded
 // blob's post-walk objects, maintained by SPAWN/DESTROY.
 class Decoder {
@@ -293,6 +313,8 @@ public:
         int extraNetId[EXPLOSION_TARGET_COUNT];
         int extraDamage[EXPLOSION_TARGET_COUNT];
         int extraFlags[EXPLOSION_TARGET_COUNT];
+        int weaponNetId = 0; // bug D: the fired weapon, resolved/recreated on the viewer
+        int weaponPid = -1;  // -1 = unarmed
     };
 
     // ONE ordered combat-presentation queue (§3.c). The server resolves a whole
@@ -371,21 +393,7 @@ public:
     void setCombatModalOpen(bool open) { _combatModalOpen = open; }
     bool combatModalOpen() const { return _combatModalOpen; }
 
-    // DEBUG scaffolding (combat-state desync hunt, 2026-07-18): route EVERY _inCombat
-    // write through here so `grep [cbtstate]` names which handler flipped it. Combat
-    // EXIT is deferred behind the replay queue, so a spurious/early flip-to-false mid-
-    // turn strands the player on the out-of-combat move path (client sends `mv` -> server
-    // "control mv dropped (in combat)") until the next TURN_START re-asserts true — which
-    // only the 62s idle timeout forced. Logs only on an actual change (TURN_START re-
-    // asserting true every enemy turn is silent). Remove once the desync is pinned.
-    void setInCombat(bool v, const char* site)
-    {
-        if (_inCombat != v) {
-            fprintf(stderr, "[cbtstate] %-16s inCombat %d->%d myTurn=%d\n",
-                site, _inCombat ? 1 : 0, v ? 1 : 0, _myTurn ? 1 : 0);
-        }
-        _inCombat = v;
-    }
+    void setInCombat(bool v) { _inCombat = v; }
 
     // Single owner of the viewer's combat outlines (#8). Fully recomputed from
     // (in-combat, whose-turn, mouse-mode) on every call, so it is idempotent and any
@@ -675,6 +683,9 @@ public:
         case EVENT_MOVIE_PLAY: onMoviePlay(r); break;
         case EVENT_MOVIE_SEEN_STATE: onMovieSeenState(r); break;
         case EVENT_MOVIE_STOP: onMovieStop(r); break;
+        case EVENT_PLAYER_SHEET: onPlayerSheet(r); break;
+        case EVENT_ENCOUNTER_PROMPT: onEncounterPrompt(r); break;
+        case EVENT_ENCOUNTER_CLOSE: onEncounterClose(r); break;
         case EVENT_MUSIC_PLAY: onMusicPlay(r); break;
         case EVENT_MUSIC_STOP: onMusicStop(r); break;
         // SNAPSHOT_BEGIN/END are pure brackets; presentation cues are cosmetic and
@@ -977,14 +988,15 @@ private:
             return;
         }
 
-        // Persist to scratch and load through the SAME sequence as the S1 loader
-        // (main.cc F2_CLIENT_BLOB_IN): adopt the server clock, drop any current
-        // map, viewer-load (no map-enter procs), apply the dude, fix combat
-        // back-pointers, reproduce the netId walk, freeze scripts.
-        File* w = fileOpen(_blobTmpPath, "wb");
-        if (w == nullptr) { debugPrint("client_net: cannot open blob scratch\n"); return; }
-        fileWrite(_blob.data(), 1, _blob.size(), w);
-        fileClose(w);
+        // Load the blob straight from memory (no scratch file), through the SAME
+        // sequence as the S1 loader (main.cc F2_CLIENT_BLOB_IN): adopt the server
+        // clock, drop any current map, viewer-load (no map-enter procs), apply the
+        // dude, fix combat back-pointers, reproduce the netId walk, freeze scripts.
+        // ►► A RAM-backed stream is mandatory here, not a convenience: rebaselines are
+        // broadcast, so several viewers on one machine would otherwise write-then-read
+        // a SHARED scratch file and one client's truncate would corrupt another's
+        // in-flight mapLoad (the co-op "black screen" root, 2026-07-23). See
+        // fileOpenMemory / XFILE_TYPE_MEMORY.
 
         // ►► UNDO ANY PRIOR REBIND BEFORE THE LOAD (MP_PROPOSAL.md Ch 5.3).
         // _obj_load_dude memcpy's the blob's dude INTO *gDude; if gDude still
@@ -1024,8 +1036,8 @@ private:
         gameTimeSetTime(_blobGameTime);
         gMapHeader.name[0] = '\0';
 
-        File* rd = fileOpen(_blobTmpPath, "rb");
-        if (rd == nullptr) { debugPrint("client_net: cannot reopen blob scratch\n"); return; }
+        File* rd = fileOpenMemory(_blob.data(), _blob.size());
+        if (rd == nullptr) { debugPrint("client_net: cannot open blob memory stream\n"); return; }
 
         mapSetViewerLoad(true);
         int loadRc = mapLoad(rd);
@@ -1196,13 +1208,14 @@ private:
             _combatActorNetId = 0;
             recomputeCombatOutlines();
         } else {
-            setInCombat(false, "REBASELINE-fresh");
+            setInCombat(false);
             _myTurn = false;
             if (clientViewerActive()) {
                 clearCombatMirror();
             }
         }
         debugPrint("client_net: world loaded (load #%d)\n", _loadCount);
+
     }
 
     // Index an object's inventory (recursively) into the netId map. MIRRORS the
@@ -1521,11 +1534,50 @@ private:
     void onConnect(Reader& r)
     {
         int netId = r.i32();
-        r.i32(); // pid
+        int pid = r.i32();
         int tile = r.i32();
         int elev = r.i32();
         Object* obj = lookup(netId);
-        if (obj != nullptr) {
+        if (obj == nullptr) {
+            // ►► SELF-HEAL: an ITEM just appeared at a world tile and this viewer has no
+            // object for it. Dropping the event (what this did) leaves the item lying on
+            // the server's ground and INVISIBLE here, forever — owner-reported as "removed
+            // 1 from inv, nothing on ground", and as two players seeing different rocks on
+            // the same floor. The binding can legitimately be missing: a thrown weapon's
+            // ground object is a viewer-local adopt transient that onDisconnect DESTROYS
+            // and un-binds on pickup, and a partial drop peels a NEW server object whose
+            // SPAWN this viewer may never have had a reason to hold. CONNECT carries
+            // pid+tile+elevation, which is everything needed to materialize it, so build
+            // the mirror rather than diverge from the server.
+            //
+            // ITEMS ONLY, deliberately: this event is the item<->world lifecycle signal
+            // (object.cc _obj_connect). A missing critter/scenery binding is a different
+            // (and worse) bug — inventing a body would hide it, so trace and drop.
+            if (netId > 0 && PID_TYPE(pid) == OBJ_TYPE_ITEM) {
+                Object* healed = nullptr;
+                if (objectCreateWithPid(&healed, pid) == 0 && healed != nullptr) {
+                    objectSetLocation(healed, tile, elev, nullptr);
+                    healed->netId = netId;
+                    _net[netId] = healed;
+                    // Async wire repaint: nothing else redraws this frame, so an item
+                    // materialized here stays invisible until some other event forces a
+                    // repaint ([[viewer-netid-map-indexes-inventories]]).
+                    Rect rect;
+                    objectGetRect(healed, &rect);
+                    tileWindowRefreshRect(&rect, elev);
+                    debugPrint("client_net: CONNECT healed unknown netId=%d pid=0x%X tile=%d\n",
+                        netId, pid, tile);
+                } else {
+                    debugPrint("client_net: CONNECT netId=%d pid=0x%X could not materialize\n",
+                        netId, pid);
+                }
+            } else {
+                debugPrint("client_net: CONNECT for unknown netId=%d pid=0x%X (not an item) dropped\n",
+                    netId, pid);
+            }
+            return;
+        }
+        {
             // A thrown weapon's flight transient owns its OWN placement via the recorded seq
             // (created + located at DECODE, then flown by the seq's MOVE ops). The server
             // ships the throw seq BEFORE the weapon's EVENT_CONNECT, so by here the transient
@@ -1555,7 +1607,16 @@ private:
             // one place. Doing it here also covers a stale/re-minted netId that
             // happens to resolve to a carried item.
             unlinkFromAnyInventory(obj);
-            _obj_connect(obj, tile, elev, nullptr);
+            // ►► REPAINT THE ARRIVAL TILE, for the same reason onDisconnect repaints the
+            // vacated one: _obj_connect only links the object into the tile list, it draws
+            // nothing, and an async wire event has no frame-level repaint riding along. With
+            // nullptr here a dropped item was really on the ground and simply not PAINTED
+            // until some unrelated event forced a redraw — indistinguishable from "my drop
+            // did nothing".
+            Rect rect;
+            if (_obj_connect(obj, tile, elev, &rect) == 0) {
+                tileWindowRefreshRect(&rect, elev);
+            }
         }
     }
 
@@ -1644,6 +1705,13 @@ private:
                 invItems.push_back(wi);
             }
         }
+        // FRAME then LIGHT (bits 9,10), after the variable-length inventory — matches the writer.
+        int frame = 0;
+        bool hasFrame = (mask & OBJECT_DELTA_FRAME) != 0;
+        if (hasFrame) frame = r.i32();
+        int lightDistance = 0, lightIntensity = 0;
+        bool hasLight = (mask & OBJECT_DELTA_LIGHT) != 0;
+        if (hasLight) { lightDistance = r.i32(); lightIntensity = r.i32(); }
 
         Object* obj = lookup(netId);
         if (obj == nullptr) return;
@@ -1680,6 +1748,26 @@ private:
                 if (!(clientViewerActive() && clientAnimDeferRotation(obj, rot))) {
                     objectSetRotation(obj, rot, nullptr);
                 }
+            }
+        }
+        // FRAME: scripted art-frame swaps (dug graves, opened doors/containers, levers)
+        // that never streamed before — only fixed on a map reload. Apply to non-critters
+        // immediately: scenery/items are never attack participants, so no in-flight replay
+        // holds them, and objectSetFrame validates frame < art frameCount (fails safe vs
+        // the frame-index-render gotcha). A critter's frame stays owned by its own local
+        // animation (the fid/pose path above), so it is deliberately not forced here.
+        if (hasFrame && PID_TYPE(obj->pid) != OBJ_TYPE_CRITTER && obj->frame != frame) {
+            Rect rect;
+            if (objectSetFrame(obj, frame, &rect) == 0) {
+                tileWindowRefreshRect(&rect, obj->elevation);
+            }
+        }
+        // LIGHT: scripted per-object emission (op_obj_set_light_level — lamps/glow). Never
+        // streamed before. objectSetLight recomputes the tile light + returns the dirtied rect.
+        if (hasLight && (obj->lightDistance != lightDistance || obj->lightIntensity != lightIntensity)) {
+            Rect rect;
+            if (objectSetLight(obj, lightDistance, lightIntensity, &rect) == 0) {
+                tileWindowRefreshRect(&rect, obj->elevation);
             }
         }
         // Rebuild the mirror inventory from the wire — the ROOT fix for stale NPC gear:
@@ -1835,7 +1923,14 @@ private:
             // duplicates. equipmentApply/Detach are the same vetted helpers the screen runs
             // at open/close.
             Inventory* inv = &obj->data.inventory;
-            bool invScreenOpen = (GameMode::getCurrentGameMode() & GameMode::kInventory) != 0;
+            // _setup_inventory (equipmentDetach) parks the dude's equipped items in
+            // the UI statics for EVERY inventory-family screen — NORMAL, loot,
+            // use-on and barter — not just kInventory. Bracket the reconcile for all
+            // of them, or the wire's equipped item matches nothing in the mirror and
+            // gets recreated as a phantom duplicate (the wielded weapon "appearing"
+            // in the loot/use/barter left pane after an action).
+            bool invScreenOpen = (GameMode::getCurrentGameMode()
+                & (GameMode::kInventory | GameMode::kLoot | GameMode::kUseOn | GameMode::kBarter)) != 0;
             bool anyModalOpen = (GameMode::getCurrentGameMode() & kViewerModalMask) != 0;
             if (invScreenOpen) {
                 equipmentApply(obj, gInventoryLeftHandItem, gInventoryRightHandItem, gInventoryArmor);
@@ -2030,6 +2125,10 @@ private:
         if (mask & WORLD_DELTA_GAMETIME) {
             gameTimeSetTime(r.u32());
         }
+        if (mask & WORLD_DELTA_LIGHT) {
+            // Global ambient light (scripted map darkness/brightness). true = repaint now.
+            lightSetAmbientIntensity(r.i32(), true);
+        }
     }
 
     void onSnapshotObject(Reader& r)
@@ -2072,7 +2171,7 @@ private:
         _net.clear();
         _adoptTransients.clear(); // adopt transients die with the old world (Fable review A3)
         _loaded = false;
-        setInCombat(false, "MAP_TRANSITION"); // a transition ends any local combat framing
+        setInCombat(false); // a transition ends any local combat framing
         _myTurn = false;
         if (clientViewerActive()) {
             clearCombatMirror();
@@ -2122,7 +2221,7 @@ private:
             // falls through to the real enter below.
             return;
         }
-        setInCombat(true, "ENTER");
+        setInCombat(true);
         _myTurn = false;
         if (clientViewerActive()) {
             // Snap any in-flight FREE-ROAM glide to its authoritative tile before the
@@ -2173,7 +2272,7 @@ private:
             debugPrint("client_net: COMBAT EXIT (queued behind replay)\n");
             return;
         }
-        setInCombat(false, "EXIT-immediate");
+        setInCombat(false);
         _myTurn = false;
         debugPrint("client_net: COMBAT EXIT\n");
     }
@@ -2183,7 +2282,7 @@ private:
     void applyCombatExit()
     {
         reconcileDudeHp(); // the fight's last blows have played — pin exact HP
-        setInCombat(false, "EXIT-applied");
+        setInCombat(false);
         _myTurn = false;
         // Vanilla resting state (mirror of _combat_over): 0x01 clear, 0x02 set.
         gCombatState &= ~(COMBAT_STATE_0x01 | COMBAT_STATE_0x02);
@@ -2212,7 +2311,7 @@ private:
         // a mid-fight joiner/rebaseline that missed COMBAT_ENTER still gates input
         // (§3.0). Whose turn it is (and the AP dots) is DEFERRED through the queue so
         // it flips only when the animations reach this point (see PresEvent).
-        setInCombat(true, "TURN_START");
+        setInCombat(true);
         if (!clientViewerActive()) {
             // Headless routing: apply _myTurn inline, byte-identical to before.
             _myTurn = isPlayer != 0 && gDude != nullptr && netId == gDude->netId;
@@ -2312,6 +2411,10 @@ private:
                 pa.extraCount++;
             }
         }
+        // Fired weapon (bug D) — read unconditionally so the reader advances even
+        // headless/overflow, exactly like the extras block above.
+        pa.weaponNetId = r.i32();
+        pa.weaponPid = r.i32();
 
         if (!clientViewerActive() || r.overflow()) {
             return; // headless never replays; state rides OBJECT_DELTA
@@ -2726,7 +2829,70 @@ private:
         // because onObjectDelta applies OBJECT_DELTA_INVENTORY — an AI critter that
         // equips/switches its weapon mid-fight updates the mirror, so a ranged NPC
         // resolves its real gun instead of a stale join-blob weapon (or none).
-        attack.weapon = critterGetWeaponForHitMode(attacker, pa.hitMode);
+        //
+        // Bug D: if the mirror is MISSING the fired weapon (the attacker acquired it
+        // after this viewer joined — the remote-critter reconcile is equip-flags-only
+        // and never creates), that resolve returns null/wrong and the swing replays as
+        // a punch. The wire now carries the fired weapon's netId + pid; resolve it, or
+        // lazily recreate it in the mirror (CREATE-ONLY, never free — so the in-flight-
+        // replay double-free hazard the equip-flags path avoids stays untouched) and
+        // seat it in the firing hand so _action_attack's inventory re-resolve finds it.
+        Object* weapon = critterGetWeaponForHitMode(attacker, pa.hitMode);
+        if (pa.weaponPid < 0) {
+            weapon = nullptr; // authoritative unarmed
+        } else if (weapon == nullptr || weapon->pid != pa.weaponPid) {
+            int handFlag = 0;
+            switch (pa.hitMode) {
+            case HIT_MODE_LEFT_WEAPON_PRIMARY:
+            case HIT_MODE_LEFT_WEAPON_SECONDARY:
+            case HIT_MODE_LEFT_WEAPON_RELOAD:
+                handFlag = OBJECT_IN_LEFT_HAND;
+                break;
+            case HIT_MODE_RIGHT_WEAPON_PRIMARY:
+            case HIT_MODE_RIGHT_WEAPON_SECONDARY:
+            case HIT_MODE_RIGHT_WEAPON_RELOAD:
+                handFlag = OBJECT_IN_RIGHT_HAND;
+                break;
+            }
+            // Find the intended weapon in the mirror (by netId, then by pid).
+            Object* found = pa.weaponNetId != 0 ? lookup(pa.weaponNetId) : nullptr;
+            if (found == nullptr || found->pid != pa.weaponPid) {
+                found = nullptr;
+                Inventory* inv = &attacker->data.inventory;
+                for (int i = 0; i < inv->length; i++) {
+                    if (inv->items[i].item != nullptr && inv->items[i].item->pid == pa.weaponPid) {
+                        found = inv->items[i].item;
+                        break;
+                    }
+                }
+            }
+            // Not in the mirror at all → recreate it (the gDude-reconcile idiom).
+            if (found == nullptr && handFlag != 0) {
+                Object* item = nullptr;
+                if (objectCreateWithPid(&item, pa.weaponPid) == 0 && item != nullptr) {
+                    _obj_disconnect(item, nullptr); // inventory-only, not in the world
+                    itemAdd(attacker, item, 1);
+                    if (pa.weaponNetId != 0) {
+                        item->netId = pa.weaponNetId;
+                        _net[pa.weaponNetId] = item; // so a thrown-weapon adopt matches
+                    }
+                    found = item;
+                }
+            }
+            if (found != nullptr && handFlag != 0) {
+                // Seat it in the firing hand so critterGetWeaponForHitMode /
+                // _action_attack resolve it. Free that hand on any other item first.
+                for (int i = 0; i < attacker->data.inventory.length; i++) {
+                    Object* it = attacker->data.inventory.items[i].item;
+                    if (it != nullptr && it != found) {
+                        it->flags &= ~handFlag;
+                    }
+                }
+                found->flags = (found->flags & ~OBJECT_IN_ANY_HAND) | handFlag;
+                weapon = found;
+            }
+        }
+        attack.weapon = weapon;
         attack.attackerDamage = pa.attackerDamage;
         attack.attackerFlags = pa.attackerFlags;
         attack.defender = defender;
@@ -2826,6 +2992,11 @@ private:
         if (actorNetId != 0 && (gDude == nullptr || actorNetId != gDude->netId)) {
             return; // somebody else's refusal — nothing happened, so show nothing
         }
+        // Feature A: a refusal aimed at us (addressed + on the refusal channel) lets the
+        // out-of-combat input block revert an optimistic hand flip the server rejected.
+        if (actorNetId != 0 && channel == kMsgChannelRefusal) {
+            gViewerRefusalPending = true;
+        }
         // A REFUSAL IS NOT NARRATION AND MUST NOT BE PACED. Everything else on this
         // channel captions an event and belongs beside it, but a refusal answers an
         // INPUT — the player's click, right now — and the whole reason it exists
@@ -2897,6 +3068,52 @@ private:
     // Background music. NOT queued behind the combat presentation pacer like sfx —
     // music is ambient, not a beat in the action, and delaying a map's track until
     // the fight's cues drain would start it minutes late. Applied immediately.
+    void onEncounterPrompt(Reader& r)
+    {
+        std::string title = r.str();
+        std::string body = r.str();
+        if (!clientViewerActive()) return;
+
+        // Same blocking YES/NO widget the single-player path uses. showDialogBox spins
+        // inputGetInput, which still services our socket — so if another viewer answers
+        // first the server's EVENT_ENCOUNTER_CLOSE lands mid-wait and injects ESC
+        // (onEncounterClose), returning 0 here. FIRST ANSWER WINS: whichever verb we
+        // send, a late one (after the barrier freed) is ignored server-side.
+        const char* bodyPtr = body.c_str();
+        gEncounterPromptActive = true;
+        // ►► FLUSH QUEUED INPUT FIRST, or the box answers ITSELF. This prompt opens
+        // unannounced, from inside the wire decoder, on top of a screen the player is
+        // actively clicking — the worldmap. Anything still sitting in the queue (the
+        // travel click's residue, a keypress) is consumed by showDialogBox's very first
+        // inputGetInput, and an ESC-equivalent returns 0 = DECLINE. Owner-observed as
+        // "the prompt appeared for a single frame and cancelled on its own", and
+        // BY CAR is exactly where it bites: car travel covers 4-8 tiles per tick
+        // (worldmapTravelStep), so an encounter can fire within a beat or two of the
+        // click that started the trip, while on foot the queue has long drained.
+        // keyboardReset + inputEventQueueReset is the same pairing main.cc uses before
+        // its own blocking prompt.
+        keyboardReset();
+        inputEventQueueReset();
+        int rc = showDialogBox(title.c_str(), &bodyPtr, 1, 169, 116,
+            _colorTable[32328], nullptr, _colorTable[32328],
+            DIALOG_BOX_LARGE | DIALOG_BOX_YES_NO);
+        gEncounterPromptActive = false;
+        clientViewerEncounterAnswer(rc != 0);
+    }
+
+    void onEncounterClose(Reader& r)
+    {
+        if (!clientViewerActive()) return;
+        // Another viewer answered; the server moved on. ONLY break out if we are still
+        // in the encounter box — otherwise a late (high-RTT) CLOSE would inject an ESC
+        // into whatever modal the player opened after their own answer, or their game.
+        // The re-entrant socket poll runs inside showDialogBox's inputGetInput, so when
+        // the box is open this flag is set and the ESC lands in that box's loop.
+        if (gEncounterPromptActive) {
+            enqueueInputEvent(KEY_ESCAPE);
+        }
+    }
+
     void onMoviePlay(Reader& r)
     {
         int movie = r.i32();
@@ -2938,6 +3155,33 @@ private:
     // server was correct, map.cc's client-side derive clobbered gDude back on every
     // map load. Sync the ledger, then re-derive so both self-view and inventory
     // match the world. [[vault-suit-appearance-gap]]
+    void onPlayerSheet(Reader& r)
+    {
+        int slot = r.i32();
+        int len = (int)r.u16();
+        std::vector<unsigned char> buf(len > 0 ? (size_t)len : 0);
+        for (int i = 0; i < len; i++) {
+            buf[i] = r.u8();
+        }
+        if (!clientViewerActive() || r.overflow() || len <= 0) {
+            return;
+        }
+        // The block carries its own firstSlot; `slot` on the wire is redundant but
+        // keeps the event self-describing for tracing. playerSheetBlockRead writes
+        // the row into the per-actor proto (gPlayerActorProtos / gDudeProto), which
+        // is what the character screen reads live — so the change shows on the next
+        // open even mid-session. Idempotent: a join blob later overwrites the row,
+        // so an out-of-order delta converges.
+        File* stream = fileOpenMemory(buf.data(), buf.size());
+        if (stream == nullptr) {
+            return;
+        }
+        if (playerSheetBlockRead(stream) == -1) {
+            debugPrint("client_net: player-sheet delta apply failed (slot %d)\n", slot);
+        }
+        fileClose(stream);
+    }
+
     void onMovieSeenState(Reader& r)
     {
         int count = (int)r.u16();
@@ -3091,6 +3335,12 @@ private:
         debugPrint("client_net: onWorldmapEnd — exiting\n");
         gWorldmapStreaming = false;
         gWorldmapStateDirty = false;
+        // Clear a still-pending enter: on an aborted/instant trip (server bails with
+        // map == -1, or the player escaped) begin+end can arrive in one pump() batch
+        // before the main loop consumes the latch at main.cc:1317, which would make the
+        // viewer enter wmWorldMap() for a trip the server has already ended. A no-op in
+        // the normal path (the latch was consumed on entry).
+        gPendingWorldmapEnter = false;
     }
 
     void onWorldmapState(Reader& r)
@@ -3736,6 +3986,13 @@ bool clientViewerTakeAttackCommitted()
     return committed;
 }
 
+bool clientViewerTakeRefusal()
+{
+    bool refused = gViewerRefusalPending;
+    gViewerRefusalPending = false;
+    return refused;
+}
+
 // Dude inventory verbs (player-UI Slice 3b). The inventory screen's drag-drop /
 // ctx-menu DROP resolution routes here instead of mutating the local mirror; the
 // server runs the real _inven_wield/_inven_unwield/itemDropStack on the
@@ -3768,6 +4025,14 @@ void clientViewerMovieAck()
     gViewerConn->sendLine("movdone");
 }
 
+void clientViewerEncounterAnswer(bool accept)
+{
+    if (gViewerConn == nullptr) {
+        return;
+    }
+    gViewerConn->sendLine(accept ? "encaccept" : "encdecline");
+}
+
 void clientViewerUnwield(int hand)
 {
     if (gViewerConn == nullptr) {
@@ -3778,7 +4043,10 @@ void clientViewerUnwield(int hand)
     gViewerConn->sendLine(cmd);
 }
 
-void clientViewerDrop(Object* item)
+// `quantity` is how many of the addressed stack to drop (the ctx-menu's count modal
+// answer, 1 for a single/equipped item); the server clamps it to the stack it holds,
+// so a mirror that is one reconcile behind can't over-drop.
+void clientViewerDrop(Object* item, int quantity)
 {
     if (gViewerConn == nullptr || item == nullptr) {
         return;
@@ -3787,8 +4055,29 @@ void clientViewerDrop(Object* item)
         debugPrint("client_net: invdrop on an unbound item (pid %d) ignored\n", item->pid);
         return;
     }
+    if (quantity < 1) {
+        quantity = 1;
+    }
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "invdrop %d %d", item->netId, quantity);
+    gViewerConn->sendLine(cmd);
+}
+
+// Eject loaded ammo from a carried weapon back into inventory (inventory ctx-menu
+// UNLOAD leaf). Like invdrop, addresses the specific weapon by netId; the server
+// runs weaponUnloadIntoInventory on the authoritative dude and streams the emptied
+// weapon + returned ammo pack(s) back via OBJECT_DELTA_INVENTORY (Slice 2 reconcile).
+void clientViewerUnload(Object* item)
+{
+    if (gViewerConn == nullptr || item == nullptr) {
+        return;
+    }
+    if (item->netId == 0) {
+        debugPrint("client_net: unload on an unbound item (pid %d) ignored\n", item->pid);
+        return;
+    }
     char cmd[32];
-    snprintf(cmd, sizeof(cmd), "invdrop %d", item->netId);
+    snprintf(cmd, sizeof(cmd), "unload %d", item->netId);
     gViewerConn->sendLine(cmd);
 }
 

@@ -302,6 +302,7 @@ static int _drop_into_container(Object* container, Object* item, int sourceIndex
 static int _drop_ammo_into_weapon(Object* weapon, Object* ammo, Object** ammoItemSlot, int quantity, int keyCode);
 static void _draw_amount(int value, int inventoryWindowType);
 static int inventoryQuantitySelect(int inventoryWindowType, Object* item, int maximum);
+static int inventoryViewerDropQuantity(Object* item, Object** itemSlot, int quantity);
 static int inventoryQuantityWindowInit(int inventoryWindowType, Object* item);
 static int inventoryQuantityWindowFree(int inventoryWindowType);
 
@@ -2472,16 +2473,19 @@ static void _inven_pickup(int buttonCode, int indexOffset)
         // FOnline-style drop-to-world: releasing a dragged item OUTSIDE the inventory
         // window drops it (vanilla FO2 just returns it to its slot). Only when truly
         // outside the window rect — dead space INSIDE the window still returns-to-slot.
-        // Fire invdrop (server drops the top-level stack of this pid + spawns it on the
-        // ground; Slice 2 reconciles the mirror + repaints the list). Skip the local
-        // mutation like every other viewer leaf.
+        // Fire invdrop (the server drops that many + spawns them on the ground; Slice 2
+        // reconciles the mirror + repaints the list). Skip the local mutation like every
+        // other viewer leaf. A stack asks HOW MANY, same as the ctx-menu DROP leaf.
         int mx;
         int my;
         mouseGetPosition(&mx, &my);
         Rect wrect;
         windowGetRect(gInventoryWindow, &wrect);
         if (mx < wrect.left || mx > wrect.right || my < wrect.top || my > wrect.bottom) {
-            clientViewerDrop(item);
+            int quantityToDrop = inventoryViewerDropQuantity(item, itemSlot, count);
+            if (quantityToDrop != -1) {
+                clientViewerDrop(item, quantityToDrop);
+            }
         }
     }
 
@@ -3502,13 +3506,17 @@ static void inventoryWindowOpenContextMenu(int keyCode, int inventoryWindowType)
     switch (actionMenuItem) {
     case GAME_MOUSE_ACTION_MENU_ITEM_DROP:
         if (clientViewerActive()) {
-            // Drop → wire verb (whole top-level stack; partial drops are later). Skip the
-            // local unequip + itemDropStack — the server drops the item and streams the
-            // removal (Slice 2 reconcile) plus a world SPAWN. Only the dude's own top-
-            // level items (owner == gDude) are addressable by the pid verb; nested-
-            // container drops are deferred (contents not streamed, Slice A2).
+            // Drop → wire verb. Skip the local unequip + itemDropStack — the server drops
+            // the item and streams the removal (Slice 2 reconcile) plus a world SPAWN.
+            // Only the dude's own top-level items (owner == gDude) are addressable;
+            // nested-container drops are deferred (contents not streamed, Slice A2).
+            // A stack asks HOW MANY first, like the local leaf does, and the answer rides
+            // the verb (the server used to be told nothing and dropped the WHOLE stack).
             if (owner == gDude) {
-                clientViewerDrop(item);
+                int quantityToDrop = inventoryViewerDropQuantity(item, itemSlot, quantity);
+                if (quantityToDrop != -1) {
+                    clientViewerDrop(item, quantityToDrop);
+                }
             }
             break;
         }
@@ -3584,7 +3592,11 @@ static void inventoryWindowOpenContextMenu(int keyCode, int inventoryWindowType)
         break;
     case GAME_MOUSE_ACTION_MENU_ITEM_UNLOAD:
         if (clientViewerActive()) {
-            break; // ammo/charges not streamed yet (Slice A2) — deferred to Slice 3c
+            // Route to the server (authoritative inventory); the emptied weapon +
+            // ejected ammo stream back via OBJECT_DELTA_INVENTORY. Mutating the local
+            // mirror here would fight that reconcile (client-only phantom ammo).
+            clientViewerUnload(item);
+            break;
         }
         weaponUnloadIntoInventory(owner, item, itemSlot == nullptr);
         break;
@@ -5628,6 +5640,24 @@ static void _container_exit(int keyCode, int inventoryWindowType)
 
 // Drop item inside a container item (bag, backpack, etc.).
 // 0x476464
+// How many of a stack the VIEWER's drop leaves should send. Same convention as the
+// local stack moves (_drop_into_container / _drop_ammo_into_weapon just below): more
+// than one asks HOW MANY, one is implicit, -1 means the player cancelled. Equipped
+// slot = 1, and an ARMED explosive skips the prompt exactly like the local DROP leaf
+// (whatever count it sends is moot — itemDropStack already drops the single armed
+// object and ignores the count, item.cc). The count modal is wire-safe inside the
+// viewer's inventory screen: the loot take/put leaves already prompt through it.
+static int inventoryViewerDropQuantity(Object* item, Object** itemSlot, int quantity)
+{
+    if (itemSlot != nullptr) {
+        return 1;
+    }
+    if (quantity > 1 && !explosiveIsActiveExplosive(item->pid)) {
+        return inventoryQuantitySelect(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, item, quantity);
+    }
+    return quantity > 1 ? quantity : 1;
+}
+
 static int _drop_into_container(Object* container, Object* item, int sourceIndex, Object** itemSlot, int quantity)
 {
     int quantityToMove;

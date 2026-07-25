@@ -15,6 +15,7 @@
 #include "proto.h"
 #include "proto_instance.h"
 #include "scripts.h"
+#include "server_players.h" // playerActorSlotOf — extras persist via the co-op appendix
 
 namespace fallout {
 
@@ -189,6 +190,19 @@ int queueLoad(File* stream)
 }
 
 // 0x4A24E0
+// True for an event owned by an EXTRA player actor (registry slot >= 1). Those
+// persist ONLY through the co-op appendix (queueSaveEventsForOwner), never the
+// global queue section: queueLoad rebinds owners by id inside the save handler
+// loop, before the appendix rebuilds the extras, so a global copy would resolve
+// to owner==nullptr and either drop the effect (permanent stat penalty) or fire
+// on a null critter. Slot 0 (the host / gDude) still rides the global section as
+// in vanilla. In single-player there are no extras, so this skips nothing and
+// the save stays byte-identical.
+static bool queueEventBelongsToExtra(QueueListNode* node)
+{
+    return node->owner != nullptr && playerActorSlotOf(node->owner) >= 1;
+}
+
 int queueSave(File* stream)
 {
     QueueListNode* queueListNode;
@@ -197,7 +211,9 @@ int queueSave(File* stream)
 
     queueListNode = gQueueListHead;
     while (queueListNode != nullptr) {
-        count += 1;
+        if (!queueEventBelongsToExtra(queueListNode)) {
+            count += 1;
+        }
         queueListNode = queueListNode->next;
     }
 
@@ -207,6 +223,10 @@ int queueSave(File* stream)
 
     queueListNode = gQueueListHead;
     while (queueListNode != nullptr) {
+        if (queueEventBelongsToExtra(queueListNode)) {
+            queueListNode = queueListNode->next;
+            continue;
+        }
         Object* object = queueListNode->owner;
         int objectId = object != nullptr ? object->id : -2;
 
@@ -230,6 +250,99 @@ int queueSave(File* stream)
         }
 
         queueListNode = queueListNode->next;
+    }
+
+    return 0;
+}
+
+int queueSaveEventsForOwner(File* stream, Object* owner)
+{
+    int count = 0;
+    for (QueueListNode* node = gQueueListHead; node != nullptr; node = node->next) {
+        if (node->owner == owner) {
+            count += 1;
+        }
+    }
+
+    if (fileWriteInt32(stream, count) == -1) {
+        return -1;
+    }
+
+    unsigned int now = gameTimeGetTime();
+    for (QueueListNode* node = gQueueListHead; node != nullptr; node = node->next) {
+        if (node->owner != owner) {
+            continue;
+        }
+
+        // Store the REMAINING delay, not the absolute fire time, so the effect
+        // resumes correctly relative to game time on reload. An already-due event
+        // clamps to 0 and fires on the first tick after the re-add.
+        int delay = (int)(node->time - now);
+        if (delay < 0) {
+            delay = 0;
+        }
+
+        if (fileWriteInt32(stream, delay) == -1) {
+            return -1;
+        }
+
+        if (fileWriteInt32(stream, node->type) == -1) {
+            return -1;
+        }
+
+        EventTypeDescription* eventTypeDescription = &(gEventTypeDescriptions[node->type]);
+        if (eventTypeDescription->writeProc != nullptr) {
+            if (eventTypeDescription->writeProc(stream, node->data) == -1) {
+                return -1;
+            }
+        }
+    }
+
+    return count;
+}
+
+int queueLoadEventsForOwner(File* stream, Object* owner)
+{
+    int count;
+    if (fileReadInt32(stream, &count) == -1) {
+        return -1;
+    }
+
+    if (count < 0) {
+        return -1;
+    }
+
+    for (int index = 0; index < count; index += 1) {
+        int delay;
+        if (fileReadInt32(stream, &delay) == -1) {
+            return -1;
+        }
+
+        int type;
+        if (fileReadInt32(stream, &type) == -1) {
+            return -1;
+        }
+
+        if (type < 0 || type >= EVENT_TYPE_COUNT) {
+            return -1;
+        }
+
+        EventTypeDescription* eventTypeDescription = &(gEventTypeDescriptions[type]);
+        void* data = nullptr;
+        if (eventTypeDescription->readProc != nullptr) {
+            if (eventTypeDescription->readProc(stream, &data) == -1) {
+                return -1;
+            }
+        }
+
+        // queueAddEvent takes ownership of `data`; free it ourselves only if the
+        // add fails (it never frees on failure).
+        if (queueAddEvent(delay, owner, data, type) == -1) {
+            if (data != nullptr && eventTypeDescription->freeProc != nullptr) {
+                eventTypeDescription->freeProc(data);
+            }
+            return -1;
+        }
     }
 
     return 0;
@@ -469,8 +582,12 @@ static int _queue_do_explosion_(Object* explosive, bool animate)
         elevation = explosive->elevation;
     }
 
-    int maxDamage;
-    int minDamage;
+    // Initialize BOTH: explosiveGetDamage leaves them untouched (and returns false)
+    // for a pid it does not recognize, and a detonating explosive carries its ARMED
+    // pid. Feeding uninitialized stack into the blast is the upstream UB that made a
+    // bomb do "2 million" one run and 18 the next. 0/0 is a harmless dud, never garbage.
+    int maxDamage = 0;
+    int minDamage = 0;
 
     // SFALL
     explosiveGetDamage(explosive->pid, &minDamage, &maxDamage);

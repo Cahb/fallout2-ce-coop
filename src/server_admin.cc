@@ -10,6 +10,7 @@
 #include "animation.h" // reg_anim_clear — cancel a stress critter's anims pre-destroy
 #include "combat.h" // isInCombat / _combat_delete_critter
 #include "command.h" // probeApplyAggro — `stress` forces the fight the way `aggro` does
+#include "critter.h" // critterRevive / critterIsDead / critterGetName — the `revive` verb
 #include "db.h"
 #include "debug.h"
 #include "game.h"
@@ -27,6 +28,7 @@
 #include "queue.h"
 #include "savegame.h"
 #include "scripts.h" // gameTimeAddTicks / gameTimeGetTime — the `timeskip` verb
+#include "server_players.h" // playerActorAt / playerActorCount — the `revive` verb
 
 namespace fallout {
 
@@ -191,13 +193,14 @@ void serverAutosaveTick()
         return;
     }
 
-    // Some maps forbid saving outright (MAP_SAVED flag) — on those the periodic
-    // trigger waits for the next map rather than spamming failures.
-    if (!wmMapIsSaveable()) {
-        lastGeneration = generation; // don't re-latch the map-change trigger here
-        return;
-    }
-
+    // NOTE: no wmMapIsSaveable() gate. That flag only means "this map's .SAV is not
+    // PERSISTED across revisits" (random encounters / free-roam wilderness regenerate)
+    // — lsgPerformSaveGame still succeeds on them (map.cc:1507 just erases the transient
+    // .SAV; the savegame itself, incl. worldmap position + player state, is written), the
+    // same as a vanilla manual save there. Gating on it wrongly skipped autosave whenever
+    // the player entered a non-city/encounter map (owner-reported). Autosave fires on
+    // every map entry now; on a transient map the checkpoint captures the persistent
+    // state, which is the sensible reload point.
     bool ok = adminWriteSave(kAutosaveSlot, "autosave");
     fprintf(stderr, "f2_server: autosave -> slot %d %s%s\n", kAutosaveSlot + 1,
         ok ? "ok" : "FAILED", mapChanged ? " (map change)" : "");
@@ -375,6 +378,7 @@ static void writeHelp(const std::function<void(const char* text)>& reply, bool w
     reply("  spawn <pid> [n] [tile]  place n critters of pid (default 1, random tile)");
     reply("  stress <n> [pid] [seed] spawn n hostiles near the players and aggro them");
     reply("  despawnall            destroy everything spawn/stress created");
+    reply("  revive <slot>         revive a dead player at 1 HP (no-op if not dead)");
     reply("  help                  this");
     writeChannelListing(reply);
     reply(worldLoaded
@@ -519,6 +523,48 @@ bool serverAdminLine(const char* line,
 
         snprintf(msg, sizeof(msg), "timeskip: done, gametime=%u", gameTimeGetTime());
         reply(msg);
+        return true;
+    }
+
+    if (strcmp(verb, "revive") == 0) {
+        // `revive <slot>` — bring a dead PLAYER actor back at 1 HP (owner spec
+        // 2026-07-23). Players only: the arg is a registry slot, so this can never
+        // target a random NPC corpse. A no-op with a clear reply when the slot is
+        // empty or the player is already alive ("does nothing if not dead").
+        if (!worldLoaded) {
+            reply("revive: no world loaded");
+            return true;
+        }
+        if (rest == nullptr) {
+            reply("usage: revive <slot>   (0 = host, 1.. = the extras)");
+            return true;
+        }
+
+        int slot = atoi(rest);
+        if (slot < 0 || slot >= playerActorCount()) {
+            snprintf(msg, sizeof(msg), "revive: slot %d out of range (0..%d)", slot, playerActorCount() - 1);
+            reply(msg);
+            return true;
+        }
+
+        Object* actor = playerActorAt(slot);
+        if (actor == nullptr) {
+            snprintf(msg, sizeof(msg), "revive: slot %d is empty", slot);
+            reply(msg);
+            return true;
+        }
+        if (!critterIsDead(actor)) {
+            snprintf(msg, sizeof(msg), "revive: slot %d (%s) is not dead — nothing to do", slot, critterGetName(actor));
+            reply(msg);
+            return true;
+        }
+
+        critterRevive(actor);
+        snprintf(msg, sizeof(msg), "revive: slot %d (%s) back at 1 HP", slot, critterGetName(actor));
+        reply(msg);
+        char line[128];
+        snprintf(line, sizeof(line), "%s has been revived.", critterGetName(actor));
+        presenter()->consoleMessageStyled(0, kMsgChannelSystem, line);
         return true;
     }
 

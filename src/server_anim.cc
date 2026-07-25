@@ -113,6 +113,7 @@
 #include "scripts.h" // scriptsExecSpatialProc — per-tile trap/trigger procs
 #include "server_anim.h"
 #include "server_loop.h"
+#include "server_players.h" // ServerActorScope / playerActorSlotOf — edge-grid transitions for extras
 #include "sim_clock.h"
 #include "tile.h"
 
@@ -399,6 +400,16 @@ static bool serverAnimStepOnce(Object* owner, int rotation, int durMs, bool run)
     // Bracketed set/clear so the pending value can never leak onto an unrelated
     // mover's objectMoved (the door script above runs BEFORE the set).
     int elevation = owner->elevation;
+
+    // Scope gDude to the mover for the commit + spatial proc below. The engine's
+    // exit-grid trigger inside objectSetLocation is gated on `obj == gDude`, and
+    // the spatial proc keys the acting player the same way — but this stepped-walk
+    // playback runs at tick top level with gDude still bound to the HOST, so an
+    // extra (slot >= 1) walking onto a map edge would otherwise never latch a
+    // transition. No-op for the host (slot 0, already gDude) and for NPC walkers
+    // (ServerActorScope(nullptr) does nothing).
+    ServerActorScope moverScope(playerActorSlotOf(owner) >= 1 ? owner : nullptr);
+
     presenterSetNextMoveDurationMs(durMs);
     presenterSetNextMoveRun(run);
     objectSetLocation(owner, nextTile, elevation, &rect);

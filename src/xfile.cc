@@ -55,6 +55,10 @@ int xfileClose(XFile* stream)
     case XFILE_TYPE_GZFILE:
         rc = gzclose(stream->gzfile);
         break;
+    case XFILE_TYPE_MEMORY:
+        free(stream->memoryBuffer);
+        rc = 0;
+        break;
     default:
         rc = fclose(stream->file);
         break;
@@ -158,6 +162,38 @@ XFile* xfileOpen(const char* filePath, const char* mode)
     return stream;
 }
 
+// Read-only, RAM-backed stream over a private copy of [data]. No path, no disk, no
+// xbase lookup — so several viewers on one machine can never share a scratch file
+// (the co-op join/rebaseline blob path). All write entry points reject this type.
+XFile* xfileOpenMemory(const void* data, size_t size)
+{
+    if (data == nullptr) {
+        return nullptr;
+    }
+
+    XFile* stream = (XFile*)malloc(sizeof(*stream));
+    if (stream == nullptr) {
+        return nullptr;
+    }
+
+    memset(stream, 0, sizeof(*stream));
+
+    stream->type = XFILE_TYPE_MEMORY;
+    stream->memoryBuffer = (unsigned char*)malloc(size != 0 ? size : 1);
+    if (stream->memoryBuffer == nullptr) {
+        free(stream);
+        return nullptr;
+    }
+
+    if (size != 0) {
+        memcpy(stream->memoryBuffer, data, size);
+    }
+    stream->memorySize = (long)size;
+    stream->memoryPosition = 0;
+
+    return stream;
+}
+
 // 0x4DF11C
 int xfilePrintFormatted(XFile* stream, const char* format, ...)
 {
@@ -190,6 +226,9 @@ int xfilePrintFormattedArgs(XFile* stream, const char* format, va_list args)
     case XFILE_TYPE_GZFILE:
         rc = gzvprintf(stream->gzfile, format, args);
         break;
+    case XFILE_TYPE_MEMORY:
+        rc = -1; // read-only stream
+        break;
     default:
         rc = vfprintf(stream->file, format, args);
         break;
@@ -211,6 +250,11 @@ int xfileReadChar(XFile* stream)
         break;
     case XFILE_TYPE_GZFILE:
         ch = gzgetc(stream->gzfile);
+        break;
+    case XFILE_TYPE_MEMORY:
+        ch = stream->memoryPosition < stream->memorySize
+            ? stream->memoryBuffer[stream->memoryPosition++]
+            : -1;
         break;
     default:
         ch = fgetc(stream->file);
@@ -236,6 +280,22 @@ char* xfileReadString(char* string, int size, XFile* stream)
     case XFILE_TYPE_GZFILE:
         result = compat_gzgets(stream->gzfile, string, size);
         break;
+    case XFILE_TYPE_MEMORY:
+        if (stream->memoryPosition >= stream->memorySize || size <= 1) {
+            result = nullptr;
+        } else {
+            int i = 0;
+            while (i < size - 1 && stream->memoryPosition < stream->memorySize) {
+                char c = (char)stream->memoryBuffer[stream->memoryPosition++];
+                string[i++] = c;
+                if (c == '\n') {
+                    break;
+                }
+            }
+            string[i] = '\0';
+            result = string;
+        }
+        break;
     default:
         result = compat_fgets(string, size, stream->file);
         break;
@@ -257,6 +317,9 @@ int xfileWriteChar(int ch, XFile* stream)
         break;
     case XFILE_TYPE_GZFILE:
         rc = gzputc(stream->gzfile, ch);
+        break;
+    case XFILE_TYPE_MEMORY:
+        rc = -1; // read-only stream
         break;
     default:
         rc = fputc(ch, stream->file);
@@ -280,6 +343,9 @@ int xfileWriteString(const char* string, XFile* stream)
         break;
     case XFILE_TYPE_GZFILE:
         rc = gzputs(stream->gzfile, string);
+        break;
+    case XFILE_TYPE_MEMORY:
+        rc = -1; // read-only stream
         break;
     default:
         rc = fputs(string, stream->file);
@@ -309,6 +375,18 @@ size_t xfileRead(void* ptr, size_t size, size_t count, XFile* stream)
         // return wrong result.
         elementsRead = gzread(stream->gzfile, ptr, size * count);
         break;
+    case XFILE_TYPE_MEMORY: {
+        size_t bytesWanted = size * count;
+        long remaining = stream->memorySize - stream->memoryPosition;
+        size_t bytesAvailable = remaining > 0 ? (size_t)remaining : 0;
+        size_t bytesToCopy = bytesWanted < bytesAvailable ? bytesWanted : bytesAvailable;
+        if (bytesToCopy != 0) {
+            memcpy(ptr, stream->memoryBuffer + stream->memoryPosition, bytesToCopy);
+            stream->memoryPosition += (long)bytesToCopy;
+        }
+        elementsRead = size != 0 ? bytesToCopy / size : 0;
+        break;
+    }
     default:
         elementsRead = fread(ptr, size, count, stream->file);
         break;
@@ -337,6 +415,9 @@ size_t xfileWrite(const void* ptr, size_t size, size_t count, XFile* stream)
         // parameters this function can return wrong result.
         elementsWritten = gzwrite(stream->gzfile, ptr, size * count);
         break;
+    case XFILE_TYPE_MEMORY:
+        elementsWritten = 0; // read-only stream
+        break;
     default:
         elementsWritten = fwrite(ptr, size, count, stream->file);
         break;
@@ -359,6 +440,27 @@ int xfileSeek(XFile* stream, long offset, int origin)
     case XFILE_TYPE_GZFILE:
         result = gzseek(stream->gzfile, offset, origin);
         break;
+    case XFILE_TYPE_MEMORY: {
+        long base = 0;
+        bool okOrigin = true;
+        if (origin == SEEK_SET) {
+            base = 0;
+        } else if (origin == SEEK_CUR) {
+            base = stream->memoryPosition;
+        } else if (origin == SEEK_END) {
+            base = stream->memorySize;
+        } else {
+            okOrigin = false;
+        }
+        long newPosition = base + offset;
+        if (!okOrigin || newPosition < 0 || newPosition > stream->memorySize) {
+            result = -1;
+        } else {
+            stream->memoryPosition = newPosition;
+            result = 0;
+        }
+        break;
+    }
     default:
         result = fseek(stream->file, offset, origin);
         break;
@@ -381,6 +483,9 @@ long xfileTell(XFile* stream)
     case XFILE_TYPE_GZFILE:
         pos = gztell(stream->gzfile);
         break;
+    case XFILE_TYPE_MEMORY:
+        pos = stream->memoryPosition;
+        break;
     default:
         pos = ftell(stream->file);
         break;
@@ -401,6 +506,9 @@ void xfileRewind(XFile* stream)
     case XFILE_TYPE_GZFILE:
         gzrewind(stream->gzfile);
         break;
+    case XFILE_TYPE_MEMORY:
+        stream->memoryPosition = 0;
+        break;
     default:
         rewind(stream->file);
         break;
@@ -420,6 +528,9 @@ int xfileEof(XFile* stream)
         break;
     case XFILE_TYPE_GZFILE:
         rc = gzeof(stream->gzfile);
+        break;
+    case XFILE_TYPE_MEMORY:
+        rc = stream->memoryPosition >= stream->memorySize ? 1 : 0;
         break;
     default:
         rc = feof(stream->file);
@@ -442,6 +553,9 @@ long xfileGetSize(XFile* stream)
         break;
     case XFILE_TYPE_GZFILE:
         fileSize = 0;
+        break;
+    case XFILE_TYPE_MEMORY:
+        fileSize = stream->memorySize;
         break;
     default:
         fileSize = getFileSize(stream->file);

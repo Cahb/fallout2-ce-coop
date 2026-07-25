@@ -68,6 +68,17 @@ static void emitState()
         wmGenData.isWalking, wmGenData.walkDistance,
         wmGenData.carFuel, wmGenData.currentAreaId,
         wmGenData.isInCar);
+
+    // ►► THE CLOCK TRAVELS TOO. Travel burns game time (worldmapTravelClockTick →
+    // wmGameTimeIncrement), but the only emitter of WORLD_DELTA_GAMETIME is the beat
+    // scan (object_delta.cc), and serverTick is PARKED for the whole worldmap session
+    // because this driver owns the loop. So the viewer's clock stayed frozen at the
+    // moment it entered and the worldmap's date/time readout never moved for the whole
+    // trip — owner-reported. Same shape as the simClockAdvance hole in the step below:
+    // a block-and-pump driver must ship what the parked spine would have shipped.
+    // Coupled to the state emit on purpose — position and time-of-day are read off the
+    // same screen, so they must not drift apart.
+    presenter()->worldDelta(WORLD_DELTA_GAMETIME);
 }
 
 int worldmapServerDriver()
@@ -77,15 +88,44 @@ int worldmapServerDriver()
     wmTransitionSaveMap();
     wmTransitionSuspendScripts();
 
+    // The car-placement scripts must not think the car is still sitting on the map we
+    // just left, or they decline to place it (and its trunk) on the next one — see
+    // wmCarClearPlacedTile. sfall's hook point is wmInterfaceInit; on a dedicated
+    // server that UI is on another machine, so the equivalent is here, where the
+    // authoritative worldmap session begins.
+    wmCarClearPlacedTile();
+
     wmMatchWorldPosToArea(wmGenData.worldPosX, wmGenData.worldPosY, &(wmGenData.currentAreaId));
 
     presenter()->worldmapBegin();
+
+    // ►► STATE BEFORE THE SCREEN OPENS. Same reasoning as the fog sync below, and a
+    // worse failure: the viewer's wmGenData still holds whatever its last LOCAL
+    // worldmap session left (position, destination, area, fuel, isInCar), and until
+    // this event lands it renders the party at a stale position with NO CAR. The car
+    // is the sharp edge — wmInterfaceInit locks the car art ONCE, gated on isInCar
+    // (worldmap_ui.cc), so a viewer that opens the screen believing it is on foot has
+    // no car sprite for the WHOLE trip, and its first click is aimed from the wrong
+    // marker. Begin + state leave here back-to-back in one wire batch and the modal is
+    // opened later from the client's main loop, so isInCar is already authoritative by
+    // the time the screen initialises. This matters for EVERY entry (a script's
+    // `give_car_to_party` metarule from the car's use_p_proc is what drives), not just
+    // the car — an on-foot trip had the same stale-marker first click.
+    emitState();
 
     // Full fog sync on entry: clear the shadow so the first diff always ships
     // the whole grid. A viewer that just opened the worldmap has whatever fog
     // its own last session left behind, which is not authoritative.
     gSubtileShadow.clear();
     emitSubtilesIfChanged();
+
+    // One line per ENTRY, matching the exit line below. `inCar=1` says the trip came
+    // from the car metarule; a bogus pos/area here means the driver started from state
+    // the last session left behind rather than the map we just left.
+    fprintf(stderr, "[wmsrv] driver enter: pos=%d,%d area=%d inCar=%d fuel=%d dude=%d\n",
+        wmGenData.worldPosX, wmGenData.worldPosY, wmGenData.currentAreaId,
+        wmGenData.isInCar ? 1 : 0, wmGenData.carFuel,
+        gDude != nullptr ? gDude->netId : -1);
 
     unsigned int partyHealTime = 0;
     int map = -1;
@@ -187,6 +227,13 @@ int worldmapServerDriver()
 
         worldmapIntentPop();
 
+        // One line per viewer intent actually CONSUMED. The failure this catches is
+        // the one that reads as "my click did nothing": a click that never became an
+        // intent prints nothing here, which separates a lost click (viewer/wire) from
+        // a click the driver acted on (sim).
+        fprintf(stderr, "[wmsrv] intent kind=%d x=%d y=%d area=%d\n",
+            (int)intent.kind, intent.x, intent.y, wmGenData.currentAreaId);
+
         if (intent.kind == WM_INTENT_MOVE) {
             wmPartyInitWalking(intent.x, intent.y);
             emitState();
@@ -200,7 +247,7 @@ int worldmapServerDriver()
                     if (wmGenData.isInCar) {
                         wmGenData.isInCar = false;
                         if (wmGenData.currentAreaId == -1) {
-                            wmMatchAreaContainingMapIdx(map, &(wmGenData.currentCarAreaId));
+                            wmCarParkAtMapArea(map);
                         } else {
                             wmGenData.currentCarAreaId = wmGenData.currentAreaId;
                         }

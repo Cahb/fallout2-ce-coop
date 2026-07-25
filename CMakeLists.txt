@@ -308,6 +308,8 @@ add_library(f2_client OBJECT
     "src/lips.h"
     "src/loadsave.cc"
     "src/loadsave.h"
+    "src/loot_highlight.cc"
+    "src/loot_highlight.h"
     "src/mainmenu.cc"
     "src/mainmenu.h"
     "src/map_render.cc"

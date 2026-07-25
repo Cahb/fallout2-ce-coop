@@ -7,6 +7,7 @@
 #include "art.h"
 #include "color.h"
 #include "combat.h"
+#include "combat_ui.h" // gCombatMessageList — reload "Out of ammo." feedback
 #include "config.h"
 #include "critter.h"
 #include "cycle.h"
@@ -1159,6 +1160,21 @@ int interfaceUpdateItems(bool animated, int leftItemAction, int rightItemAction)
         }
     }
 
+    // ►► WIELD-ON-REJOIN TRACE ([[coop-open-issues]]): P1 wields armor+rocket, quits,
+    // rejoins → weapon not shown (intermittent). This brackets the client self-view
+    // rebuild: does gDude->fid still carry the 0xF000 weapon-anim nibble after the
+    // rejoin blob load, and do the hand items still hold their IN_*_HAND flags? If the
+    // fid nibble is 0 but item2 is present, the body-fid lost the code; if item2 is
+    // null but the launcher is in inventory, the hand flag was dropped by the load.
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        fprintf(stderr,
+            "[wield-rejoin] curHand=%d fid=0x%08x weaponNibble=%d "
+            "item1=%d(flags=0x%x) item2=%d(flags=0x%x)\n",
+            gInterfaceCurrentHand, gDude->fid, (gDude->fid & 0xF000) >> 12,
+            item1 != nullptr ? item1->pid : -1, item1 != nullptr ? item1->flags : 0,
+            item2 != nullptr ? item2->pid : -1, item2 != nullptr ? item2->flags : 0);
+    }
+
     if (animated) {
         Object* newCurrentItem = gInterfaceItemStates[gInterfaceCurrentHand].item;
         if (newCurrentItem != oldCurrentItem) {
@@ -2043,6 +2059,15 @@ static int _intface_item_reload()
     interfaceUpdateItems(false, INTERFACE_ITEM_ACTION_DEFAULT, INTERFACE_ITEM_ACTION_DEFAULT);
 
     if (!v0) {
+        // Nothing was loaded (no compatible ammo in inventory). Vanilla is silent
+        // here; surface it like the attack path does for an empty weapon. Local
+        // (solo/host) path — the co-op viewer reload path is a separate wire gap
+        // tracked in coop-open-issues.
+        MessageListItem messageListItem;
+        messageListItem.num = 101; // Out of ammo.
+        if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
+            displayMonitorAddMessage(messageListItem.text);
+        }
         return -1;
     }
 

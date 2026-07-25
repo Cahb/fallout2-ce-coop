@@ -34,6 +34,7 @@
 #include "game_dialog.h" // gameDialogSetServerPump — A2 dialog block-and-pump seam
 #include "inventory.h" // barterSetServerPump — the barter block-and-pump seam
 #include "server_worldmap.h" // worldmapSetServerPump — worldmap block-and-pump seam
+#include "worldmap.h" // worldmapEncounterSetServerPump — random-encounter prompt barrier
 #include "object.h"
 #include "pres_record.h"
 #include "presenter_network.h"
@@ -545,6 +546,32 @@ int main(int argc, char** argv)
                 return true;
             });
         }
+
+        // Random-encounter prompt barrier (worldmap.cc wmEncounterPromptBarrier).
+        // Installed unconditionally: it only fires when the sim detects an encounter
+        // AND viewers are connected — no clients → bail → the barrier's default enter
+        // (pre-stream behavior). Services inbound so encaccept/encdecline lands; unlike
+        // the worldmap pump it does NOT gate on claimant (first-answer-wins, any viewer)
+        // or combat (an encounter prompt is out of combat).
+        worldmapEncounterSetServerPump([&]() -> bool {
+            if (gameTerminalQuitRequested()) {
+                return false;
+            }
+            if (haveNet && netSink.clientCount() == 0) {
+                return false; // nobody to answer → default enter
+            }
+            if (haveNet) {
+                serverControlBeginDrain([&](int sid) { return netSink.hasSession(sid); });
+                netSink.pollInbound([&](int sessionId, const char* line) {
+                    serverControlLine(sessionId, line);
+                });
+            }
+            if (haveCmd) {
+                cmdListener.pollCommands([&](const char* line, const CommandListener::ReplyFn& reply) { dispatchControlLine(0, line, reply); });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(paceMs > 0 ? paceMs : 10));
+            return true;
+        });
 
         serverServe(
             // intentsDrain: each beat, pull whatever command lines have arrived

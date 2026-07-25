@@ -8,12 +8,15 @@
 
 #include "combat.h" // _combat_free_move (TURN_START bonus-move field, §3.a)
 #include "combat_defs.h"
+#include "light.h" // lightGetAmbientIntensity — global ambient-light worldDelta
 #include "scripts.h"
 #include "map.h" // mapGetLoadGeneration (WireFrameMeta.mapGeneration)
 #include "object.h"
-#include "pres_record.h" // kPresStreamVersion
+#include "pres_record.h" // kPresStreamVersion / presRecordCostMs
 #include "msg_channel.h"
 #include "presenter.h"
+#include "server_loop.h" // serverDedicatedActive — feature A marks only on the real server
+#include "server_players.h" // serverActorBusyMarkByNetId — the action-gate busy mark
 #include "sim_clock.h"
 #include "wire_defs.h"
 
@@ -200,6 +203,14 @@ enum EventType : unsigned char {
     // Co-op: stop local movie playback on every viewer. Emitted when the movie
     // barrier frees (first ack), so one player's skip ends the cutscene for all.
     EVENT_MOVIE_STOP = 47,
+
+    // Co-op: a per-actor character-sheet row changed at runtime (chem stat mod,
+    // level-up, ...). Payload = slot + a one-slot PSHT block. The join blob is the
+    // durable source; this is the LIVE delta so a viewer sees the change without
+    // waiting for a transition.
+    EVENT_PLAYER_SHEET = 48,
+    EVENT_ENCOUNTER_PROMPT = 49, // random-encounter accept/decline prompt (title+body); ack via encaccept/encdecline
+    EVENT_ENCOUNTER_CLOSE = 50, // first viewer answered — break the others out of the prompt box
 };
 
 // Event flag bits.
@@ -421,6 +432,9 @@ public:
         if ((changedFields & WORLD_DELTA_GAMETIME) != 0) {
             putU32(gameTimeGetTime()); // u32: the clock is unsigned and outlives i32
         }
+        if ((changedFields & WORLD_DELTA_LIGHT) != 0) {
+            putI32(lightGetAmbientIntensity());
+        }
         endEvent();
     }
 
@@ -447,6 +461,10 @@ public:
         if (changedFields & OBJECT_DELTA_AP) putI32(obj->data.critter.combat.ap);
         if (changedFields & OBJECT_DELTA_COMBAT_RESULTS) putI32(obj->data.critter.combat.results);
         if (changedFields & OBJECT_DELTA_INVENTORY) putInventory(obj);
+        // FRAME last (highest bit) — appended after the variable-length inventory so the
+        // reader stays aligned by walking the mask in bit order.
+        if (changedFields & OBJECT_DELTA_FRAME) putI32(obj->frame);
+        if (changedFields & OBJECT_DELTA_LIGHT) { putI32(obj->lightDistance); putI32(obj->lightIntensity); }
         endEvent();
     }
 
@@ -629,6 +647,14 @@ public:
             putI32(attack->extrasDamage[i]);
             putI32(attack->extrasFlags[i]);
         }
+        // Bug D: the fired weapon. The viewer replays the swing/fire/throw anim from
+        // the ATTACKER's mirror inventory, but a weapon acquired after that viewer
+        // joined is absent there → the attack replays as a punch even though the idle
+        // fid shows it armed. Carry netId + pid so the consumer can resolve it, or
+        // lazily recreate it in the mirror. netId 0 / pid -1 = unarmed. Appended after
+        // the extras block; length-prefixed events make the tail-append safe.
+        putI32(attack->weapon != nullptr ? netIdOf(attack->weapon) : 0);
+        putI32(attack->weapon != nullptr ? attack->weapon->pid : -1);
         endEvent();
     }
 
@@ -681,6 +707,17 @@ public:
     {
         if (presenterEmissionsSuppressed() || data == nullptr || size <= 0) return;
         if (eventTraceEnabled()) fprintf(stderr, "[presseq] SEND ops=%d bytes=%d actor=%d\n", opCount, size, actorNetId);
+        // Feature A: this recorded action's on-screen duration is (a) the presentation
+        // cost stamped into this frame's outbox meta (§8.6 — was hard-stubbed 0), and
+        // (b) the actor's non-blocking busy window. The busy mark is DEDICATED-server
+        // only (the headless probe never marks → goldens byte-identical) and skips a
+        // seq with no acting player (actorNetId 0 / a non-player critter). presRecordCostMs
+        // is valid here: it rides the same buffer as `data`, before the next section.
+        int costMs = presRecordCostMs();
+        if ((unsigned int)costMs > _frameSeqCostMs) _frameSeqCostMs = (unsigned int)costMs;
+        if (serverDedicatedActive() && actorNetId != 0) {
+            serverActorBusyMarkByNetId(actorNetId, costMs);
+        }
         beginEvent(EVENT_PRES_SEQ, 0);
         putI32(actorNetId); // primary actor to wait for (0 = none); precedes the op blob
         putU8(kPresStreamVersion);
@@ -783,6 +820,43 @@ public:
         beginEvent(EVENT_MOVIE_STOP, 0);
         endEvent();
         flushFrame();
+    }
+
+    void encounterPrompt(const char* title, const char* body) override
+    {
+        // Modal, like moviePlay/dialogNode: right after this the server BLOCKS in the
+        // encounter barrier waiting for encaccept/encdecline, so it must go out now —
+        // no beatEnd will carry it. Not gated on suppression (same reasoning as movies).
+        beginEvent(EVENT_ENCOUNTER_PROMPT, 0);
+        putString(title != nullptr ? title : "");
+        putString(body != nullptr ? body : "");
+        endEvent();
+        flushFrame();
+    }
+
+    void encounterClose() override
+    {
+        // Modal, like movieStop: the barrier just freed on the first answer, so ship
+        // it now to break the OTHER viewers' blocking prompt boxes this beat.
+        beginEvent(EVENT_ENCOUNTER_CLOSE, 0);
+        endEvent();
+        flushFrame();
+    }
+
+    bool wantsSheetDeltas() override { return true; }
+
+    void playerSheetDelta(int slot, const unsigned char* data, int len) override
+    {
+        if (data == nullptr || len <= 0 || len > 0xFFFF) return;
+        // Rides the beat like objectDelta (beatEnd flushes it); the consumer drops
+        // it if the join blob has not landed yet (the blob carries a fresher row).
+        beginEvent(EVENT_PLAYER_SHEET, EVENT_FLAG_STATE);
+        putI32(slot);
+        putU16((unsigned short)len);
+        for (int i = 0; i < len; i++) {
+            putU8(data[i]);
+        }
+        endEvent();
     }
 
     void movieSeenState(const unsigned char* seen, int count) override

@@ -11,7 +11,7 @@ metadata:
 
 ## ►► DONE — dialog streaming complete (A0→A3)
 
-All four stages committed. Plan of record = `DIALOG_STREAMING_PLAN.md` (repo root).
+All four stages committed. Plan of record = `DIALOG_STREAMING_PLAN.md (deleted)` (repo root).
 
 - **✅ A0** — game_dialog.cc linked into f2_server, 24 collisions retired
 - **✅ A1** — ServerScriptRequestHandler dialogEnter→gameDialogEnter
@@ -35,4 +35,4 @@ to a scripted NPC, click TALK. Dialog window renders with talking head and optio
 
 ### Next: [[barter-streaming-track]]
 
-See [[dialog-headless-plan]], [[p5-server-plan]], [[BARTER_STREAMING_PLAN.md]].
+See [[dialog-headless-plan]], [[p5-server-plan]], [[BARTER_STREAMING_PLAN.md (deleted)]].

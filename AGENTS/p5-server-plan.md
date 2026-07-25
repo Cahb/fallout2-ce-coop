@@ -18,9 +18,9 @@ Temple solo critical path has run LIVE over the wire EXCEPT dialog. The current 
 ════════════════════════════════════════════════════════════════════════════════
 1. Read THIS file. Skim [[mp-actor-architecture-principle]] (load-bearing) + IDEAS.md (vision/
    constraints) only if designing.
-2. Docs of record IN REPO: MP_PROTOCOL.md (wire), CLIENT_JOIN_DESIGN.md (join/viewer),
-   SERVER_LOOP_DESIGN.md, COMBAT_CLIENT_DESIGN.md (combat presentation), INTERACTION_UX_DESIGN.md
-   (out-of-combat action UX), TEMPLE_DEMO_ROADMAP.md (north star). History = git log + [[p5-cut-list]].
+2. Docs of record IN REPO: docs/MP_PROTOCOL.md (wire), CLIENT_JOIN_DESIGN.md (deleted) (join/viewer),
+   SERVER_LOOP_DESIGN.md (deleted), docs/COMBAT_CLIENT_DESIGN.md (combat presentation), INTERACTION_UX_DESIGN.md (deleted)
+   (out-of-combat action UX), docs/TEMPLE_DEMO_ROADMAP.md (north star). History = git log + [[p5-cut-list]].
 3. Gate = scripts/check.sh → must print "ALL GATES PASS" (builds everything; legacy byte-identical
    + server goldens + netstream/netsocket/join/joining-client + resumable/wire-combat gates).
    ►► NEVER run golden harnesses concurrently, and NEVER run check.sh while a live viewer_live.sh
@@ -127,8 +127,8 @@ longer abort). Combat presentation is driven by the record/replay channel ([[pre
 ════════════════════════════════════════════════════════════════════════════════
 • ►► PRESENTATION SEAM — the answer to "stream actions? opcodes? script calls?" is NONE — seam at
   the ENGINE PRESENTATION PRIMITIVE layer. This is now the RECORD/REPLAY track
-  ([[pres-record-build-track]]); design docs = PRESENTATION_RECORD_REPLAY_SPEC.md (Appendix A holds
-  the folded-in seam rationale/lineage) + PRESENTATION_RECORD_REPLAY_COOKBOOK.md + PRESENTATION_FSM_DESIGN.md
+  ([[pres-record-build-track]]); design docs = docs/PRESENTATION_RECORD_REPLAY_SPEC.md (Appendix A holds
+  the folded-in seam rationale/lineage) + docs/PRESENTATION_RECORD_REPLAY_COOKBOOK.md + PRESENTATION_FSM_DESIGN.md (deleted)
   (the client_present glide subsystem). Remaining seam work is the
   script-presentation opcode pass (op_play_sfx/op_float_msg/op_anim/…) routing through the presenter
   once each (bounded, closed opcode world) + bucket-C script cutscenes — captured in the record/replay
@@ -235,7 +235,7 @@ OPEN RISKS (still open; size before the relevant slice)
 • MODAL LOOPS block the tick (dialog/barter drain synchronously) — see the MODAL-LOOP SAFEGUARD rule.
 
 ════════════════════════════════════════════════════════════════════════════════
-►► NORTH STAR = TEMPLE_DEMO_ROADMAP.md
+►► NORTH STAR = docs/TEMPLE_DEMO_ROADMAP.md
 ════════════════════════════════════════════════════════════════════════════════
 Demo v1 = SOLO pass the Temple of Trials; then P2 co-op. The remaining solo blocker is DIALOG OPTION
 STREAMING ([[dialog-streaming-track]] — the dialog ENGINE works headless, the gap is the viewer

@@ -437,7 +437,7 @@ int critterAdjustPoison(Object* critter, int amount)
 {
     MessageListItem messageListItem;
 
-    if (critter != gDude) {
+    if (!playerActorIs(critter)) {
         return -1;
     }
 
@@ -445,7 +445,7 @@ int critterAdjustPoison(Object* critter, int amount)
         // Take poison resistance into account.
         amount -= amount * critterGetStat(critter, STAT_POISON_RESISTANCE) / 100;
     } else {
-        if (gDude->data.critter.poison <= 0) {
+        if (critter->data.critter.poison <= 0) {
             // Critter is not poisoned and we're want to decrease it even
             // further, which makes no sense.
             return 0;
@@ -457,7 +457,7 @@ int critterAdjustPoison(Object* critter, int amount)
         critter->data.critter.poison = newPoison;
 
         _queue_clear_type(EVENT_TYPE_POISON, nullptr);
-        queueAddEvent(10 * (505 - 5 * newPoison), gDude, nullptr, EVENT_TYPE_POISON);
+        queueAddEvent(10 * (505 - 5 * newPoison), critter, nullptr, EVENT_TYPE_POISON);
 
         // You have been poisoned!
         messageListItem.num = 3000;
@@ -473,7 +473,7 @@ int critterAdjustPoison(Object* critter, int amount)
     }
 
     if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-        presenter()->consoleMessage(messageListItem.text);
+        presenter()->consoleMessageFor(critter->netId, messageListItem.text);
     }
 
     if (critter == gDude) {
@@ -486,7 +486,7 @@ int critterAdjustPoison(Object* critter, int amount)
 // 0x42D318
 int poisonEventProcess(Object* obj, void* data)
 {
-    if (obj != gDude) {
+    if (!playerActorIs(obj)) {
         return 0;
     }
 
@@ -522,12 +522,12 @@ int critterAdjustRadiation(Object* obj, int amount)
 {
     MessageListItem messageListItem;
 
-    if (obj != gDude) {
+    if (!playerActorIs(obj)) {
         return -1;
     }
 
     Proto* proto;
-    protoGetProto(gDude->pid, &proto);
+    protoGetProto(obj->pid, &proto);
 
     if (amount > 0) {
         amount -= critterGetStat(obj, STAT_RADIATION_RESISTANCE) * amount / 100;
@@ -540,14 +540,14 @@ int critterAdjustRadiation(Object* obj, int amount)
     if (amount > 0) {
         Object* geigerCounter = nullptr;
 
-        Object* item1 = critterGetItem1(gDude);
+        Object* item1 = critterGetItem1(obj);
         if (item1 != nullptr) {
             if (item1->pid == PROTO_ID_GEIGER_COUNTER_I || item1->pid == PROTO_ID_GEIGER_COUNTER_II) {
                 geigerCounter = item1;
             }
         }
 
-        Object* item2 = critterGetItem2(gDude);
+        Object* item2 = critterGetItem2(obj);
         if (item2 != nullptr) {
             if (item2->pid == PROTO_ID_GEIGER_COUNTER_I || item2->pid == PROTO_ID_GEIGER_COUNTER_II) {
                 geigerCounter = item2;
@@ -595,7 +595,7 @@ int critterAdjustRadiation(Object* obj, int amount)
 // 0x42D4F4
 int _critter_check_rads(Object* obj)
 {
-    if (obj != gDude) {
+    if (!playerActorIs(obj)) {
         return 0;
     }
 
@@ -1036,6 +1036,62 @@ void critterKill(Object* critter, int anim, bool a3)
             _game_user_wants_to_quit = 2;
         }
     }
+}
+
+// Bring a dead critter back with a single hit point — the deliberate, minimal
+// INVERSE of critterKill. NOT a full resurrection: it does not re-attach the
+// script critterKill removed, re-add a party member, or restore drug events; it
+// undoes exactly the state that reads as "dead" or "a corpse" so the body stands,
+// blocks, and can act again. Co-op revive seam (MP_PROPOSAL Ch 9.5): a teammate
+// uses a healing item on a downed player, or the operator runs `revive <slot>`.
+// Returns false (no-op) on anything that is not an actually-dead critter — the
+// "does nothing if not dead" contract both call sites rely on.
+//
+// The single HP is load-bearing: critterIsDead reports dead on DAM_DEAD OR
+// current-HP <= 0, so clearing the flag without giving back a hit point would
+// leave the critter dead by the second test.
+bool critterRevive(Object* critter)
+{
+    if (critter == nullptr || PID_TYPE(critter->pid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+    if (!critterIsDead(critter)) {
+        return false;
+    }
+
+    // One hit point — critterIsDead reports dead on DAM_DEAD OR current-HP <= 0, so
+    // clearing the flag without a hit point would leave it dead by the second test —
+    // and clear every incapacitating result the kill / knockout paths can set.
+    critter->data.critter.hp = 1;
+    critter->data.critter.combat.results &= ~(DAM_DEAD | DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN | DAM_LOSE_TURN);
+
+    // Undo critterKill's flatten + no-block so the body is solid and clickable again —
+    // but only when the proto is not naturally flat/no-block (then the kill path left
+    // those bits alone and so must we). _obj_toggle_flat XORs OBJECT_FLAT, the exact
+    // inverse of the kill-path toggle when the bit is set.
+    Rect flatRect;
+    bool flatToggled = false;
+    if (!_critter_flag_check(critter->pid, CRITTER_FLAT)) {
+        critter->flags &= ~OBJECT_NO_BLOCK;
+        if ((critter->flags & OBJECT_FLAT) != 0) {
+            _obj_toggle_flat(critter, &flatRect);
+            flatToggled = true;
+        }
+    }
+    if (flatToggled) {
+        presenter()->worldInvalidateRect(&flatRect, critter->elevation);
+    }
+
+    // Stand the body back up through the engine's OWN dude stand-up (relocated to
+    // f2_core for exactly this server-side use). It rebuilds the fid at ANIM_STAND on
+    // the SAME base art the death anim preserved — so it recovers even a GIBBED /
+    // fire-danced corpse (a violent death only changes the anim slot, never the base
+    // art id) — restores the drawn-weapon offset, resets the frame (the corpse-frame
+    // render gotcha), and refreshes. fid = -1 lets it choose STAND vs FIRE_DANCE. The
+    // fid / position / flag / HP changes all stream to viewers via the object-delta +
+    // actor-HP channels regardless of the (server-noop) local refresh.
+    _dude_stand(critter, critter->rotation, -1);
+    return true;
 }
 
 // Returns experience for killing [critter].

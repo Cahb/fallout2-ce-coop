@@ -22,6 +22,7 @@
 #include "proto.h"
 #include "random.h"
 #include "scripts.h"
+#include "player_sheet.h" // playerSheetMarkDirty — stream runtime sheet changes
 #include "server_players.h" // playerActorSlotOf — per-actor PC-stat rows
 #include "skill.h"
 #include "svga.h"
@@ -277,7 +278,14 @@ int critterGetStat(Object* critter, int stat)
             break;
         }
 
-        if (critter == gDude) {
+        // Perk-derived SPECIAL / damage-resistance / max-HP bonuses belong to the
+        // subject actor, not whoever is bound to gDude. Keying on `== gDude` drops
+        // an extra's bonuses whenever it is not the scoped actor (e.g. it is the
+        // DEFENDER during an enemy turn, where gDude is restored to the host), so
+        // its Dermal Armor DR / Adrenaline Rush / GAIN_* etc. silently vanish
+        // off-turn. Use playerActorIs, matching the HtH-evade block above and
+        // critterGetBaseStatWithTraitModifier.
+        if (playerActorIs(critter)) {
             switch (stat) {
             case STAT_STRENGTH:
                 if (perkGetRank(critter, PERK_GAIN_STRENGTH)) {
@@ -530,6 +538,10 @@ int critterSetBaseStat(Object* critter, int stat, int value)
             critterUpdateDerivedStats(critter);
         }
 
+        // Sheet lives in the per-slot proto row, not on the Object — stream the
+        // row so viewers see the change live (no-op off a network presenter).
+        playerSheetMarkDirty(critter);
+
         return 0;
     }
 
@@ -589,6 +601,10 @@ int critterSetBonusStat(Object* critter, int stat, int value)
         if (stat >= STAT_STRENGTH && stat <= STAT_LUCK) {
             critterUpdateDerivedStats(critter);
         }
+
+        // Sheet lives in the per-slot proto row, not on the Object — stream the
+        // row so viewers see the change live (no-op off a network presenter).
+        playerSheetMarkDirty(critter);
 
         return 0;
     } else {
@@ -701,6 +717,10 @@ int pcSetStat(int pcStat, int value, Object* subject)
     } else {
         result = pcSetExperience(value, subject);
     }
+
+    // Stream the row: level / karma / unspent skill points are per-actor sheet
+    // fields, so a viewer must see them change (same channel as SPECIAL/XP).
+    playerSheetMarkDirty(subject);
 
     return result;
 }
@@ -1017,6 +1037,13 @@ int pcAddExperienceWithOptions(int xp, bool a2, int* xpGained, Object* subject)
     if (xpGained != nullptr) {
         *xpGained = newXp - oldXp;
     }
+
+    // Stream the earner's new XP/level row. The award is already per-actor (the
+    // combat bucket credits the killer), but without this the extra's client keeps
+    // showing seeded XP — "only slot 0 gains XP". The XP write above is direct (not
+    // via pcSetStat), so mark here; whole-row is idempotent so the nested level-up
+    // pcSetStat marking again is harmless.
+    playerSheetMarkDirty(earner);
 
     return 0;
 }

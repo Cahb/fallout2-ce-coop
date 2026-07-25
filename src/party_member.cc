@@ -25,8 +25,10 @@
 #include "proto.h"
 #include "proto_instance.h"
 #include "queue.h"
+#include "server_loop.h" // serverDedicatedActive — skip dialog-window UI on the headless server
 #include "random.h"
 #include "scripts.h"
+#include "server_players.h" // playerActorAt/Count — rest heals every player actor (co-op)
 #include "skill.h"
 #include "stat.h"
 #include "string_parsers.h"
@@ -413,7 +415,12 @@ int partyMemberAdd(Object* object)
     critterSetTeam(object, 0);
     queueRemoveEventsByType(object, EVENT_TYPE_SCRIPT);
 
-    if (_gdialogActive()) {
+    // _gdialogUpdatePartyStatus() lays out the dialog window's party-status control
+    // with screenGetWidth — pure client UI that aborts on the core-only server. The
+    // party change already landed above; a viewer updates its own dialog window from
+    // the stream. Skip the UI on the dedicated server (recruiting/dismissing a
+    // companion mid-dialog, e.g. Sulik, otherwise SIGABRTs f2_server).
+    if (_gdialogActive() && !serverDedicatedActive()) {
         if (object == gGameDialogSpeaker) {
             _gdialogUpdatePartyStatus();
         }
@@ -466,7 +473,12 @@ int partyMemberRemove(Object* object)
 
     queueRemoveEventsByType(object, EVENT_TYPE_SCRIPT);
 
-    if (_gdialogActive()) {
+    // _gdialogUpdatePartyStatus() lays out the dialog window's party-status control
+    // with screenGetWidth — pure client UI that aborts on the core-only server. The
+    // party change already landed above; a viewer updates its own dialog window from
+    // the stream. Skip the UI on the dedicated server (recruiting/dismissing a
+    // companion mid-dialog, e.g. Sulik, otherwise SIGABRTs f2_server).
+    if (_gdialogActive() && !serverDedicatedActive()) {
         if (object == gGameDialogSpeaker) {
             _gdialogUpdatePartyStatus();
         }
@@ -485,6 +497,18 @@ int _partyMemberPrepSave()
 
         if (index > 0) {
             ptr->object->flags &= ~(OBJECT_NO_REMOVE | OBJECT_NO_SAVE);
+            // ►► WARN WHILE IT IS STILL RECOVERABLE. Clearing NO_SAVE only gets this
+            // object written if it is part of the map body being saved; one sitting in
+            // limbo (tile -1) is in no save at all, and partyMembersLoad will delete it
+            // from the roster on the way back in (see the note there). Vanilla notices
+            // this one beat too late — at LOAD, when the object is already unreachable.
+            // Saying it at SAVE time is the difference between "go collect your car"
+            // and "your trunk and everything in it are gone".
+            if (ptr->object->tile == -1) {
+                fprintf(stderr, "f2_server: party member id=%d (proto index %d) is OFF-MAP"
+                                " at save — it will be dropped when this save is loaded\n",
+                    ptr->object->id, ptr->object->id - 18000);
+            }
         }
 
         Script* script;
@@ -745,6 +769,23 @@ int partyMembersLoad(File* stream)
                 gPartyMembers[index].object = object;
             } else {
                 debugPrint("Couldn't find party member on map...trying to load anyway.\n");
+                // ►► THIS IS SILENT DATA LOSS, AND IT MUST NOT BE. The id resolved
+                // against nothing on the loaded map, so the block below DROPS this
+                // member from the party for good — and if it was a CONTAINER (the
+                // Highwayman's trunk, pid 455) its contents go with it. That is the
+                // known vanilla "car trunk disappeared" bug: a party object must be on
+                // the map you save, because _partyMemberPrepSave clears its NO_SAVE
+                // only for the CURRENT map body; one stranded elsewhere is in no save
+                // at all, and this loop then deletes it from the roster.
+                //
+                // Vanilla's only complaint is the debugPrint above, which reaches
+                // nobody unless DEBUGACTIVE is set — so on a dedicated server the loss
+                // is completely invisible. Say it on stderr instead. partyMemberAdd
+                // stamps id = (pid & 0xFFFFFF) + 18000, so the id names the proto that
+                // just vanished: 18455 = the car trunk.
+                fprintf(stderr, "f2_server: party member id=%d (proto index %d) DROPPED"
+                                " — not on the loaded map; its inventory is lost\n",
+                    objectId, objectId - 18000);
                 if (index + 1 >= gPartyMembersLength) {
                     partyMemberObjectIds[index] = 0;
                 } else {
@@ -838,6 +879,19 @@ int _partyMemberRestingHeal(int a1)
         if (PID_TYPE(partyMember->object->pid) == OBJ_TYPE_CRITTER) {
             int healingRate = critterGetStat(partyMember->object, STAT_HEALING_RATE);
             critterAdjustHitPoints(partyMember->object, v1 * healingRate);
+        }
+    }
+
+    // Co-op: extra players are first-class actors, NOT gPartyMembers, so the loop
+    // above misses them. Rest heals ALL players (owner ruling 2026-07-24) — slot 0
+    // is gDude, already healed via the party list, so heal the other player actors
+    // on their own healing rate. SP (playerActorCount()==1) skips this entirely, so
+    // the behaviour and goldens are unchanged.
+    for (int slot = 1; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor != nullptr && PID_TYPE(actor->pid) == OBJ_TYPE_CRITTER) {
+            int healingRate = critterGetStat(actor, STAT_HEALING_RATE);
+            critterAdjustHitPoints(actor, v1 * healingRate);
         }
     }
 
@@ -1147,6 +1201,16 @@ int _getPartyMemberCount()
     }
 
     return count;
+}
+
+// True iff at least one companion has been recruited (index 0 is always gDude,
+// added at object.cc:322). Unlike _getPartyMemberCount this counts the RAW list —
+// a dead/hidden companion still counts, because its body is still an OBJECT_NO_SAVE
+// object that must ride the co-op join blob (mapSaveToStream's party bracket) so a
+// viewer can still see/loot it after a rebaseline.
+bool partyHasRecruitedMembers()
+{
+    return gPartyMembersLength > 1;
 }
 
 // 0x495070

@@ -40,6 +40,7 @@
 #include "queue.h"
 #include "random.h"
 #include "scripts.h"
+#include "client_net.h" // clientViewerActive — viewer skips the local map teardown
 #include "server_loop.h"
 #include "settings.h"
 #include "sfall_config.h"
@@ -60,6 +61,11 @@ namespace fallout {
 static void wmSetFlags(int* flagsPtr, int flag, int value);
 static int wmGenDataInit();
 static int wmGenDataReset();
+// Lock-on-demand size readers for worldmap art the CLIENT UI owns the lock on.
+// Declared up here because the two marker placements (car out of gas, special
+// encounter) sit well above the definitions.
+static void wmCitySizeDimensions(int citySize, int* widthPtr, int* heightPtr);
+static void wmHotspotDimensions(int* widthPtr, int* heightPtr);
 static int wmWorldMapSaveTempData();
 static int wmWorldMapLoadTempData();
 static int wmConfigInit();
@@ -2538,9 +2544,18 @@ void worldmapTravelStep(int worldX, int worldY)
 
                 CityInfo* city = &(wmAreaInfoList[CITY_CAR_OUT_OF_GAS]);
 
-                CitySizeDescription* citySizeDescription = &(wmSphereData[city->size]);
-                int worldmapX = wmGenData.worldPosX + wmGenData.hotspotNormalFrmImage.getWidth() / 2 + citySizeDescription->frmImage.getWidth() / 2;
-                int worldmapY = wmGenData.worldPosY + wmGenData.hotspotNormalFrmImage.getHeight() / 2 + citySizeDescription->frmImage.getHeight() / 2;
+                // Lock-on-demand: this runs on the DEDICATED SERVER (the travel
+                // driver's step), where the worldmap UI holds no art locks, so the
+                // raw getWidth()/getHeight() reads were 0 and the "ran out of gas"
+                // marker landed half a sprite off.
+                int sphereWidth;
+                int sphereHeight;
+                wmCitySizeDimensions(city->size, &sphereWidth, &sphereHeight);
+                int hotspotWidth;
+                int hotspotHeight;
+                wmHotspotDimensions(&hotspotWidth, &hotspotHeight);
+                int worldmapX = wmGenData.worldPosX + hotspotWidth / 2 + sphereWidth / 2;
+                int worldmapY = wmGenData.worldPosY + hotspotHeight / 2 + sphereHeight / 2;
                 wmAreaSetWorldPos(CITY_CAR_OUT_OF_GAS, worldmapX, worldmapY);
 
                 city->state = CITY_STATE_KNOWN;
@@ -2605,7 +2620,7 @@ bool worldmapTravelEncounterCheck()
     if (wmRndEncounterOccurred()) {
         if (wmGenData.encounterMapId != -1) {
             if (wmGenData.isInCar) {
-                wmMatchAreaContainingMapIdx(wmGenData.encounterMapId, &(wmGenData.currentCarAreaId));
+                wmCarParkAtMapArea(wmGenData.encounterMapId);
             }
         }
 
@@ -2636,6 +2651,53 @@ int wmCheckGameAreaEvents()
     }
 
     return 0;
+}
+
+// Co-op random-encounter prompt barrier (see worldmap.h). Mirrors the movie
+// barrier (game_movie_state.cc): the server emits EVENT_ENCOUNTER_PROMPT, then
+// spins the pump until the FIRST viewer answers (encaccept/encdecline drives
+// worldmapEncounterAnswer). Null pump = client / SP / golden / no viewers → the
+// caller falls back to its default (enter), so those paths never change.
+static std::function<bool()> gEncounterServerPump;
+static bool gEncounterAnswered = false;
+static bool gEncounterAccepted = false;
+
+void worldmapEncounterSetServerPump(std::function<bool()> pump)
+{
+    gEncounterServerPump = std::move(pump);
+}
+
+void worldmapEncounterAnswer(bool accept)
+{
+    // FIRST ANSWER WINS: later answers (another viewer, or a late decline from a
+    // dismissed prompt) are ignored — the flag is cleared before the next prompt.
+    if (gEncounterAnswered) {
+        return;
+    }
+    gEncounterAccepted = accept;
+    gEncounterAnswered = true;
+}
+
+// Returns the player's choice for a detected encounter. Emits the prompt and
+// block-and-pumps for the first answer; on bail (no viewers / quit) defaults to
+// entering, matching the pre-stream dedicated-server behavior. Always dismisses
+// any other viewer still showing the prompt on release.
+static bool wmEncounterPromptBarrier(const char* title, const char* body)
+{
+    if (gEncounterServerPump == nullptr) {
+        return true; // no viewers to prompt (probe / bare server) → enter
+    }
+    presenter()->encounterPrompt(title, body);
+    gEncounterAnswered = false;
+    bool bailed = false;
+    while (!gEncounterAnswered) {
+        if (!gEncounterServerPump()) {
+            bailed = true;
+            break;
+        }
+    }
+    presenter()->encounterClose(); // break other viewers out of their prompt box
+    return bailed ? true : gEncounterAccepted;
 }
 
 // 0x4C0634
@@ -2678,7 +2740,7 @@ static int wmRndEncounterOccurred()
             wmGenData.encounterMapId = -1;
             wmGenData.didMeetFrankHorrigan = true;
             if (wmGenData.isInCar) {
-                wmMatchAreaContainingMapIdx(MAP_IN_GAME_MOVIE1, &(wmGenData.currentCarAreaId));
+                wmCarParkAtMapArea(MAP_IN_GAME_MOVIE1);
             }
 
             if (!serverLoopActive()) {
@@ -2696,7 +2758,7 @@ static int wmRndEncounterOccurred()
     if (wmForceEncounterMapId != -1) {
         if ((wmForceEncounterFlags & ENCOUNTER_FLAG_NO_CAR) != 0) {
             if (wmGenData.isInCar) {
-                wmMatchAreaContainingMapIdx(wmForceEncounterMapId, &(wmGenData.currentCarAreaId));
+                wmCarParkAtMapArea(wmForceEncounterMapId);
             }
         }
 
@@ -2757,9 +2819,18 @@ static int wmRndEncounterOccurred()
         wmMatchAreaContainingMapIdx(wmGenData.encounterMapId, &areaIdx);
 
         CityInfo* city = &(wmAreaInfoList[areaIdx]);
-        CitySizeDescription* citySizeDescription = &(wmSphereData[city->size]);
-        int worldmapX = wmGenData.worldPosX + wmGenData.hotspotNormalFrmImage.getWidth() / 2 + citySizeDescription->frmImage.getWidth() / 2;
-        int worldmapY = wmGenData.worldPosY + wmGenData.hotspotNormalFrmImage.getHeight() / 2 + citySizeDescription->frmImage.getHeight() / 2;
+        // Same lock-on-demand reason as the out-of-gas placement above: the
+        // encounter check runs server-side with no worldmap UI, so reading these
+        // sizes straight gave 0 and put the special-encounter marker in the wrong
+        // spot on the map every player then sees.
+        int sphereWidth;
+        int sphereHeight;
+        wmCitySizeDimensions(city->size, &sphereWidth, &sphereHeight);
+        int hotspotWidth;
+        int hotspotHeight;
+        wmHotspotDimensions(&hotspotWidth, &hotspotHeight);
+        int worldmapX = wmGenData.worldPosX + hotspotWidth / 2 + sphereWidth / 2;
+        int worldmapY = wmGenData.worldPosY + hotspotHeight / 2 + sphereHeight / 2;
         wmAreaSetWorldPos(areaIdx, worldmapX, worldmapY);
 
         if (areaIdx >= 0 && areaIdx < wmMaxAreaNum) {
@@ -2842,7 +2913,18 @@ static int wmRndEncounterOccurred()
 
         title = getmsg(&wmMsgFile, &messageListItem, 2999);
         body = getmsg(&wmMsgFile, &messageListItem, 3000 + 50 * wmGenData.encounterTableId + wmGenData.encounterEntryId);
-        if (showDialogBox(title, &body, 1, 169, 116, _colorTable[32328], nullptr, _colorTable[32328], DIALOG_BOX_LARGE | DIALOG_BOX_YES_NO) == 0) {
+        // The accept/decline prompt is client UI — showDialogBox aborts on the
+        // core-only server. On the dedicated server STREAM it to the viewer(s) and
+        // block-and-pump for the first answer (first-answer-wins), mirroring the
+        // dialog/movie barriers; no viewers → the barrier defaults to entering.
+        // Single-player / golden take the unchanged showDialogBox path.
+        bool enter = true;
+        if (serverDedicatedActive()) {
+            enter = wmEncounterPromptBarrier(title, body);
+        } else {
+            enter = showDialogBox(title, &body, 1, 169, 116, _colorTable[32328], nullptr, _colorTable[32328], DIALOG_BOX_LARGE | DIALOG_BOX_YES_NO) != 0;
+        }
+        if (!enter) {
             wmGenData.encounterIconIsVisible = false;
             wmGenData.encounterMapId = -1;
             wmGenData.encounterTableId = -1;
@@ -3728,6 +3810,17 @@ static void wmPartyWalkingStep()
 // map -> worldmap transition. Save & unload the active map...
 void wmTransitionSaveMap()
 {
+    // On a VIEWER the world is server-authoritative and gets torn down + rebuilt by
+    // the next rebaseline blob (applyBlob → mapLoad → _obj_remove_all). Running the
+    // vanilla local save here would _obj_remove_all NOW and free the client's
+    // player-actor objects — which lack OBJECT_NO_REMOVE on the viewer (stripped by
+    // _obj_load_player_actor so extras die on rebaseline) — leaving gDude and glide
+    // refs dangling → heap-use-after-free at the next interface paint
+    // (wmInterfaceExit → critterGetItem1(gDude)) and in advanceGlides. The server
+    // and single-player still save normally (their actors carry NO_REMOVE).
+    if (clientViewerActive()) {
+        return;
+    }
     _map_save_in_game(true);
 }
 
@@ -3928,6 +4021,27 @@ static void wmCitySizeDimensions(int citySize, int* widthPtr, int* heightPtr)
 
     if (!wasLocked) {
         citySizeDescription->frmImage.unlock();
+    }
+}
+
+// Same class, same fix, for the town-map SELECTOR art (hotspot1.frm): locked by
+// wmInterfaceInit / unlocked by wmInterfaceExit, both client-only, so a sim path
+// that reads its size outside an open worldmap screen gets 0. The two callers are
+// the marker placements below (car-out-of-gas, special encounter) — both run on the
+// dedicated server, where they were writing a marker position half a sprite off.
+// Keep the fid in sync with wmInterfaceInit (worldmap_ui.cc).
+static void wmHotspotDimensions(int* widthPtr, int* heightPtr)
+{
+    bool wasLocked = wmGenData.hotspotNormalFrmImage.isLocked();
+    if (!wasLocked) {
+        wmGenData.hotspotNormalFrmImage.lock(buildFid(OBJ_TYPE_INTERFACE, 168, 0, 0, 0));
+    }
+
+    *widthPtr = wmGenData.hotspotNormalFrmImage.getWidth();
+    *heightPtr = wmGenData.hotspotNormalFrmImage.getHeight();
+
+    if (!wasLocked) {
+        wmGenData.hotspotNormalFrmImage.unlock();
     }
 }
 
@@ -4425,6 +4539,57 @@ int wmSetMapMusic(int mapIdx, const char* name)
 }
 
 // 0x4C59A4
+// Park the car at whatever worldmap AREA owns `mapIdx`, and leave it where it is
+// when no area owns that map.
+//
+// ►►►► THIS IS THE FIX FOR THE VANILLA "CAR DISAPPEARED" BUG, and it is the whole
+// bug. wmMatchAreaContainingMapIdx below writes 0 into its out-param BEFORE it
+// searches, and returns -1 without clearing it on a miss. Every car-parking caller
+// (random encounter, Horrigan cutscene, forced encounter, entering the wilderness)
+// ignored that -1 and wrote the result straight into currentCarAreaId. Random
+// encounter tiles and cutscene maps are in NO area's entrance list — so a miss
+// silently reassigned the car to area 0, which is CITY_ARROYO.
+//
+// Consequence, and it matches the owner's live report exactly: have one random
+// encounter while driving, and the game believes the Highwayman is parked in Arroyo.
+// No other town's script then places the car OR its trunk (they key on
+// car_current_town / METARULE_CAR_CURRENT_TOWN), so the car is simply gone
+// everywhere you go, permanently. The trunk is a party member, so the next save+load
+// also DELETES it from the roster with its contents (party_member.cc partyMembersLoad).
+//
+// Deliberate divergence from vanilla, and an unambiguous one: writing a failed
+// lookup's default into persistent state is a defect, not a design. Leaving the car
+// parked where it already was is what every caller here actually means.
+void wmCarParkAtMapArea(int mapIdx)
+{
+    int areaIdx;
+    if (wmMatchAreaContainingMapIdx(mapIdx, &areaIdx) == 0) {
+        wmGenData.currentCarAreaId = areaIdx;
+    }
+}
+
+// SFALL (CarPlacedTileFix, on by default there): clear GVAR_CAR_PLACED_TILE when the
+// worldmap opens. The car-placement SCRIPTS use that gvar to remember the tile they
+// last put the car on; left stale from the map you just left, they decline to place it
+// on the next one — "the car is lost when entering a location via the Town/World button
+// and then leaving on foot". sfall hooks wmInterfaceInit for this; we do it at both
+// worldmap entries (the server driver, and wmWorldMapFunc for solo) because on a
+// dedicated server the UI is on a different machine from the gvars.
+//
+// A SECOND, INDEPENDENT car-loss bug from the wmCarParkAtMapArea one above: that fix
+// stops the ENGINE mis-parking the car, this one stops the SCRIPTS refusing to place
+// it. Both are needed, and vanilla + upstream fallout2-ce carry neither (the gvar is
+// declared in game_vars.h and never touched by our engine).
+void wmCarClearPlacedTile()
+{
+    // Authoritative sim only. A viewer's gvars are a stale mirror it never owns, and
+    // writing there just invites a divergence the next rebaseline has to undo.
+    if (clientViewerActive()) {
+        return;
+    }
+    gameSetGlobalVar(GVAR_CAR_PLACED_TILE, -1);
+}
+
 int wmMatchAreaContainingMapIdx(int mapIdx, int* areaIdxPtr)
 {
     *areaIdxPtr = 0;

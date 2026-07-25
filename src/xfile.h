@@ -14,6 +14,10 @@ typedef enum XFileType {
     XFILE_TYPE_FILE,
     XFILE_TYPE_DFILE,
     XFILE_TYPE_GZFILE,
+    // Read-only, RAM-backed stream (no disk). Used for the co-op join/rebaseline
+    // blob so several viewers on one machine never share a scratch file. Portable
+    // (plain buffer + cursor), unlike fmemopen which is POSIX-only.
+    XFILE_TYPE_MEMORY,
 } XFileType;
 
 // A universal database of files.
@@ -41,6 +45,10 @@ typedef struct XFile {
         DFile* dfile;
         gzFile gzfile;
     };
+    // XFILE_TYPE_MEMORY only: an owned copy of the bytes plus a read cursor.
+    unsigned char* memoryBuffer;
+    long memorySize;
+    long memoryPosition;
 } XFile;
 
 typedef struct XList {
@@ -50,6 +58,8 @@ typedef struct XList {
 
 int xfileClose(XFile* stream);
 XFile* xfileOpen(const char* filename, const char* mode);
+// Open a READ-ONLY stream over an in-memory copy of [data]. No disk, no path.
+XFile* xfileOpenMemory(const void* data, size_t size);
 int xfilePrintFormatted(XFile* xfile, const char* format, ...);
 int xfilePrintFormattedArgs(XFile* stream, const char* format, va_list args);
 int xfileReadChar(XFile* stream);

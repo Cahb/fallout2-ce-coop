@@ -219,6 +219,7 @@ printf 'give 41 1\ndrop 41\n'              | nc -q1 127.0.0.1 9201
 | `spawn <pid> [n] [tile]` | place n critters of pid (default 1, random tile) |
 | `stress <n> [pid] [seed]` | spawn n hostiles near the players and aggro them (default pid `0x010000EE` = Raider; seed is printed — reuse to replay) |
 | `despawnall` | destroy everything `spawn`/`stress` created |
+| `revive <slot>` | bring a dead player actor (0 = host, 1.. = extras) back at 1 HP; no-op if that slot is empty or not dead |
 | `help` / `?` | list verbs + channels |
 | `quit` / `shutdown` | stop the server |
 

@@ -36,9 +36,10 @@
 # with the slot. CREATE0 is the first viewer, not CREATE1.
 #
 # Slots are handed out on a FIRST-COME basis, and with an interactive CREATE<n>=ask
-# that means whoever finishes rolling first takes slot 0 — the host body, which
-# worldmap travel and the other host-only screens are gated on. HOST=<name> pins
-# slot 0 to that account instead, so "who can drive the map" stops being a race:
+# that means whoever finishes rolling first takes slot 0 — the host body, which the
+# remaining host-only screen (dialog) is gated on. Worldmap travel and map
+# transitions are open to every player as of 2026-07-23. HOST=<name> pins slot 0 to
+# that account instead, so "who is the host" stops being a race:
 #   HOST=Cahb NAMES="Cahb,Mennoc" CREATE0=ask CREATE1=ask VIEWERS=2 ...
 #
 # Example — two players, each their own character, no player count anywhere:

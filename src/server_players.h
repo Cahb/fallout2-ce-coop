@@ -153,6 +153,52 @@ private:
     bool _engaged;
 };
 
+// ---- Per-actor ACTION GATE + active hand (feature A) ------------------------
+//
+// Vanilla rate-limits a player's actions by BLOCKING the game loop on each action's
+// animation (a weapon holster/ready, a door ceremony). The authoritative server must
+// never block — one slow actor would freeze the whole sim — so it reproduces the
+// EFFECT with a non-blocking per-actor "busy-until" WALL-CLOCK timestamp: starting a
+// recorded action marks only that actor busy for the animation's duration. The state
+// is enforced two ways from one mark (out of combat the verb layer REJECTS the actor's
+// next mutating verb; in combat the intent drain DEFERS it — server_control.cc /
+// combat_drain.cc), and is consulted here because both enforcement sites and the mark
+// site (presenter_network.cc presSeq) live in different TUs but all reach f2_core.
+//
+// It is SERVER-side, transient state: never persisted, never on an Object, never on
+// the wire, and marked only on the true dedicated server. With one player actor there
+// is never a second actor to overlap, and the headless golden probe never marks (it is
+// not serverDedicatedActive()), so single-player and every golden stay byte-identical.
+
+// Mark `slot` busy for `durMs` wall-clock ms (getTicks). `what` is a short label for
+// the trace. durMs <= 0 is a no-op. Self-expiring — no clear call is required.
+void serverActorBusyMark(int slot, int durMs, const char* what);
+
+// Resolve `actorNetId` to its registry slot and mark it busy (the presSeq hook only
+// has the acting object's netId). A netId that is not a player actor is ignored.
+void serverActorBusyMarkByNetId(int actorNetId, int durMs);
+
+// True while `slot`'s busy window has not yet elapsed (timestamp compare — self-
+// expiring, wrap-safe). False for an unmarked or out-of-range slot.
+bool serverActorBusyIs(int slot);
+
+// Drop every actor's busy window. Called at combat enter/exit and map transition,
+// where the animation a window was gating no longer exists (presentation is flushed).
+void serverActorBusyClearAll();
+
+// The registry slot's ACTIVE weapon hand (HAND_LEFT / HAND_RIGHT, inventory.h). The
+// DEFAULT is HAND_RIGHT for every slot, which preserves serverDudeHitMode's original
+// right-hand-first selection (combat_drain.cc) → byte-identical for a dude who never
+// swaps. Out-of-range slots read the default. Set by the `hand` verb.
+int serverActorActiveHand(int slot);
+void serverActorSetActiveHand(int slot, int hand);
+
+// Master enable for the GATE ENFORCEMENT (reject + defer) only — the `hand` verb, the
+// recording and the cost helper are inert-to-existing-behavior regardless. Default ON;
+// set env F2_SERVER_ACTION_GATE=0 to disable (the escape hatch if a wire gate probe
+// trips the busy window). Read once.
+bool serverActionGateEnabled();
+
 // The "player" a script should see (MP_PROPOSAL.md Ch 10.4, owner ruling
 // 2026-07-19: O2+O3 together). This is what `dude_obj` resolves to — every
 // script's answer to "where is the player / how far / is he sneaking".

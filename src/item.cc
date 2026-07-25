@@ -1636,7 +1636,7 @@ int weaponGetRange(Object* critter, int hitMode)
         }
 
         if (weaponGetAttackTypeForHitMode(weapon, hitMode) == ATTACK_TYPE_THROW) {
-            if (critter == gDude) {
+            if (playerActorIs(critter)) {
                 effectiveStrength = critterGetStat(critter, STAT_STRENGTH) + 2 * perkGetRank(critter, PERK_HEAVE_HO);
 
                 // SFALL: Fix for Heave Ho! increasing effective strength above
@@ -2697,8 +2697,8 @@ static void _perform_drug_effect(Object* critter, int* stats, int* mods, bool is
 
         oldStatBonus = critterGetBonusStat(critter, stat);
 
-        int before = (critter == gDude)
-            ? critterGetStat(gDude, stat)
+        int before = playerActorIs(critter)
+            ? critterGetStat(critter, stat)
             : 0;
 
         if (firstStatIsMinimum) {
@@ -2721,7 +2721,12 @@ static void _perform_drug_effect(Object* critter, int* stats, int* mods, bool is
 
         critterSetBonusStat(critter, stat, statBonus);
 
-        if (critter == gDude) {
+        // playerActorIs, not == gDude: an EXTRA gets its own stat feedback, and the
+        // DELAYED restore (item.cc drugEffectEventProcess) fires OUTSIDE any
+        // ServerActorScope — there gDude is the host, so == gDude would silently
+        // drop an extra's restore message. Route the line to the acting actor's own
+        // viewer via consoleMessageFor(netId) (degrades to consoleMessage locally).
+        if (playerActorIs(critter)) {
             if (stat == STAT_CURRENT_HIT_POINTS) {
                 presenter()->hudHitPoints(true);
             }
@@ -2734,7 +2739,7 @@ static void _perform_drug_effect(Object* critter, int* stats, int* mods, bool is
                 if (messageListGetItem(&gItemsMessageList, &messageListItem)) {
                     char* statName = statGetName(stat);
                     snprintf(msgBuf, sizeof(msgBuf), messageListItem.text, after < before ? before - after : after - before, statName);
-                    presenter()->consoleMessage(msgBuf);
+                    presenter()->consoleMessageFor(critter->netId, msgBuf);
                     statsChanged = true;
                 }
             }
@@ -4229,20 +4234,25 @@ bool explosiveSetDamage(int pid, int minDamage, int maxDamage)
 
 bool explosiveGetDamage(int pid, int* minDamagePtr, int* maxDamagePtr)
 {
-    if (pid == PROTO_ID_DYNAMITE_I) {
+    // Match BOTH the unarmed (_I) and the ARMED (_II) pid. explosiveActivate swaps an
+    // explosive to its _II pid when armed, so a DETONATING charge always carries the
+    // _II form — recognizing only _I meant this returned false for every real
+    // explosion, and the caller then blasted with uninitialized damage (the upstream
+    // "2 million / 18 damage" UB). Same base damage armed or not.
+    if (pid == PROTO_ID_DYNAMITE_I || pid == PROTO_ID_DYNAMITE_II) {
         *minDamagePtr = gDynamiteMinDamage;
         *maxDamagePtr = gDynamiteMaxDamage;
         return true;
     }
 
-    if (pid == PROTO_ID_PLASTIC_EXPLOSIVES_I) {
+    if (pid == PROTO_ID_PLASTIC_EXPLOSIVES_I || pid == PROTO_ID_PLASTIC_EXPLOSIVES_II) {
         *minDamagePtr = gPlasticExplosiveMinDamage;
         *maxDamagePtr = gPlasticExplosiveMaxDamage;
         return true;
     }
 
     for (const auto& explosive : gExplosives) {
-        if (explosive.pid == pid) {
+        if (explosive.pid == pid || explosive.activePid == pid) {
             *minDamagePtr = explosive.minDamage;
             *maxDamagePtr = explosive.maxDamage;
             return true;

@@ -265,3 +265,57 @@ took spec fixes (max-not-sum, action-frame commit, masked-flags + frame) but no 
 `[[presentation-backpressure-gap]]`, item AA/J/K/S/X in `drafts/COOP_LIVEPLAY_BUGS_2026-07-21.md`,
 `PRESENTATION_RECORD_REPLAY_SPEC.md`, `COMBAT_MOVE_RECORD_DESIGN.md`, `src/pres_record.h`,
 `APPLYBLOB_TEARDOWN_PLAN.md` (the transition/rebaseline seam §6.5 leans on).
+
+## 11. Per-actor action gate (feature A, SHIPPED) + pickup/outcome sync (B, designed)
+
+### A — SHIPPED @0c2c0c8 (2026-07-24, check.sh green, LIVE-VERIFY OWED)
+Reproduces vanilla's animation-blocked action pacing without ever blocking the authoritative
+single-thread sim. Per-actor **wall-clock busy window** (`serverActorBusyMark/Is`,
+`server_players.{h,cc}` — self-expiring, clamped [100,3000]ms, never persisted/on-Object/on-wire).
+Enforced two ways from ONE state: **out of combat REJECT** at the verb choke point
+(`server_control.cc`, rate-limited refusal, meta verbs bypass, `!isInCombat()` only); **in combat
+DEFER** in the intent drain (`combat_drain.cc`, `END_TURN`/`END_COMBAT` bypass — no barrier
+deadlock). Duration = **`presRecordCostMs()`** (`pres_record.cc` — per-owner-lane anim cycles, MAX
+across lanes; also feeds the once-stubbed outbox `_frameSeqCostMs`). Pilot consumer = **`hand <0|1>`**
+verb (per-actor active hand + recorded put-away/take-out; 0 AP; `serverDudeHitMode` reads active
+hand, default RIGHT → byte-identical). Client 'B' input-blocks the initiating viewer only, reverts on
+refusal. Golden-safe: busy marked only on `serverDedicatedActive()`. Kill switch `F2_SERVER_ACTION_GATE=0`.
+►► LIVE-VERIFY: weapon-switch plays an animation; spam (door/lockpick/hand) is rate-limited; `mv`
+doesn't storm refusals; a non-host advanced-unarmed move works (also validates per-actor sheet).
+
+### B — pickup / outcome-delta sync (DESIGNED 2026-07-24, NOT built; builds on A's cost helper)
+Bug: "item disappears before the pickup animation finishes." Grounded findings:
+- The co-op client does **NOT predict movement** (`main.cc:1165/1619/1642` — server-authoritative
+  glide owns the sprite) → **no warp/reconcile needed**; a losing peer never runs ahead.
+- The cancel-push **already exists** (`interactionCannotGetThere`, `server_control.cc:358`).
+- Pickup **reparents** the item (`_obj_pickup`) → the loser's `PendingInteraction` can't satisfy →
+  drops → cancel-push. Server race resolution is complete + authoritative.
+- The gesture **IS** streamed out of combat (`interactionEmitGesture`, `server_control.cc:597`, on
+  arrival at :859) — right before `interactionFire` (:860) the same beat.
+- ROOT: the gesture presSeq replays over frames but the **item-removed lifecycle delta applies
+  immediately** on the viewer → item pops at gesture-START not gesture-END. Pure emission ordering,
+  no race, **no lock**.
+►► **OUTBOX `costMs` APPROACH IS INFEASIBLE** (build-agent verified 2026-07-24 — my earlier "release
+the delta via the outbox slot" was structurally WRONG; corrected here). Four reasons: (1) the outbox
+paces at FRAME granularity — `costMs` defers frame N+1, not content within a frame, and the gesture
+presSeq + the item DISCONNECT are emitted the SAME beat → same frame (`server_control.cc` erase→emitGesture
+→fire); (2) `costMs` is combat-only (`presenter_network.cc:1318`); (3) outbox pacing off by default
+(`F2_SERVER_OUTBOX_PACE`, `server_net.cc:44`); (4) the per-client outbox is a strict FIFO — deferring one
+frame delays ALL behind it (forbidden). AND the removal is `EVENT_DISCONNECT`, emitted **synchronously**
+from vanilla-shared `_obj_pickup`→`_obj_disconnect` (not scan-derived), applied **immediately at client
+decode** (`client_net.cc:1575`), while the gesture rides `_presQueue` drained behind the actor's
+`animationIsBusy` (`client_net.cc:571`). **That decouple IS the bug.**
+►► **REAL SEAM = the RECEIVE side** (per-viewer + RTT-correct by construction): route the pickup DISCONNECT
+through the client's existing `_presQueue`, tagged with the gesture actor's netId, so it drains behind that
+actor's gesture via the already-present `animationIsBusy` gate. Needs a wire link actor↔item. **Variant (a),
+recommended:** new `EVENT_DISCONNECT_AFTER_GESTURE{itemNetId, actorNetId}`, emitted dedicated-path only —
+NO `kPresStreamVersion` bump, existing DISCONNECT bytes unchanged, unknown-event skip-safe on client +
+netstream decoders. Variant (b): append `afterActorNetId` to `EVENT_DISCONNECT` (touches shared bytes,
+bumps version 4→5). Server: `interactionFire` stamps the gesture actor `interactionEmitGesture` just
+recorded. **This is a design-class protocol addition — PENDING owner green-light before building.**
+►► **SHIPPED @3a198e9: the message branch** — "Someone grabbed it." to the contested-pickup loser at the
+target-gone drop (`kInteractGet` + `objectFindByNetId`→null, since the winner's `_obj_pickup` reparented
+the item out of the world tile list). Was a silent drop. Golden-safe (dedicated-only, `consoleMessageFor`
+no-op on null presenter); check.sh green, no gate moved.
+Owner steer: co-op players are an SP-style party ([[coop-group-effects-like-party]]); this is presentation
+consistency for the N parallel peers, NOT server integrity (authoritative FIFO, solved).

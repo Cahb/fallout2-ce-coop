@@ -3,6 +3,8 @@
 
 namespace fallout {
 
+struct Object;
+
 // Per-beat object field-delta tracker (MP_PROTOCOL.md §6.2, P5-B). The fieldwise
 // object state that has no clean per-call mutation choke point — fid, rotation,
 // flags, and the critter scalars hp/radiation/poison/AP/combat-results — is
@@ -33,6 +35,15 @@ void objectDeltaReset();
 // object, then advance the shadow. Called at the end of each server beat
 // (serverTick). Auto-rebaselines silently on a detected map change.
 void objectDeltaScan();
+
+// Tell the next objectDeltaScan NOT to emit OBJECT_DELTA_FRAME for this object: a
+// presentation path (door/container open/close via presSeq/doorState) ALREADY streams
+// the frame change as an animated slide, so also sending it as a frame delta would snap
+// the viewer past the slide. Syncs the object's shadow frame to its current value, so
+// the beat's diff sees no change. Call it AFTER the new frame is set, from the present
+// path only — a SCRIPT-driven frame swap (op_anim: graves, levers) does NOT call this,
+// so its frame still streams (that path has no other channel).
+void objectDeltaNotePresentedFrame(Object* obj);
 
 } // namespace fallout
 

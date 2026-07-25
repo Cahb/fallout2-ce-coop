@@ -1,13 +1,13 @@
 ---
 name: item-pid-glossary
-description: "ITEM_GLOSSARY.md = PID decoder (531 item protos); PID==items.lst line index, name=msg{PID*100}"
+description: "docs/ITEM_GLOSSARY.md = PID decoder (531 item protos); PID==items.lst line index, name=msg{PID*100}"
 metadata: 
   node_type: memory
   type: reference
   originSessionId: 7b9f5982-a111-4da9-9744-2d678fb46707
 ---
 
-ITEM_GLOSSARY.md (repo root) is the item analog of [[dialog-headless-plan]]'s sibling MAP_GLOSSARY.md — a PID→name/description decoder for the 531 item protos, grouped by item type (Weapon/Ammo/Armor/Drug/Container/Key/Misc). Useful when a raw PID shows up on the wire, in saves, or in code.
+docs/ITEM_GLOSSARY.md (repo root) is the item analog of [[dialog-headless-plan]]'s sibling docs/MAP_GLOSSARY.md — a PID→name/description decoder for the 531 item protos, grouped by item type (Weapon/Ammo/Armor/Drug/Container/Key/Misc). Useful when a raw PID shows up on the wire, in saves, or in code.
 
 **Authoritative mapping (verified across all 531, zero mismatch):**
 - Item protos live inside `FO2/master.dat` (loose `proto/items/` is empty). Extract via DAT2 reader: footer `<I` at [-8:-4]=treeSize, tree at `len-treeSize-8`; per entry = nameLen(4)+name+comp(1)+realSize(4)+packedSize(4)+offset(4); comp==1 → zlib. `.pro` headers are BIG-endian.

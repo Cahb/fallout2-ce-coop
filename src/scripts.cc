@@ -21,7 +21,7 @@
 #include "game_mouse.h"
 #include "game_movie.h"
 #include "input.h"
-#include "map.h" // mapSetTransitionSuppressed — host-only transitions (Ch 14.2)
+#include "map.h" // mapSetTransitionSuppressed — transit-authority choke (Ch 14.2; open to all as of 2026-07-23, plumbing kept for future multi-map policy)
 #include "memory.h"
 #include "message.h"
 #include "object.h"
@@ -443,7 +443,16 @@ int gameTimeEventProcess(Object* obj, void* data)
         _scriptsCheckGameEvents(&movie_index, -1);
     }
 
-    stopProcess = _critter_check_rads(gDude);
+    // Co-op: radiation is per-actor, so drive the rad check for every player, not
+    // just the host. SP (playerActorCount()==1, slot 0 == gDude) runs exactly the
+    // one original call, byte-identical. _critter_check_rads returns 0 on every
+    // path, so stopProcess is unaffected either way.
+    for (int slot = 0; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor != nullptr) {
+            stopProcess = _critter_check_rads(actor);
+        }
+    }
 
     _queue_clear_type(4, nullptr);
 
@@ -726,6 +735,17 @@ static void _doBkProcesses()
 // 0x4A3CA0
 static void _script_chk_critters()
 {
+    // F2_TRACE_AGGRO: out-of-combat aggro cadence. This is a ROUND-ROBIN — one
+    // critter's critter_p_proc per background tick — and it is skipped wholesale
+    // while any player is in dialog or in combat. In co-op both are global, so a
+    // suppressed tick means NO wild critter perceives ANY player this beat. The
+    // fire line reports the cycle length (scriptsCount) = the dilution factor
+    // that decides how often a given ant gets to poll perception at all.
+    if (getenv("F2_TRACE_AGGRO") != nullptr && (_gdialogActive() || isInCombat())) {
+        fprintf(stderr, "[aggro] heartbeat SUPPRESSED: gdialog=%d inCombat=%d (no critter perceives players this tick)\n",
+            _gdialogActive() ? 1 : 0, isInCombat() ? 1 : 0);
+    }
+
     if (!_gdialogActive() && !isInCombat()) {
         ScriptList* scriptList;
         ScriptListExtent* scriptListExtent;
@@ -758,6 +778,10 @@ static void _script_chk_critters()
 
             if (scriptListExtent != nullptr) {
                 Script* script = &(scriptListExtent->scripts[scriptIndex]);
+                if (getenv("F2_TRACE_AGGRO") != nullptr) {
+                    fprintf(stderr, "[aggro] heartbeat tick: firing sid=%d (%d/%d critters this cycle)\n",
+                        script->sid, _count_, scriptsCount);
+                }
                 scriptExecProc(script->sid, proc);
             }
         }

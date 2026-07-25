@@ -40,7 +40,18 @@ typedef enum OutlineType {
     OUTLINE_TYPE_FRIENDLY = 8,
     OUTLINE_TYPE_ITEM = 16,
     OUTLINE_TYPE_32 = 32,
+    // Co-op "highlight lootables" overlay (loot_highlight.cc). Dedicated,
+    // color-coded types so the overlay never collides with the mouse-hover item
+    // outline (OUTLINE_TYPE_ITEM) or combat outlines when set/cleared as a batch.
+    // One bit each so OUTLINE_LOOT_MASK can test "is one of ours" cheaply.
+    OUTLINE_TYPE_LOOT_ITEM = 64, // loose ground item — yellow
+    OUTLINE_TYPE_LOOT_CORPSE = 128, // dead critter — orange
+    OUTLINE_TYPE_LOOT_CONTAINER = 256, // container (locker/safe/bag) — cyan
+    OUTLINE_TYPE_LOOT_DOOR = 512, // door / stairs / ladder / elevator — green
 } OutlineType;
+
+// Set of outline types owned by the highlight-lootables overlay.
+#define OUTLINE_LOOT_MASK (OUTLINE_TYPE_LOOT_ITEM | OUTLINE_TYPE_LOOT_CORPSE | OUTLINE_TYPE_LOOT_CONTAINER | OUTLINE_TYPE_LOOT_DOOR)
 
 typedef enum ObjectFlags {
     OBJECT_HIDDEN = 0x01,

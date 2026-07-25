@@ -148,6 +148,11 @@ File* fileOpen(const char* filename, const char* mode)
     return xfileOpen(filename, mode);
 }
 
+File* fileOpenMemory(const void* data, size_t size)
+{
+    return xfileOpenMemory(data, size);
+}
+
 // 0x4C5ED0
 int filePrintFormatted(File* stream, const char* format, ...)
 {

@@ -1,6 +1,8 @@
 #ifndef WORLD_MAP_H
 #define WORLD_MAP_H
 
+#include <functional>
+
 #include "db.h"
 
 namespace fallout {
@@ -22,6 +24,14 @@ typedef enum CityState {
     CITY_STATE_VISITED,
     CITY_STATE_INVISIBLE = -66,
 } CityState;
+
+// Co-op random-encounter accept/decline prompt (dedicated server). The server
+// streams EVENT_ENCOUNTER_PROMPT and block-and-pumps this seam for the first
+// viewer's answer (first-answer-wins), mirroring the movie barrier. Null pump
+// (SP / no viewers) → the caller keeps its default. worldmapEncounterAnswer is
+// driven by the encaccept/encdecline control verbs.
+void worldmapEncounterSetServerPump(std::function<bool()> pump);
+void worldmapEncounterAnswer(bool accept);
 
 typedef enum City {
     CITY_ARROYO,
@@ -292,6 +302,18 @@ int wmSfxIdxName(int sfxIdx, char** namePtr);
 int wmMapMusicStart();
 int wmSetMapMusic(int mapIdx, const char* name);
 int wmMatchAreaContainingMapIdx(int mapIdx, int* areaIdxPtr);
+
+// Park the car at the area owning `mapIdx`, or leave it parked where it is when no
+// area owns that map. ►► USE THIS, never wmMatchAreaContainingMapIdx directly, to
+// write currentCarAreaId: a failed lookup leaves 0 (= CITY_ARROYO) in the out-param,
+// which is the vanilla "car disappeared after a random encounter" bug. See the
+// definition for the full chain (it takes the trunk's contents with it).
+void wmCarParkAtMapArea(int mapIdx);
+
+// SFALL CarPlacedTileFix: clear GVAR_CAR_PLACED_TILE on worldmap entry so the car
+// placement scripts do not skip placing the car on the next map. Call from every
+// worldmap entry; no-ops on a viewer (it does not own gvars).
+void wmCarClearPlacedTile();
 int wmTeleportToArea(int areaIdx);
 
 void wmSetPartyWorldPos(int x, int y);

@@ -145,6 +145,11 @@ void clientViewerCommitAttack(Object* target, int hitMode, int hitLocation);
 // freeze combat input for the round-trip timeout.
 bool clientViewerTakeAttackCommitted();
 
+// Return (and clear) whether the server streamed a REFUSAL addressed to this actor
+// since the last poll (feature A). The out-of-combat input block uses it to revert an
+// optimistic local hand flip the server rejected as busy (main.cc).
+bool clientViewerTakeRefusal();
+
 // Dude inventory verbs (player-UI Slice 3b). The inventory screen reroutes its
 // drag-drop / ctx-menu DROP resolution through these instead of mutating the local
 // mirror — the server runs the authoritative _inven_wield/_inven_unwield/
@@ -153,12 +158,14 @@ bool clientViewerTakeAttackCommitted();
 // no connection is registered.
 void clientViewerWield(Object* item, int hand);
 void clientViewerUnwield(int hand);
-void clientViewerDrop(Object* item);
+void clientViewerDrop(Object* item, int quantity);
+void clientViewerUnload(Object* item);
 
 // Tell the server this viewer is done with the movie it was shown (finished or
 // skipped). The server's movie barrier releases on the FIRST ack it gets, so this
 // ends the cutscene for the whole room by design (game_movie.h).
 void clientViewerMovieAck();
+void clientViewerEncounterAnswer(bool accept);
 void clientViewerUseItem(int pid);
 void clientViewerUseItemOn(int targetNetId, int pid);
 void clientViewerArmExplosive(int pid, int seconds);

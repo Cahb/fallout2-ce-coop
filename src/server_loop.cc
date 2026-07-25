@@ -18,6 +18,7 @@
 #include "invariants.h"
 #include "map.h"
 #include "object_delta.h"
+#include "player_sheet.h"
 #include "presenter.h"
 #include "presenter_narrate.h"
 #include "presenter_network.h"
@@ -27,6 +28,7 @@
 #include "sim_clock.h"
 #include "worldmap.h" // wmMapMusicStart — baseline music re-announce
 #include "object.h"
+#include "party_member.h" // objectIsPartyMember — companions ride the baseline (§C domain)
 
 namespace fallout {
 
@@ -339,8 +341,11 @@ static void serverEmitBaseline()
         // The NO_SAVE test already skips player actors (they carry the flag, as
         // the dude always has); !playerActorIs states the "emitted exactly once,
         // from the slot loop above" invariant in code rather than leaving it to
-        // be inferred from a flag.
-        if ((obj->flags & OBJECT_NO_SAVE) == 0 && !playerActorIs(obj)) {
+        // be inferred from a flag. Recruited party members are NO_SAVE too but ARE
+        // in the sync domain (blob map body + netId walk + delta layer), so they
+        // must be snapshotted here as well — the client's onSnapshotObject tripwire
+        // then scores them ok against the same body it built from the blob.
+        if (((obj->flags & OBJECT_NO_SAVE) == 0 || objectIsPartyMember(obj)) && !playerActorIs(obj)) {
             presenter()->snapshotObject(obj);
         }
     }
@@ -477,6 +482,11 @@ void serverTick(int tick, const std::function<void(int)>& intentsDrain, bool adv
     // under the null presenter, so goldens are unaffected; auto-rebaselines on
     // the map change mapHandleTransition may have just performed.
     objectDeltaScan();
+
+    // Ship any per-actor sheet rows that changed this beat (chem stat mods, etc.).
+    // Same discipline as objectDeltaScan: no-op off a network presenter, so
+    // goldens are unaffected.
+    playerSheetDeltaEmit();
 
     // Correctness self-check: the goldens pin determinism, not correctness.
     // Pure read on the success path (byte-identical); aborts non-zero with the

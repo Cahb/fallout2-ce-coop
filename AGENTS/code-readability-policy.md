@@ -1,6 +1,6 @@
 ---
 name: code-readability-policy
-description: "Readability strategy for the RE-derived codebase — quarantine ugly names, GLOSSARY.md as decoder+rename-map, big rename pass POST-v1-leash (golden-safe), new seams always get real names."
+description: "Readability strategy for the RE-derived codebase — quarantine ugly names, docs/GLOSSARY.md as decoder+rename-map, big rename pass POST-v1-leash (golden-safe), new seams always get real names."
 metadata: 
   node_type: memory
   type: project
@@ -17,7 +17,7 @@ POLICY (agreed):
 - Quarantine line: NEW seams/files always get real names (server_control, server_anim,
   combatRoundBegin...). LLM-gen code in new files must read modern; reviews may carry a
   readability lens.
-- **GLOSSARY.md (repo root, @d179bd5)** = additive-only decoder ring; every session that
+- **docs/GLOSSARY.md (repo root, @d179bd5)** = additive-only decoder ring; every session that
   decodes an ugly name the hard way APPENDS a line. It doubles as the RENAME MAP for the
   banked post-v1 rename pass.
 - The big rename is LOW-RISK here by construction: renames are behavior-invariant and the
@@ -29,5 +29,5 @@ POLICY (agreed):
 **Why:** converts recon knowledge that currently evaporates into a compounding asset, and
 sequences the readability tax where it's cheap instead of where it stalls the roadmap.
 **How to apply:** when writing recon/build briefs, tell agents to append decoded names to
-GLOSSARY.md; when user raises readability again, point at this policy + the glossary's
+docs/GLOSSARY.md; when user raises readability again, point at this policy + the glossary's
 growth instead of starting an early rename.

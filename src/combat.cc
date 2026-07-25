@@ -4658,7 +4658,7 @@ static int attackComputeEnhancedKnockout(Attack* attack)
         int chance = randomBetween(1, 100);
         if (chance <= difficulty) {
             Object* weapon = nullptr;
-            if (attack->defender != gDude) {
+            if (!playerActorIs(attack->defender)) {
                 weapon = critterGetWeaponForHitMode(attack->defender, HIT_MODE_RIGHT_WEAPON_PRIMARY);
             }
 
@@ -4669,6 +4669,25 @@ static int attackComputeEnhancedKnockout(Attack* attack)
     }
 
     return 0;
+}
+
+// JINXED is an AURA, not a personal stat: while a Jinxed character is in a
+// fight, EVERY combatant's failed roll can fumble. Co-op players are party
+// members sharing one battlefield, so the faithful generalization is simply
+// "is ANY player Jinxed" — the same question vanilla asked of the lone dude.
+// Byte-identical in SP (one registered actor == the dude); it also fixes the
+// latent bug that the raw gDude/slot-0 read only ever noticed the HOST's Jinxed.
+static bool anyPlayerActorJinxed()
+{
+    for (int slot = 0; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor != nullptr
+            && (traitIsSelected(TRAIT_JINXED, actor) || perkHasRank(actor, PERK_JINXED))) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // 0x42378C
@@ -4710,7 +4729,7 @@ static int attackCompute(Attack* attack)
     }
 
     if (roll == ROLL_FAILURE) {
-        if (traitIsSelected(TRAIT_JINXED) || perkHasRank(gDude, PERK_JINXED)) {
+        if (anyPlayerActorJinxed()) {
             if (randomBetween(0, 1) == 1) {
                 roll = ROLL_CRITICAL_FAILURE;
             }
@@ -4982,7 +5001,7 @@ static int attackComputeCriticalHit(Attack* attack)
         effect = 5;
 
     CriticalHitDescription* criticalHitDescription;
-    if (defender == gDude) {
+    if (playerActorIs(defender)) {
         criticalHitDescription = &(gPlayerCriticalHitTable[attack->defenderHitLocation][effect]);
     } else {
         int killType = critterGetKillType(defender);
@@ -5012,7 +5031,7 @@ static int attackComputeCriticalHit(Attack* attack)
     }
 
     Object* weapon = nullptr;
-    if (defender != gDude) {
+    if (!playerActorIs(defender)) {
         weapon = critterGetWeaponForHitMode(defender, HIT_MODE_RIGHT_WEAPON_PRIMARY);
     }
 
@@ -5047,7 +5066,7 @@ static int attackComputeCriticalFailure(Attack* attack)
         return 0;
     }
 
-    if (attack->attacker == gDude) {
+    if (playerActorIs(attack->attacker)) {
         // SFALL: Remove criticals time limits.
         bool criticalsTimeLimitsRemoved = false;
         configGetBool(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_REMOVE_CRITICALS_TIME_LIMITS_KEY, &criticalsTimeLimitsRemoved);
@@ -5229,7 +5248,7 @@ static int attackDetermineToHit(Object* attacker, int tile, Object* defender, in
             }
 
             if (distanceMod >= minEffectiveDist) {
-                int perceptionBonus = attacker == gDude
+                int perceptionBonus = playerActorIs(attacker)
                     ? perceptionBonusMult * (perception - 2)
                     : perceptionBonusMult * perception;
 
@@ -5308,7 +5327,7 @@ static int attackDetermineToHit(Object* attacker, int tile, Object* defender, in
         toHit += 15;
     }
 
-    if (attacker == gDude) {
+    if (playerActorIs(attacker)) {
         int lightIntensity;
         if (defender != nullptr) {
             lightIntensity = objectGetLightIntensity(defender);
@@ -5479,7 +5498,7 @@ static void attackComputeDamage(Attack* attack, int ammoQuantity, int bonusDamag
         }
     }
 
-    if (attack->attacker == gDude) {
+    if (playerActorIs(attack->attacker)) {
         if (perkGetRank(attack->attacker, PERK_LIVING_ANATOMY) != 0) {
             int kt = critterGetKillType(attack->defender);
             if (kt != KILL_TYPE_ROBOT && kt != KILL_TYPE_ALIEN) {
@@ -5501,7 +5520,7 @@ static void attackComputeDamage(Attack* attack, int ammoQuantity, int bonusDamag
         && !_critter_flag_check(critter->pid, CRITTER_NO_KNOCKBACK)) {
         bool shouldKnockback = true;
         bool hasStonewall = false;
-        if (critter == gDude) {
+        if (playerActorIs(critter)) {
             if (perkGetRank(critter, PERK_STONEWALL) != 0) {
                 int chance = randomBetween(0, 100);
                 hasStonewall = true;

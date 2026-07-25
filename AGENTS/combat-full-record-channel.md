@@ -59,6 +59,6 @@ scripts/viewer_live.sh`, then `aggro` via the cmd port, skip turns. Kept diagnos
 (F2_TRACE_EVENTS-gated, cmove-* style): `[cmove-rec]`/`[cmove-play]` (server/viewer move),
 `[cmove-hold]` (held position), `[cmove-drift]` (should be SILENT), `[cpickup]`/`[disc]`
 (pickup), `[busy] STUCK` (pump-wedge watchdog), `[satk]`/`[dude-equip]`/`[dude-fid]`/`[ctakeout]`
-(equip/draw). Design = COMBAT_MOVE_RECORD_DESIGN.md. See [[presenter-object-ref-model]],
+(equip/draw). Design = COMBAT_MOVE_RECORD_DESIGN.md (deleted). See [[presenter-object-ref-model]],
 [[visual-verification-protocol]], [[dont-declare-not-a-bug-confidently]].
 </content>

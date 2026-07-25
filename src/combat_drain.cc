@@ -91,18 +91,23 @@ void _combat_turn_run()
 
 // --- server-loop combat driver (SERVER_LOOP_DESIGN.md §3, combat_intent.h) ---
 
-// The dude's primary hit mode for its equipped weapon (right hand, then left),
-// else an unarmed punch. Headless has no interface bar, so interfaceGetCurrent
-// HitMode() is meaningless (returns -1); pick from the equipped weapon directly.
+// The dude's primary hit mode for its equipped weapon, else an unarmed punch.
+// Headless has no interface bar, so interfaceGetCurrentHitMode() is meaningless
+// (returns -1); pick from the equipped weapon directly. The ACTIVE hand is consulted
+// first (feature A `hand` verb, serverActorActiveHand) so an extra who switched hands
+// fires from the hand they chose; the other hand is the fallback. The active-hand
+// DEFAULT is HAND_RIGHT, so this stays right-hand-first — byte-identical to the old
+// item2-then-item1 order — for any actor that never swapped.
 static int serverDudeHitMode()
 {
-    Object* weapon = critterGetItem2(gDude);
-    if (weapon != nullptr && itemGetType(weapon) == ITEM_TYPE_WEAPON) {
-        return HIT_MODE_RIGHT_WEAPON_PRIMARY;
+    int hand = serverActorActiveHand(playerActorSlotOf(gDude));
+    Object* primary = hand == HAND_RIGHT ? critterGetItem2(gDude) : critterGetItem1(gDude);
+    if (primary != nullptr && itemGetType(primary) == ITEM_TYPE_WEAPON) {
+        return hand == HAND_RIGHT ? HIT_MODE_RIGHT_WEAPON_PRIMARY : HIT_MODE_LEFT_WEAPON_PRIMARY;
     }
-    weapon = critterGetItem1(gDude);
-    if (weapon != nullptr && itemGetType(weapon) == ITEM_TYPE_WEAPON) {
-        return HIT_MODE_LEFT_WEAPON_PRIMARY;
+    Object* other = hand == HAND_RIGHT ? critterGetItem1(gDude) : critterGetItem2(gDude);
+    if (other != nullptr && itemGetType(other) == ITEM_TYPE_WEAPON) {
+        return hand == HAND_RIGHT ? HIT_MODE_LEFT_WEAPON_PRIMARY : HIT_MODE_RIGHT_WEAPON_PRIMARY;
     }
     return HIT_MODE_PUNCH;
 }
@@ -236,6 +241,18 @@ CombatPumpOutcome combatServerPumpIntents(int actorSlot)
     while (combatIntentPeekForSlot(actorSlot, &intent)) {
         if (combatPlayerTurnShouldBreak() || combatPlayerTurnOutOfAp()) {
             outcome.stop = CombatPumpStop::kEndTurn;
+            break;
+        }
+        // Feature A (in-combat twin of the out-of-combat verb REJECT, server_control.cc):
+        // while this actor is still animating a prior recorded action, DEFER — leave the
+        // intent queued (do NOT pop) and yield the beat as if the queue were drained; the
+        // busy window is wall-clock self-expiring, so a later beat drains it. END_TURN /
+        // END_COMBAT always bypass so a player can end their turn mid-animation. Gated by
+        // the kill switch, and busy is never marked on the golden probe → byte-identical.
+        if (serverActionGateEnabled() && serverActorBusyIs(actorSlot)
+            && intent.kind != COMBAT_INTENT_END_TURN
+            && intent.kind != COMBAT_INTENT_END_COMBAT) {
+            outcome.stop = CombatPumpStop::kQueueDrained;
             break;
         }
         if (intent.kind == COMBAT_INTENT_END_TURN) {
@@ -531,7 +548,15 @@ void _combat_display(Attack* attack)
 
     if ((attack->attackerFlags & DAM_HIT) != 0) {
         Object* v21 = attack->defender;
-        if (v21 != nullptr && (v21->data.critter.combat.results & DAM_DEAD) == 0) {
+        // Narrate the hit unless the target was ALREADY a corpse before this attack.
+        // The live `results & DAM_DEAD` is the pre-attack state here (display runs
+        // before _apply_damage, combat.cc:5824/5853), so it correctly skips only a
+        // pre-existing corpse. Also narrate when THIS attack's computed flags killed
+        // it (attack->defenderFlags), so a decoupled path where apply preceded display
+        // can't silently drop the kill line. In normal ordering the first clause is
+        // already true, so this is byte-identical (goldens unchanged).
+        if (v21 != nullptr && ((v21->data.critter.combat.results & DAM_DEAD) == 0
+                || (attack->defenderFlags & DAM_DEAD) != 0)) {
             text[0] = '\0';
 
             if (FID_TYPE(v21->fid) == OBJ_TYPE_CRITTER) {
@@ -650,7 +675,8 @@ void _combat_display(Attack* attack)
         }
     }
 
-    if (attack->attacker != nullptr && (attack->attacker->data.critter.combat.results & DAM_DEAD) == 0) {
+    if (attack->attacker != nullptr && ((attack->attacker->data.critter.combat.results & DAM_DEAD) == 0
+            || (attack->attackerFlags & DAM_DEAD) != 0)) { // see defender gate above: robust to apply-before-display
         if ((attack->attackerFlags & DAM_HIT) == 0) {
             if ((attack->attackerFlags & DAM_CRITICAL) != 0) {
                 switch (attack->attackerDamage) {
@@ -699,7 +725,21 @@ void _combat_display(Attack* attack)
 
     for (int index = 0; index < attack->extrasLength; index++) {
         Object* critter = attack->extras[index];
-        if ((critter->data.critter.combat.results & DAM_DEAD) == 0) {
+        // ►► SPLASH-NARRATION TRACE ([[rocket-splash-no-damage-narration]]): dump each
+        // blast victim's COMPUTED damage/flags + live results so a single rocket repro
+        // says which participant a "hit for no damage" line names (a genuinely 0-damage
+        // extra is correct + is NOT knocked back; knockback implies damage > 0). Server-
+        // side, gated. Strip once the owner's live capture confirms the cause.
+        if (getenv("F2_TRACE_EVENTS") != nullptr) {
+            fprintf(stderr, "[splash] extra[%d] %s dmg=%d flags=0x%x liveResults=0x%x dead=%d\n",
+                index, objectGetName(critter), attack->extrasDamage[index], attack->extrasFlags[index],
+                critter->data.critter.combat.results, (attack->extrasFlags[index] & DAM_DEAD) != 0);
+        }
+        // Narrate unless this victim was a corpse BEFORE the blast (pre-attack live
+        // state, since display precedes apply); also narrate a kill this attack made,
+        // so a decoupled apply-first path can't drop it. No-op in normal ordering.
+        if ((critter->data.critter.combat.results & DAM_DEAD) == 0
+                || (attack->extrasFlags[index] & DAM_DEAD) != 0) {
             combatCopyDamageAmountDescription(text, sizeof(text), critter, attack->extrasDamage[index]);
             combatAddDamageFlagsDescription(text, attack->extrasFlags[index], critter);
             strcat(text, ".");

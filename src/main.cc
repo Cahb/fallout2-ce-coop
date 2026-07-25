@@ -44,6 +44,7 @@
 #include "item.h"
 #include "kb.h"
 #include "loadsave.h"
+#include "loot_highlight.h"
 #include "mainmenu.h"
 #include "map.h"
 #include "mouse.h"
@@ -391,6 +392,11 @@ static void mainLoop()
         sfall_gl_scr_process_main();
 
         gameHandleKey(keyCode, false);
+
+        // LALT toggles the yellow highlight-lootables overlay (corpses,
+        // containers, ground items). Polled here so it works in solo and as the
+        // co-op viewer (both drive this loop).
+        lootHighlightUpdate();
 
         scriptsHandleRequests();
 
@@ -1244,6 +1250,22 @@ static int mainClientViewer(const char* connectSpec)
         conn.sendLine("claim");
     }
 
+    // Name the window WHO and WHERE, so a co-op player running several clients on one
+    // machine can tell them apart at a glance: "FALLOUT II - [name] - server host:port".
+    // playerName is the account we just logged in as; without it (the bare `claim`
+    // path) the title still carries the server, so windows stay distinct. This retitle
+    // only happens on the live-viewer path — the headless/golden client never reaches
+    // here, and the offline game keeps the plain "FALLOUT II" set at gameInit.
+    {
+        char titleBuf[320];
+        if (playerName != nullptr && playerName[0] != '\0') {
+            snprintf(titleBuf, sizeof(titleBuf), "FALLOUT II - [%s] - server %s:%d", playerName, host, port);
+        } else {
+            snprintf(titleBuf, sizeof(titleBuf), "FALLOUT II - server %s:%d", host, port);
+        }
+        programWindowSetTitle(titleBuf);
+    }
+
     _game_user_wants_to_quit = 0;
     int puppetLoadCount = conn.loadCount();
 
@@ -1263,6 +1285,13 @@ static int mainClientViewer(const char* connectSpec)
     // CROSSHAIR→MOVE until then). Mirrors vanilla left-click-weapon = enter combat + arm.
     bool pendingEnterCrosshair = false;
     const unsigned int kActionPendingTimeoutMs = 1200;
+    // OUT-OF-COMBAT input block (feature A — the out-of-combat twin of combatBusy). While
+    // set, world clicks and the 'B' hand-swap are eaten and the watch cursor shows, just
+    // like vanilla blocks the game loop for a weapon holster/ready. It is driven by a
+    // pending hand switch (RTT latch) OR the local replay of our own draw animation.
+    bool oocBusy = false;
+    bool handSwitchPending = false;
+    unsigned int handSwitchSince = 0;
 
     while (_game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
@@ -1328,6 +1357,10 @@ static int mainClientViewer(const char* connectSpec)
         // viewer can never mutate the sim; the standard mouse pump still runs harmlessly.
         int keyCode = inputGetInput();
 
+        // LALT toggles the highlight-lootables overlay. Safe in the viewer: it only
+        // sets client-side outlines (rendering), never touches the sim.
+        lootHighlightUpdate();
+
         if (clientDialogActive()) {
             clientDialogHandleKey(keyCode);
         } else if (keyCode == KEY_ESCAPE) {
@@ -1381,23 +1414,57 @@ static int mainClientViewer(const char* connectSpec)
                 conn.recomputeCombatOutlines();
             }
         } else if (keyCode == KEY_LOWERCASE_B || keyCode == KEY_UPPERCASE_B) {
-            interfaceBarSwapHands(false);
-            if (conn.inCombat()) {
-                conn.recomputeCombatOutlines();
+            // 'B' swaps the active weapon hand. Feature A: this now drives the authoritative
+            // server switch (put-away/take-out streamed back as a recorded sequence), no
+            // longer a local-only cosmetic flip. Flip gInterfaceCurrentHand IMMEDIATELY for
+            // responsiveness (the local _combat_attack_this reads it for the hitMode it
+            // forwards), send `hand <n>`, and lock input until the server answers. On a
+            // refusal (server busy) the flip is reverted below. In combat the existing
+            // combatBusy gate applies + the server queues it for our turn; out of combat the
+            // new oocBusy gate applies. Blocked while already busy (no spamming the swap).
+            bool busy = conn.inCombat() ? combatBusy : oocBusy;
+            if (!busy) {
+                interfaceBarSwapHands(false);
+                int newHand = interfaceGetCurrentHand();
+                char cmd[16];
+                snprintf(cmd, sizeof(cmd), "hand %d", newHand);
+                conn.sendLine(cmd);
+                if (conn.inCombat()) {
+                    actionPending = true;
+                    actionPendingSince = getTicks();
+                    conn.recomputeCombatOutlines();
+                } else {
+                    handSwitchPending = true;
+                    handSwitchSince = getTicks();
+                    clientViewerTakeRefusal(); // clear any stale refusal edge before we wait
+                }
             }
         } else if (keyCode == -20) {
-            // Left-click the weapon/attack slot (interface.cc:505) = vanilla "activate
-            // weapon" (_intface_use_item): arm the crosshair + enter combat. We can't run
-            // _intface_use_item locally — it also reloads / _obj_use_item / calls _combat,
-            // all sim mutations the server owns — so replicate only the safe intent: enter
-            // combat via cstart if needed, then switch to the crosshair (target) cursor.
-            // In combat it sticks immediately; out of combat the CROSSHAIR→MOVE guard below
-            // holds until COMBAT_ENTER, so defer via pendingEnterCrosshair. (Reload/use-item
-            // branch of the slot is deferred to the inventory verb slices.)
-            if (conn.inCombat()) {
+            // Left-click the weapon/attack slot (interface.cc:505). Vanilla
+            // (_intface_use_item) branches on the slot's CYCLED action: RELOAD reloads
+            // (out of combat WITHOUT entering combat, interface.cc:1322), any attack
+            // action arms the crosshair + enters combat. Match that split here rather
+            // than always doing the attack path (which was forcing a combat-enter on a
+            // reload, and never reloading — owner-reported).
+            int leftAction = INTERFACE_ITEM_ACTION_DEFAULT;
+            int rightAction = INTERFACE_ITEM_ACTION_DEFAULT;
+            interfaceGetItemActions(&leftAction, &rightAction);
+            int curHand = interfaceGetCurrentHand();
+            int action = curHand == HAND_LEFT ? leftAction : rightAction;
+            if (action == INTERFACE_ITEM_ACTION_RELOAD) {
+                // Reload runs against the authoritative dude on the server; the loaded
+                // rounds / consumed ammo stream back via OBJECT_DELTA_INVENTORY. Do NOT
+                // enter combat and do NOT arm the crosshair.
+                char cmd[32];
+                snprintf(cmd, sizeof(cmd), "reload %d", curHand);
+                conn.sendLine(cmd);
+            } else if (conn.inCombat()) {
+                // Attack action: arm the crosshair. In combat it sticks immediately;
                 gameMouseSetMode(GAME_MOUSE_MODE_CROSSHAIR);
                 conn.recomputeCombatOutlines();
             } else {
+                // out of combat the CROSSHAIR→MOVE guard below holds until COMBAT_ENTER,
+                // so enter combat via cstart, then defer the crosshair.
                 conn.sendLine("cstart");
                 pendingEnterCrosshair = true;
             }
@@ -1500,7 +1567,8 @@ static int mainClientViewer(const char* connectSpec)
                 }
             } else if (mode == GAME_MOUSE_MODE_ARROW
                 && (mouseEvent & MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT) == MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT
-                && windowGetAtPoint(mx, my) == gIsoWindow) {
+                && windowGetAtPoint(mx, my) == gIsoWindow
+                && !oocBusy) { // feature A: eat world input while an action animation is owed
                 // ARROW-mode left-HOLD → the vanilla action menu. Build + run it
                 // locally (pure-read on the mirror, via the shared game_mouse helpers),
                 // then map the picked item to a wire verb (§3.2). Works in combat too:
@@ -1517,7 +1585,8 @@ static int mainClientViewer(const char* connectSpec)
                     viewerSendActionMenuVerb(conn, selectedItem, targetObj);
                 }
             } else if ((mouseEvent & MOUSE_EVENT_LEFT_BUTTON_UP) != 0
-                && windowGetAtPoint(mx, my) == gIsoWindow) {
+                && windowGetAtPoint(mx, my) == gIsoWindow
+                && !oocBusy) { // feature A: eat world input while an action animation is owed
                 // Only clicks inside the iso window act (game_mouse.cc pattern); the
                 // viewer's gIsoWindow spans the whole screen at (0,0).
                 if (inCombat && mode == GAME_MOUSE_MODE_CROSSHAIR) {
@@ -1738,6 +1807,20 @@ static int mainClientViewer(const char* connectSpec)
         combatBusy = conn.inCombat()
             && (!conn.myTurn() || conn.combatPresentationBusy() || actionPending
                 || clientAnimActiveFor(gDude));
+
+        // Feature A: out-of-combat input block (the twin of combatBusy). Resolve the
+        // pending hand switch first — a refusal (server busy) flips the local hand back;
+        // otherwise the RTT timeout releases the latch, by which point the authoritative
+        // draw has streamed and animationIsBusy(gDude) keeps the block for its duration.
+        if (handSwitchPending) {
+            if (clientViewerTakeRefusal()) {
+                interfaceBarSwapHands(false); // server rejected the switch — undo the flip
+                handSwitchPending = false;
+            } else if (getTicksBetween(getTicks(), handSwitchSince) >= kActionPendingTimeoutMs) {
+                handSwitchPending = false;
+            }
+        }
+        oocBusy = !conn.inCombat() && (handSwitchPending || animationIsBusy(gDude));
         // Softlock diagnostic (F2_TRACE_EVENTS): if the wait cursor holds for a long
         // stretch, name WHICH component keeps combatBusy latched — a stuck myTurn flip,
         // an un-idle replay/door, a queue that won't drain, an unanswered action, or the
@@ -1773,10 +1856,10 @@ static int mainClientViewer(const char* connectSpec)
                 }
             }
         }
-        if (combatBusy && !watchCursorShown) {
+        if ((combatBusy || oocBusy) && !watchCursorShown) {
             gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
             watchCursorShown = true;
-        } else if (!combatBusy && watchCursorShown) {
+        } else if (!combatBusy && !oocBusy && watchCursorShown) {
             // Hand the cursor back to the pinned MOVE hex (gameMouseRefresh rebuilds
             // it once the animated cursor is cleared and the objects are shown).
             gameMouseSetCursor(MOUSE_CURSOR_NONE);

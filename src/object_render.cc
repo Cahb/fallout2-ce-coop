@@ -475,6 +475,42 @@ static void objectDrawOutline(Object* object, Rect* rect)
                 v48 = _redBlendTable;
             }
             break;
+        case OUTLINE_TYPE_LOOT_ITEM:
+            // Highlight-lootables overlay: loose ground item — yellow (248,248,0).
+            v44 = 0;
+            color = _colorTable[32736];
+            if (v53 != 0) {
+                v47 = _commonGrayTable;
+                v48 = _redBlendTable;
+            }
+            break;
+        case OUTLINE_TYPE_LOOT_CORPSE:
+            // Highlight-lootables overlay: dead critter — orange (248,128,0).
+            v44 = 0;
+            color = _colorTable[32256];
+            if (v53 != 0) {
+                v47 = _commonGrayTable;
+                v48 = _redBlendTable;
+            }
+            break;
+        case OUTLINE_TYPE_LOOT_CONTAINER:
+            // Highlight-lootables overlay: container — cyan (0,248,248).
+            v44 = 0;
+            color = _colorTable[1023];
+            if (v53 != 0) {
+                v47 = _commonGrayTable;
+                v48 = _redBlendTable;
+            }
+            break;
+        case OUTLINE_TYPE_LOOT_DOOR:
+            // Highlight-lootables overlay: door / transition scenery — green (0,248,0).
+            v44 = 0;
+            color = _colorTable[992];
+            if (v53 != 0) {
+                v47 = _commonGrayTable;
+                v48 = _redBlendTable;
+            }
+            break;
         case OUTLINE_TYPE_32:
             color = 61;
             v53 = 0;

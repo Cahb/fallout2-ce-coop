@@ -4785,11 +4785,14 @@ void objectAssignAllNetIds()
         // blob (objectSaveAll, object.cc:674), and the delta layer (objectIsSyncable,
         // object_delta.cc) must number the SAME object set, or a slot mismatch
         // shifts every netId after it (the client cannot then reproduce the walk).
-        // OBJECT_NO_SAVE objects (cursors, the egg, recruited party members) are
-        // absent from the blob AND excluded from deltas, so they take no netId slot.
-        // Player actors are NO_SAVE but ARE primary actors: numbered first,
-        // above, and skipped here so they take exactly one slot each.
-        if (!playerActorIs(obj) && (obj->flags & OBJECT_NO_SAVE) == 0) {
+        // OBJECT_NO_SAVE objects (cursors, the egg) are absent from the blob AND
+        // excluded from deltas, so they take no netId slot. Player actors are
+        // NO_SAVE but ARE primary actors: numbered first, above, and skipped here.
+        // Recruited party members are ALSO NO_SAVE but ARE in the sync domain — the
+        // join blob rides them in the map body under a prep bracket (mapSaveToStream)
+        // and objectIsSyncable tracks their deltas, so they must take one inline slot
+        // each here too, in the SAME tile-walk order the blob wrote them.
+        if (!playerActorIs(obj) && ((obj->flags & OBJECT_NO_SAVE) == 0 || objectIsPartyMember(obj))) {
             obj->netId = objectNextNetId();
             objectAssignInventoryNetIds(obj);
         } else if (!playerActorIs(obj)) {

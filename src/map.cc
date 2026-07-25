@@ -1383,7 +1383,33 @@ int mapSaveToStream(File* stream, int* mapBodyLenOut)
     gMapHeader.flags |= 0x01;
     gMapHeader.lastVisitTime = gameTimeGetTime();
 
-    if (_map_save_file(stream) == -1) {
+    // Co-op: recruited party members carry OBJECT_NO_SAVE (party_member.cc:401),
+    // so objectSaveAll would skip them and a viewer rebuilding its world from this
+    // blob would lose every companion on a rebaseline (they otherwise ride only the
+    // live recruit-time spawn delta). Ride them in the map body exactly as the DISK
+    // save does: _partyMemberPrepSave clears NO_SAVE|NO_REMOVE on members (index > 0)
+    // so objectSaveAll writes them, UnPrepSave restores. Bracket the SINGLE
+    // _map_save_file call so no early return can split the latch — a split latch
+    // permanently strips companion flags AND denies all future recruit/dismiss
+    // (party_member.cc:390/455). This is the only save path that must add the
+    // bracket: the disk save reaches _map_save_file via _map_save with its own
+    // bracket (savegame.cc:731/833), never through mapSaveToStream.
+    //
+    // ►► Guard on an ACTUAL recruited member (length includes gDude at index 0, so
+    // > 1 == someone recruited). _partyMemberPrepSave's script-flag clear at
+    // party_member.cc:501-504 is NOT index>0-guarded — it strips SCRIPT_FLAG_0x08|
+    // 0x10 from gDude's own script too, which perturbs the dude's script/lvar
+    // serialization in the map body. Unbracketed when the party is empty, the blob
+    // stays byte-identical (the no-party reconstruction goldens depend on this).
+    bool bracketParty = partyHasRecruitedMembers();
+    if (bracketParty) {
+        _partyMemberPrepSave();
+    }
+    int mapSaveRc = _map_save_file(stream);
+    if (bracketParty) {
+        _partyMemberUnPrepSave();
+    }
+    if (mapSaveRc == -1) {
         return -1;
     }
 

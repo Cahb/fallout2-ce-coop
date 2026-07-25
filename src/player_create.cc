@@ -96,8 +96,9 @@ bool playerCreateSpecValidate(const PlayerCreateSpec* spec)
 int playerCreateApply(int slot, const PlayerCreateSpec* spec)
 {
     // Slot 0 IS allowed. The first player to log in by name binds the host slot
-    // (nobody can drive the worldmap otherwise — host-only screens), so "create my
-    // character" has to be able to land on the host body. The pid check below is
+    // (slot 0 is the gDude fallback for any un-scoped path — NPC-opened dialog, the
+    // golden/CMD path), so "create my character" has to be able to land on the host
+    // body. The pid check below is
     // what keeps this honest: it still refuses to write a row that is not this
     // slot's. What protects an ESTABLISHED host character is one level up — an
     // existing account never carries a creation spec (server_control.cc).

@@ -10,14 +10,14 @@ metadata:
 ## ►► ACTIVE track — barter streaming to the viewer
 
 Barter is the trade/inventory sub-modal reachable from dialog when talking to a
-merchant NPC. Plan of record = `BARTER_STREAMING_PLAN.md` (repo root, JUST CREATED).
+merchant NPC. Plan of record = `BARTER_STREAMING_PLAN.md (deleted)` (repo root, JUST CREATED).
 Read it FIRST for architecture + staged decomposition.
 
 **Key fact**: Server-side barter engine is largely DONE — `inventoryOpenTrade` already
 has a full `serverLoopActive()` drain loop processing OFFER/TAKE/UNOFFER/COMMIT/DONE
 intents from the `barter_intent` queue. The gap is the viewer side.
 
-**Resume ladder** (see BARTER_STREAMING_PLAN.md for detail):
+**Resume ladder** (see BARTER_STREAMING_PLAN.md (deleted) for detail):
 - **B0** — Enter `inventoryOpenTrade` on viewer (~1 session)
 - **B1** — Table object netIds + inventory streaming (~1-2 sessions, the real work)
 - **B2** — Wire verbs: boffer/btake/bunoffer/bcommit through serverControlLine (~1 session)
@@ -34,7 +34,7 @@ no symbol collisions.
 - `inventoryOpenTrade` (the interactive trade screen) is NEVER entered on viewer
 
 ### Fresh-session bootstrap
-1. Read `BARTER_STREAMING_PLAN.md` (repo root)
+1. Read `BARTER_STREAMING_PLAN.md (deleted)` (repo root)
 2. Read [[p5-server-plan]] for RESUME PROTOCOL + gate/live-demo commands
 3. Read `src/inventory_ui.cc:4481` (`inventoryOpenTrade`) for existing server drain
 4. Read `src/game_dialog.cc:2029-2057` for server barter branch in `_gdProcess`
@@ -44,7 +44,7 @@ no symbol collisions.
 ### Predecessor
 [[dialog-streaming-track]] (DONE — A0→A3 completed, dialog now renders on viewer)
 
-See also [[p5-server-plan]], [[BARTER_STREAMING_PLAN.md]], [[dialog-headless-plan]].
+See also [[p5-server-plan]], [[BARTER_STREAMING_PLAN.md (deleted)]], [[dialog-headless-plan]].
 
 Active bug specs (repo `bugs/`):
 - `bugs/001-dialog-range-early-fire.md` — FIXED

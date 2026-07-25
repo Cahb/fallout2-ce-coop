@@ -1741,18 +1741,25 @@ static void opWieldItem(Program* program)
     bool shouldAdjustArmorClass = false;
     Object* oldArmor = nullptr;
     Object* newArmor = nullptr;
-    if (critter == gDude) {
-        if (interfaceGetCurrentHand() == HAND_LEFT) {
-            hand = HAND_LEFT;
-        }
 
-        if (itemGetType(item) == ITEM_TYPE_ARMOR) {
-            oldArmor = critterGetArmor(gDude);
+    // Worn armour grants AC / damage-resistance / damage-threshold as BONUS STATS
+    // on the wearer, so equipping it must re-run _adjust_ac for EVERY player actor
+    // (mirror of the fixed move_obj_inven_to_obj give-back). Gating this on gDude
+    // left an EXTRA visibly wearing armour with zero protection until re-equipped
+    // through the inventory screen — a combat-math error, not a cosmetic one.
+    if (playerActorIs(critter) && itemGetType(item) == ITEM_TYPE_ARMOR) {
+        oldArmor = critterGetArmor(critter);
 
-            // SFALL
-            shouldAdjustArmorClass = true;
-            newArmor = item;
-        }
+        // SFALL
+        shouldAdjustArmorClass = true;
+        newArmor = item;
+    }
+
+    // The current-hand read is the LOCAL player's interface state, so it stays the
+    // host's; an extra defaults to the right hand (irrelevant for armour, which
+    // occupies the armour slot regardless).
+    if (critter == gDude && interfaceGetCurrentHand() == HAND_LEFT) {
+        hand = HAND_LEFT;
     }
 
     if (_inven_wield(critter, item, hand) == -1) {
@@ -1761,10 +1768,14 @@ static void opWieldItem(Program* program)
         return;
     }
 
+    // Stat give-back is every player actor's; the HUD repaint below is the host's
+    // screen only.
+    if (shouldAdjustArmorClass) {
+        _adjust_ac(critter, oldArmor, newArmor);
+    }
+
     if (critter == gDude) {
         if (shouldAdjustArmorClass) {
-            _adjust_ac(critter, oldArmor, newArmor);
-
             // SFALL
             presenter()->hudArmorClass(false);
         }
@@ -1832,6 +1843,21 @@ static void opObjectCanSeeObject(Program* program)
         }
     } else {
         scriptPredefinedError(program, "obj_can_see_obj", SCRIPT_ERROR_OBJECT_IS_NULL);
+    }
+
+    // F2_TRACE_AGGRO: the perception DECISION POINT for out-of-combat aggro.
+    // A wild critter's critter_p_proc calls obj_can_see_obj(self_obj, dude_obj)
+    // before attack_complex; this line breaks the "did it see me?" answer into
+    // its three gates (same-elevation / in-perception-range / LOS) so a co-op
+    // no-aggro repro tells us WHICH one failed, and what dude_obj resolved to
+    // (nearest online player vs host). Cheap: off unless the env var is set.
+    if (getenv("F2_TRACE_AGGRO") != nullptr && object1 != nullptr && object2 != nullptr) {
+        bool sameElev = object2->elevation == object1->elevation;
+        bool ranged = sameElev && object2->tile != -1 && object1->tile != -1
+            && isWithinPerception(object1, object2);
+        fprintf(stderr, "[aggro] can_see self=%p pid=%d -> target=%p pid=%d player=%d | sameElev=%d inPerc=%d dist=%d => %d\n",
+            (void*)object1, object1->pid, (void*)object2, object2->pid, playerActorIs(object2) ? 1 : 0,
+            sameElev ? 1 : 0, ranged ? 1 : 0, tileDistanceBetween(object1->tile, object2->tile), canSee ? 1 : 0);
     }
 
     programStackPushInteger(program, canSee);

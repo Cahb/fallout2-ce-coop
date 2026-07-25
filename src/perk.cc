@@ -11,6 +11,7 @@
 #include "object.h"
 #include "party_member.h"
 #include "platform_compat.h"
+#include "player_sheet.h" // playerSheetMarkDirty — stream perk-rank changes
 #include "server_players.h" // playerActorSlotOf / kMaxPlayerActors
 #include "skill.h"
 #include "stat.h"
@@ -579,6 +580,10 @@ int perkAdd(Object* critter, int perk)
 
     perkAddEffect(critter, perk);
 
+    // Perk ranks are per-actor sheet state — stream the row so the actor's client
+    // reflects the new perk (and any stat effect it just applied).
+    playerSheetMarkDirty(critter);
+
     return 0;
 }
 
@@ -602,6 +607,10 @@ int perkAddForce(Object* critter, int perk)
     ranksData->ranks[perk] += 1;
 
     perkAddEffect(critter, perk);
+
+    // Perk ranks are per-actor sheet state — stream the row so the actor's client
+    // reflects the new perk (and any stat effect it just applied).
+    playerSheetMarkDirty(critter);
 
     return 0;
 }

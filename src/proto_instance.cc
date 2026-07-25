@@ -23,6 +23,7 @@
 #include "map.h"
 #include "message.h"
 #include "object.h"
+#include "object_delta.h" // objectDeltaNotePresentedFrame — suppress door/container frame double-stream
 #include "palette.h"
 #include "perk.h"
 #include "pres_record.h" // presRecord* — record the door slide as a presentation sequence
@@ -1766,6 +1767,9 @@ static void doorPresentSlide(Object* door, bool opening, int actorNetId)
     reg_anim_end();
     presRecordSectionEnd();
     presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), actorNetId);
+    // The slide above already streams this door's frame change; suppress the redundant
+    // OBJECT_DELTA_FRAME so a viewer doesn't snap past the animation.
+    objectDeltaNotePresentedFrame(door);
 }
 
 // 0x49CCB8
@@ -1948,6 +1952,9 @@ int _obj_use_container(Object* critter, Object* item)
         reg_anim_end();
         presRecordSectionEnd();
         presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount());
+        // The open/close slide above already streams this container's frame change;
+        // suppress the redundant OBJECT_DELTA_FRAME (would snap past the animation).
+        objectDeltaNotePresentedFrame(item);
 
         if (critter == gDude) {
             MessageListItem messageListItem;

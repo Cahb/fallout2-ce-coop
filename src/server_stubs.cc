@@ -716,7 +716,8 @@ int buttonEnable(int btn) { serverStubAbort("buttonEnable"); }
 void clientViewerArmExplosive(int pid, int seconds) { serverStubAbort("clientViewerArmExplosive"); }
 bool clientViewerConsumeDudeInvDirty() { serverStubAbort("clientViewerConsumeDudeInvDirty"); }
 bool clientViewerConsumeLootTargetInvDirty() { serverStubAbort("clientViewerConsumeLootTargetInvDirty"); }
-void clientViewerDrop(Object* item) { serverStubAbort("clientViewerDrop"); }
+void clientViewerDrop(Object* item, int quantity) { serverStubAbort("clientViewerDrop"); }
+void clientViewerUnload(Object* item) { serverStubAbort("clientViewerUnload"); }
 void clientViewerLootPut(int containerNetId, int pid, int quantity) { serverStubAbort("clientViewerLootPut"); }
 void clientViewerLootTake(int containerNetId, int pid, int quantity) { serverStubAbort("clientViewerLootTake"); }
 void clientViewerLootTakeAll(int containerNetId) { serverStubAbort("clientViewerLootTakeAll"); }

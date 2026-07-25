@@ -21,11 +21,14 @@
 #include "combat_intent.h" // COMBAT_INTENT_* / combatIntentPush (P3)
 #include "critter.h" // critterIsDead
 #include "dialog_intent.h" // DIALOG_INTENT_* / dialogIntentPush (A2 dialog streaming)
+#include "worldmap.h" // worldmapEncounterAnswer — random-encounter prompt barrier
 #include "worldmap_intent.h" // WM_INTENT_* / worldmapIntentPush (worldmap streaming)
 #include "server_worldmap.h" // worldmapServerActive — gate for wmmove/wmenter/wmesc
 #include "game.h" // gDude / gMiscMessageList
+#include "game_sound.h" // sfxBuildWeaponName / WEAPON_SOUND_EFFECT_READY — the reload click
 #include "game_movie.h" // gameMovieAck — the movie barrier's release
 #include "game_dialog.h" // _gdialogActive — dialog-active gate for dsay/dend
+#include "input.h" // getTicks — wall-clock rate limit on the busy refusal (feature A)
 #include "inventory.h" // _inven_wield / _inven_unwield / critterGetArmor / _adjust_ac / HAND_*
 #include "item.h" // itemGetType / ITEM_TYPE_CONTAINER / itemDropStack / itemRemove
 #include "map.h" // mapGetLoadGeneration — drop latches on a map change
@@ -70,6 +73,13 @@ namespace fallout {
 // exactly: slot 0 is the only bindable slot.
 static int gBindings[kMaxPlayerActors] = {};
 
+// Feature A: last wall-clock tick a "You are busy." refusal was streamed per slot, so
+// a click-spammed mv against the busy window cannot storm the refusal channel. The
+// stderr line (a gate contract) is unconditional; only the player-facing message is
+// rate-limited.
+static unsigned int gLastBusyRefuseAt[kMaxPlayerActors] = {};
+constexpr unsigned int kBusyRefuseMinGapMs = 500;
+
 // Slot this session drives, or -1 if it holds none (a SPECTATOR: it still
 // receives the whole stream, it just cannot act).
 int serverControlSlotForSession(int sessionId)
@@ -112,15 +122,14 @@ bool serverControlAnyBound()
 // Is this session driving the HOST actor (slot 0)? The debug CMD port carries no
 // session and drives the host, so it answers yes.
 //
-// OWNER RULING 2026-07-20: the WORLDMAP and DIALOG screens are host-only. Both move
-// state that belongs to everyone — travel relocates the whole party, and a
-// conversation answers for it — so an extra must not be able to drag the group
-// across the world map or speak for them. Same reasoning, and the same act, as the
-// host-only map transition (MP_PROPOSAL Ch 14.2): anti-grief and no unconsented
-// travel, an intentional asymmetry rather than a v1 shortcut. Extras still SEE both
-// screens (every viewer receives the dialog nodes and the travel stream); they just
-// cannot drive them. NOTE: this narrows MP_PROPOSAL Ch 11.2, which had the dialog
-// driver being whichever actor requested the conversation.
+// NO SCREEN IS HOST-ONLY as of 2026-07-23: the WORLDMAP and map transitions are open
+// to every player (see the wmmove/wmenter/wmesc gate below and playerActorMayTransit),
+// and DIALOG is INITIATOR-driven — serverControlMayDriveDialog compares against the
+// requester's slot (gDialogDriverSlot), NOT the host. This predicate is now used ONLY
+// as that dialog gate's FALLBACK, for the one case with no recorded driver: an
+// NPC-opened conversation, the golden path, or the CMD port (gDialogDriverSlot < 0).
+// In that state gDude also falls back to slot 0, so "host drives" and "gDude == slot 0"
+// are the same residual assumption, not a deliberate anti-grief policy.
 static bool serverControlIsHostSession(int sessionId)
 {
     return serverControlSlotForSession(sessionId) <= 0;
@@ -290,6 +299,11 @@ enum {
                         // (the Temple Key on the locked door, a doctor's bag on
                         //  a critter, …). arg carries the item pid, re-resolved
                         //  on the actor's inventory at fire time.
+    kInteractHand,      // feature A: switch the active weapon hand (0/1 in arg) —
+                        //  NO target, NO approach, 0 AP. In combat it rides the
+                        //  intent queue so the put-away/take-out runs on the
+                        //  actor's own turn; serverControlRunCombatInteract handles
+                        //  it before target resolution (there is no target).
 };
 
 struct PendingInteraction {
@@ -362,6 +376,20 @@ static void interactionCannotGetThere(Object* actor)
     if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
         presenter()->consoleMessageFor(actor != nullptr ? actor->netId : 0, messageListItem.text);
     }
+}
+
+// A GET latch's target vanished from the world before the actor arrived — the
+// contested-pickup loser (MP_PROPOSAL Ch 7.x). Server race resolution already
+// reparented the item to the WINNER (_obj_pickup → _obj_disconnect), so the
+// loser's objectFindByNetId now misses it (that lookup walks the world tile list
+// only, never inventories) and this is the specific "another player took it"
+// case — distinct from "you can't get there" (the approach failed with the item
+// still lying there). Say so, addressed to the loser: it answers THEIR click and
+// means nothing to the other players. No vanilla string exists for a multiplayer
+// steal, so this is a co-op literal (as serverControlRefuseActor's are).
+static void interactionTargetTaken(Object* actor)
+{
+    presenter()->consoleMessageFor(actor != nullptr ? actor->netId : 0, "Someone grabbed it.");
 }
 
 // The per-verb adjacency rule. All verbs require the actor adjacent to the target
@@ -515,6 +543,25 @@ static void interactionFire(int verb, Object* actor, Object* target, int arg)
             }
         }
         if (item != nullptr) {
+            // ►► CO-OP REVIVE (players only). A healing item used on a downed PLAYER
+            // brings them back at exactly 1 HP (owner spec 2026-07-23: a revive, not a
+            // heal) instead of running the normal use, which does nothing to a corpse
+            // anyway. Gated to the dedicated server + a dead player target, so vanilla
+            // and the goldens never take this branch. itemIsHealing = the engine's own
+            // stimpak/super-stimpak/healing-powder set. The single HP + cleared DAM_DEAD
+            // stream to every viewer via the actor-HP + OBJECT_DELTA channels, and the
+            // stand-up fid + un-flatten ride OBJECT_DELTA_FID / OBJECT_DELTA_FLAGS.
+            if (serverDedicatedActive() && playerActorIs(target) && critterIsDead(target)
+                && itemIsHealing(item->pid)) {
+                if (critterRevive(target)) {
+                    itemRemove(actor, item, 1); // consume one unit; do NOT touch `item` after
+                    fprintf(stderr, "f2_server: control useitemon REVIVE net=%d\n", target->netId);
+                    char line[128];
+                    snprintf(line, sizeof(line), "%s revived %s.", critterGetName(actor), critterGetName(target));
+                    presenter()->consoleMessageStyled(target->netId, kMsgChannelSystem, line);
+                }
+                break;
+            }
             // Through the AP wrapper, not _action_use_an_item_on_object direct:
             // it gates on and charges the vanilla 2 AP when the use succeeds
             // (actions.cc:2714) and is a plain pass-through out of combat, so
@@ -589,6 +636,110 @@ static void interactionEmitGesture(int verb, Object* actor, Object* target)
     presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), actor->netId);
 }
 
+// Present a successful reload: the weapon-ready CLICK + the magic-hands gesture.
+// The viewer routes reload to the `reload` verb instead of running vanilla's
+// _intface_item_reload, so without this a reload was completely silent and still —
+// owner-reported. Positional sound, so the rest of the group hears their squadmate
+// reload from where they stand.
+static void serverControlEmitReloadPresentation(Object* weapon)
+{
+    if (gDude == nullptr || weapon == nullptr) {
+        return;
+    }
+    // Vanilla passes the primary right-hand mode regardless of which hand reloaded;
+    // the effect name only depends on the weapon's sound id for READY.
+    const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_READY, weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY, nullptr);
+    if (sfx != nullptr) {
+        presenter()->sfxPlayAt(sfx, gDude);
+    }
+
+    // DELIBERATE DIVERGENCE (owner call 2026-07-25): vanilla plays no player reload
+    // animation, but in co-op a silent stat change is invisible — this is the only way
+    // the rest of the group SEES you reload. Same gesture vanilla gives an AI/party
+    // reload (_ai_magic_hands, combat_ai.cc), recorded and shipped like the interaction
+    // gesture above; the busy mark the presSeq leaves also stops a reload spam-click
+    // from queueing animations (feature A action gate).
+    presRecordSectionBegin();
+    reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+    animationRegisterAnimate(gDude, ANIM_MAGIC_HANDS_MIDDLE, 0);
+    reg_anim_end();
+    presRecordSectionEnd();
+    presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), gDude->netId);
+}
+
+// ─── Weapon/hand switch (feature A pilot) ────────────────────────────────────
+// Switch `actor`'s active weapon hand to `hand` (HAND_LEFT/HAND_RIGHT) and present
+// the put-away/take-out draw. Vanilla charges NO AP for the hand toggle — the only
+// cost is the animation, which the busy gate reproduces (the busy mark is a side
+// effect of the presSeq below, presenter_network.cc). Idempotent (explicit target
+// hand, not a toggle), so a resend re-derives the same fid and re-plays the draw.
+//
+// This mirrors _invenWieldFunc's weapon branch (inventory.cc:441-494) MINUS the
+// blocking reg_anim pump and the HUD callbacks: it records the same leaves and ships
+// them as EVENT_PRES_SEQ. The authoritative armed fid is set DIRECTLY (rides
+// OBJECT_DELTA; viewers HOLD it during the replay) — and unconditionally, not just in
+// combat like _invenWieldFunc, because out of combat this is the whole point: the
+// server must show the drawn/holstered pose to every viewer and to a mid-join.
+static void serverControlSwapHand(Object* actor, int slot, int hand)
+{
+    if (actor == nullptr) {
+        return;
+    }
+    serverActorSetActiveHand(slot, hand);
+
+    // The weapon now in that hand (item1 = left, item2 = right), or null = empty hand.
+    Object* held = hand == HAND_RIGHT ? critterGetItem2(actor) : critterGetItem1(actor);
+    int newCode = (held != nullptr && itemGetType(held) == ITEM_TYPE_WEAPON)
+        ? weaponGetAnimationCode(held) : 0;
+    int oldCode = (actor->fid & 0xF000) >> 12; // the weapon-animation nibble in the current fid
+
+    // Authoritative armed stand fid for the new hand, preserving the armor/base body
+    // frame and skin nibble (the invunwield armor branch template) — only the
+    // weapon-animation nibble changes.
+    int standFid = buildFid(OBJ_TYPE_CRITTER, actor->fid & 0xFFF, ANIM_STAND, newCode, actor->rotation + 1);
+    if (artExists(standFid) && actor->fid != standFid) {
+        objectSetFid(actor, standFid, nullptr);
+        objectSetFrame(actor, 0, nullptr);
+    }
+
+    // Record the holster (old weapon) + draw (new weapon) and ship it. `recordedDraw`
+    // mirrors _invenWieldFunc: only an actual put-away/take-out is worth shipping; a
+    // bare empty-hand→empty-hand toggle records a SetFid the fid delta already covers,
+    // so abort rather than ship a redundant one. Inert (recording=false) off-server.
+    bool recording = !isoIsDisabled() && presRecordEnabled();
+    bool recordedDraw = false;
+    if (recording) {
+        presRecordSectionBegin();
+    }
+    if (!isoIsDisabled()) {
+        reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+    }
+    if (oldCode != 0) {
+        animationRegisterAnimate(actor, ANIM_PUT_AWAY, 0);
+        recordedDraw = true;
+    }
+    if (newCode != 0) {
+        animationRegisterTakeOutWeapon(actor, newCode, -1);
+        recordedDraw = true;
+    } else {
+        int fid = buildFid(OBJ_TYPE_CRITTER, actor->fid & 0xFFF, ANIM_STAND, 0, actor->rotation + 1);
+        animationRegisterSetFid(actor, fid, -1);
+    }
+    if (!isoIsDisabled()) {
+        reg_anim_end();
+    }
+    if (recording) {
+        if (recordedDraw) {
+            presRecordSectionEnd();
+            presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), actor->netId);
+        } else {
+            presRecordSectionAbort();
+        }
+    }
+    fprintf(stderr, "f2_server: control hand=%d slot=%d oldCode=%d newCode=%d\n",
+        hand, slot, oldCode, newCode);
+}
+
 // ─── In-combat interaction (Stage 4) ────────────────────────────────────────
 // The combat twin of serverControlArmInteraction below. Called back from the
 // combat pump on the actor's OWN turn, inside its ServerActorScope.
@@ -610,6 +761,14 @@ bool serverControlRunCombatInteract(Object* actor, int verb, int targetNetId, in
 {
     if (actor == nullptr) {
         return false;
+    }
+
+    // Hand switch has NO target and NO approach — handle it before target resolution.
+    // arg carries the hand (HAND_LEFT/HAND_RIGHT); 0 AP, so it never ends the turn.
+    if (verb == kInteractHand) {
+        serverControlSwapHand(actor, playerActorSlotOf(actor), arg);
+        fprintf(stderr, "f2_server: combat interact hand=%d fired\n", arg);
+        return true;
     }
 
     // Re-resolve the target NOW. It was validated when the intent was queued, but
@@ -812,6 +971,15 @@ void serverControlAdvancePending()
                 (actor != nullptr && target != nullptr && target->elevation != actor->elevation) ? 1 : 0,
                 target != nullptr ? target->id : -1, target != nullptr ? target->pid : -1,
                 pending.targetId, pending.targetPid);
+            // A GET whose target simply LEFT THE WORLD (gone, not a netId reshuffle
+            // or an elevation split) is the contested-pickup loser: someone grabbed
+            // it first. Tell that player specifically, instead of the old silent
+            // drop. Only for the target-taken case — a rebaseline id/pid mismatch or
+            // an elevation mismatch is not a steal and stays silent.
+            if (pending.verb == kInteractGet && actor != nullptr
+                && !critterIsDead(actor) && target == nullptr) {
+                interactionTargetTaken(actor);
+            }
             gPendingBySession.erase(sessionId);
             continue;
         }
@@ -921,6 +1089,23 @@ static std::vector<int> gPendingDespawns;
 
 void serverControlBeginDrain(const std::function<bool(int)>& liveSession)
 {
+    // Feature A: a combat phase change or a map load ends every actor's busy window —
+    // the animation a window was gating no longer exists (reg_anim is flushed and, on a
+    // map change, the objects are rebuilt). The window self-expires anyway; this just
+    // drops it promptly at the same boundaries that flush presentation. Cheap per-beat
+    // edge check; inert until an actor has actually been marked busy.
+    {
+        static bool sWasInCombat = false;
+        static unsigned int sLastGeneration = 0;
+        bool nowInCombat = isInCombat();
+        unsigned int nowGeneration = mapGetLoadGeneration();
+        if (nowInCombat != sWasInCombat || nowGeneration != sLastGeneration) {
+            serverActorBusyClearAll();
+            sWasInCombat = nowInCombat;
+            sLastGeneration = nowGeneration;
+        }
+    }
+
     // Release bindings whose owner has dropped. Done here (not in serverControlLine)
     // because pollInbound's onLine must not observe the client set — and doing it
     // BEFORE this beat's lines means a session that dropped last beat frees its
@@ -1388,6 +1573,15 @@ void serverControlLine(int sessionId, const char* line)
         return;
     }
 
+    if (strcmp(verb, "encaccept") == 0 || strcmp(verb, "encdecline") == 0) {
+        // Answer to a streamed random-encounter prompt. FIRST ANSWER WINS (like
+        // movdone): answered before the claimant/actor gates so any viewer shown the
+        // prompt can decide, and a late answer after the barrier freed is a no-op.
+        worldmapEncounterAnswer(strcmp(verb, "encaccept") == 0);
+        fprintf(stderr, "f2_server: control %s\n", verb);
+        return;
+    }
+
     if (strcmp(verb, "platform") == 0) {
         // `platform <name>` — the client's OS, remembered per session for the join
         // greeting. One word; anything odd is just ignored.
@@ -1728,6 +1922,35 @@ void serverControlLine(int sessionId, const char* line)
         }
     }
 
+    // A BUSY player actor's next MUTATING verb is refused until its action animation
+    // completes (feature A, PRESENTATION_PACING_DESIGN.md). This is the out-of-combat
+    // enforcement of the per-actor busy window (in combat the intent drain DEFERS
+    // instead — combat_drain.cc); it reproduces vanilla's game-loop block on a weapon
+    // holster/ready without ever blocking the sim. Same choke-point / bypass-list shape
+    // as the dead-actor gate above: read-only and meta verbs pass through. Enforced only
+    // out of combat and only when the gate is enabled (F2_SERVER_ACTION_GATE); the busy
+    // window is never marked on the headless probe, so no golden reaches this.
+    if (serverActionGateEnabled() && !isInCombat()) {
+        int busySlot = serverControlSlotForSession(sessionId);
+        bool bypass = strcmp(verb, "look") == 0
+            || strcmp(verb, "cancel") == 0
+            || strcmp(verb, "invopen") == 0
+            || strcmp(verb, "invclose") == 0
+            || strcmp(verb, "claim") == 0
+            || strcmp(verb, "login") == 0;
+        if (busySlot >= 0 && !bypass && serverActorBusyIs(busySlot)) {
+            fprintf(stderr, "f2_server: control %s dropped (actor busy, session %d)\n",
+                verb, sessionId);
+            unsigned int now = getTicks();
+            if (getTicksBetween(now, gLastBusyRefuseAt[busySlot]) >= kBusyRefuseMinGapMs
+                || gLastBusyRefuseAt[busySlot] == 0) {
+                serverControlRefuse(sessionId, "You are busy.");
+                gLastBusyRefuseAt[busySlot] = now;
+            }
+            return;
+        }
+    }
+
     // gDude := actor for the whole verb. The handlers below still read gDude in
     // places, and so does the entire callee tree beneath them (skill branches,
     // item-use script source_obj, "You…" message selection) — the scope is what
@@ -1773,6 +1996,33 @@ void serverControlLine(int sessionId, const char* line)
             reg_anim_clear(actor);
         }
         fprintf(stderr, "f2_server: control cancel\n");
+        return;
+    }
+
+    // -- hand <0|1>: switch the active weapon hand (feature A pilot) -----------
+    // Explicit target hand (0 = left, 1 = right), idempotent — NOT a toggle. Vanilla
+    // charges no AP; the only cost is the put-away/take-out animation the busy gate
+    // reproduces. Out of combat run it now (this verb is already gated by the busy
+    // reject above); in combat queue it as a 0-AP interact intent so the draw plays on
+    // the actor's own turn (combat_drain.cc → serverControlRunCombatInteract).
+    if (strcmp(verb, "hand") == 0) {
+        int hand = n >= 2 ? arg : -1;
+        if (hand != HAND_LEFT && hand != HAND_RIGHT) {
+            fprintf(stderr, "f2_server: control hand bad arg=%d ignored\n", n >= 2 ? arg : -1);
+            serverControlRefuse(sessionId, "That isn't a hand.");
+            return;
+        }
+        int slot = serverControlSlotForSession(sessionId);
+        if (slot < 0) {
+            slot = 0; // the debug CMD port has no session and drives the host
+        }
+        if (isInCombat()) {
+            combatIntentPushVerb(COMBAT_INTENT_INTERACT, kInteractHand, 0, hand, slot);
+            fprintf(stderr, "f2_server: control hand=%d queued (combat, slot=%d)\n", hand, slot);
+        } else {
+            serverControlSupersedePending(sessionId, "a hand switch");
+            serverControlSwapHand(actor, slot, hand);
+        }
         return;
     }
 
@@ -1906,19 +2156,16 @@ void serverControlLine(int sessionId, const char* line)
     // -- Worldmap travel verbs -----------------------------------------------
     // wmmove <x> <y> / wmenter / wmesc route the viewer's travel intents
     // through the trust boundary into the worldmap intent queue, which the
-    // server-side worldmap driver drains. Three gates:
-    //   * claimant — only the controlling client may drive.
+    // server-side worldmap driver drains. ANY player may drive the world map
+    // (owner decision 2026-07-23, reversing the host-only rule @c3243a1 /
+    // MP_PROPOSAL Ch 11.2): whoever clicks moves the shared party marker, and an
+    // enter takes the whole group into the location — mapHandleTransition places
+    // everyone from slot 0 regardless of who drove. The anti-grief /
+    // no-unconsented-travel asymmetry is dropped so co-op players can lead travel.
+    // One gate remains:
     //   * worldmap-active — worldmapServerActive() is false unless the driver
     //     is actually running.
     if (strcmp(verb, "wmmove") == 0 || strcmp(verb, "wmenter") == 0 || strcmp(verb, "wmesc") == 0) {
-        if (!serverControlIsHostSession(sessionId)) {
-            fprintf(stderr, "f2_server: control %s dropped (host-only screen)\n", verb);
-            // Same design rule as dialog: travel relocates everyone, so only the
-            // host drives it. An extra clicking the map is not broken, just not
-            // in charge — and has no way to know that unless we say so.
-            serverControlRefuse(sessionId, "Only the host can travel the world map.");
-            return;
-        }
         if (!worldmapServerActive()) {
             fprintf(stderr, "f2_server: control %s ignored (no active worldmap)\n", verb);
             serverControlRefuse(sessionId, "The world map is not open.");
@@ -2072,14 +2319,17 @@ void serverControlLine(int sessionId, const char* line)
         if (strcmp(verb, "look") == 0) {
             // No approach — examine streams the description (EVENT_CONSOLE). Mirror
             // vanilla's fallback: if _obj_examine has no description to give (-1), fall
-            // back to _obj_look_at (game_mouse.cc LOOK case). Allowed in combat too;
-            // only clear a pending approach walk OUT of combat (in combat there is no
-            // interaction approach in flight, and reg_anim_clear must not touch a live
-            // combat animation).
-            serverControlSupersedePending(sessionId, "an examine");
-            if (!isInCombat()) {
-                reg_anim_clear(gDude); // supersede any in-flight approach walk
-            }
+            // back to _obj_look_at (game_mouse.cc LOOK case). Allowed in combat too.
+            //
+            // ►► EXAMINE IS NON-DESTRUCTIVE. It must NOT supersede a pending approach
+            // latch or stop an in-flight walk: in vanilla LOOK only streams a
+            // description and never cancels a queued action. It used to do BOTH, which
+            // is why "I can't heal another player" — the walk-then-useitemon (verb 5)
+            // was armed toward the teammate, then a stray examine (the ARROW-mode click
+            // that landed on a wall after the item picker closed) killed the latch and
+            // reg_anim_clear'd the approach walk before the actor arrived. A latch is
+            // dropped only by a real REPLACING action (a new interact / approach / move
+            // / push / explicit cancel), never by looking at something.
             if (_obj_examine(gDude, target) == -1) {
                 _obj_look_at(gDude, target);
             }
@@ -2130,9 +2380,21 @@ void serverControlLine(int sessionId, const char* line)
             return;
         }
 
-        // talk: critter only (the unguarded fall-through). Walk-then-act (approach <
-        // 9). Verb ships; the viewer menu does not wire it until dialog-options
-        // streaming (§5).
+        // talk: critter only, and NOT another player. A player actor is a full
+        // scripted critter (it carries a live sid), so without this guard `talk` opens
+        // a real conversation on their DUDE script — which has no player-facing dialog,
+        // so gameDialogEnter engages the conversation barrier (everyone else gets
+        // "X is talking to Y, please wait") on a dialog that produces no node, at best
+        // a spurious freeze and at worst a wedged tick. You do not converse with a
+        // teammate. (mp-actor-architecture-principle: "actor I control" is, to the
+        // engine, just another scripted critter — hence the guard, not a slot test.)
+        if (playerActorIs(target)) {
+            fprintf(stderr, "f2_server: control talk target netId=%d is a player, refused\n", netId);
+            serverControlRefuse(sessionId, "That's another player.");
+            return;
+        }
+        // Walk-then-act (approach < 9). Verb ships; the viewer menu does not wire it
+        // until dialog-options streaming (§5).
         if (PID_TYPE(target->pid) != OBJ_TYPE_CRITTER) {
             fprintf(stderr, "f2_server: control talk target netId=%d not a critter\n", netId);
             serverControlRefuse(sessionId, "There is nobody there to talk to.");
@@ -2247,9 +2509,80 @@ void serverControlLine(int sessionId, const char* line)
     // still not streamed.) The mutation rides OBJECT_DELTA_
     // INVENTORY back to every viewer (Slice 2 reconcile); a dropped item also
     // arrives as a world SPAWN. Mirrors the debug-port item fns (command.cc).
+    // reload <hand>: 0=left, 1=right. Reload the WIELDED weapon in that hand from
+    // carried ammo — the viewer can't run _intface_item_reload locally (a sim mutation
+    // the server owns), so it routes here. gDude is scoped to the acting actor (line
+    // ~1753), so this reloads the RIGHT player's weapon. The loaded rounds / consumed
+    // ammo pack ride OBJECT_DELTA_INVENTORY (the inventory hash covers ammoQuantity)
+    // back to every viewer, so the ammo count updates through the Slice-2 reconcile.
+    // Out of combat it is free (load until full); in combat it is a PRICED action —
+    // this actor's turn + AP cost, mirroring vanilla _intface_use_item (interface.cc:1306).
+    if (strcmp(verb, "reload") == 0) {
+        if (gDude == nullptr) {
+            return;
+        }
+        int hand = n >= 2 ? arg : -1;
+        Object* weapon = hand == HAND_LEFT ? critterGetItem1(gDude)
+            : hand == HAND_RIGHT ? critterGetItem2(gDude)
+                                 : nullptr;
+        if (weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+            fprintf(stderr, "f2_server: control reload bad/empty hand=%d ignored\n", hand);
+            serverControlRefuse(sessionId, "There's no weapon in that hand.");
+            return;
+        }
+        bool alreadyFull = ammoGetQuantity(weapon) >= ammoGetCapacity(weapon);
+
+        if (isInCombat()) {
+            // Priced combat action: this actor's turn + AP, NOT the free inventory-session
+            // model (reload comes from the main weapon slot, not the inventory screen).
+            if (_combat_whose_turn() != gDude) {
+                fprintf(stderr, "f2_server: control reload dropped (not this actor's turn)\n");
+                serverControlRefuse(sessionId, "It isn't your turn.");
+                return;
+            }
+            int hitMode = hand == HAND_LEFT ? HIT_MODE_LEFT_WEAPON_RELOAD : HIT_MODE_RIGHT_WEAPON_RELOAD;
+            int apCost = itemGetActionPointCost(gDude, hitMode, false);
+            if (apCost > gDude->data.critter.combat.ap) {
+                fprintf(stderr, "f2_server: control reload dropped (need %d AP, have %d)\n",
+                    apCost, gDude->data.critter.combat.ap);
+                serverControlRefuse(sessionId, "You don't have enough action points.");
+                return;
+            }
+            bool loaded = false;
+            while (weaponAttemptReload(gDude, weapon) != -1) {
+                loaded = true;
+            }
+            if (loaded) {
+                gDude->data.critter.combat.ap -= apCost; // apCost <= ap checked above → non-negative
+                serverControlEmitReloadPresentation(weapon);
+            } else if (!alreadyFull) {
+                serverControlRefuse(sessionId, "Out of ammo.");
+            }
+            fprintf(stderr, "f2_server: control reload (combat) hand=%d loaded=%d apLeft=%d\n",
+                hand, loaded ? 1 : 0, gDude->data.critter.combat.ap);
+            return;
+        }
+
+        bool loaded = false;
+        while (weaponAttemptReload(gDude, weapon) != -1) {
+            loaded = true;
+        }
+        if (loaded) {
+            serverControlEmitReloadPresentation(weapon);
+        }
+        if (!loaded && !alreadyFull) {
+            // Not full, but no compatible ammo carried. Surface it — the local
+            // _intface_item_reload "Out of ammo." message can't reach a viewer.
+            serverControlRefuse(sessionId, "Out of ammo.");
+        }
+        fprintf(stderr, "f2_server: control reload hand=%d loaded=%d\n", hand, loaded ? 1 : 0);
+        return;
+    }
+
     bool isInvVerb = strcmp(verb, "invwield") == 0
         || strcmp(verb, "invunwield") == 0
         || strcmp(verb, "invdrop") == 0
+        || strcmp(verb, "unload") == 0
         || strcmp(verb, "useitem") == 0
         || strcmp(verb, "useitem_armexplosive") == 0;
     if (isInvVerb) {
@@ -2362,7 +2695,8 @@ void serverControlLine(int sessionId, const char* line)
         // the wrong slot. Carried items already carry netIds (the server numbers
         // inventory recursively and the wire ships one per item), so the acting object
         // can simply be named.
-        const bool byNetId = strcmp(verb, "invwield") == 0 || strcmp(verb, "invdrop") == 0;
+        const bool byNetId = strcmp(verb, "invwield") == 0 || strcmp(verb, "invdrop") == 0
+            || strcmp(verb, "unload") == 0;
         int pid = -1;
         Object* item = nullptr;
         int stackQty = 0;
@@ -2457,6 +2791,28 @@ void serverControlLine(int sessionId, const char* line)
             seconds -= seconds % 10;
             _obj_arm_explosive(item, seconds);
             fprintf(stderr, "f2_server: control useitem_armexplosive pid=%d seconds=%d\n", pid, seconds);
+            return;
+        }
+
+        if (strcmp(verb, "unload") == 0) {
+            // Eject loaded ammo from the (netId-addressed) weapon back into inventory,
+            // mirroring the inventory ctx-menu UNLOAD leaf (inventory_ui.cc). The weapon
+            // drains every ammo pack back into the dude. The returned void gives no
+            // "did anything" signal, so check the loaded count first. Freed ammo objects
+            // get netIds on the next assign pass and stream out as new inventory items;
+            // the weapon's cleared ammoQuantity rides OBJECT_DELTA_INVENTORY (Slice-2
+            // reconcile). inventoryResident mirrors vanilla's `itemSlot == nullptr`: a
+            // main-list weapon is popped-and-re-added (true) to re-fold its stack, a
+            // wielded (hand-slot) one is left in place (false) — passing true there would
+            // itemRemove an in-hand object.
+            if (itemGetType(item) != ITEM_TYPE_WEAPON || ammoGetQuantity(item) <= 0) {
+                fprintf(stderr, "f2_server: control unload pid=%d nothing to eject\n", pid);
+                serverControlRefuse(sessionId, "There's nothing to unload.");
+                return;
+            }
+            bool wielded = (item->flags & OBJECT_IN_ANY_HAND) != 0;
+            weaponUnloadIntoInventory(gDude, item, !wielded);
+            fprintf(stderr, "f2_server: control unload pid=%d\n", pid);
             return;
         }
 
@@ -2578,14 +2934,23 @@ void serverControlLine(int sessionId, const char* line)
                 fprintf(stderr, "[dude-equip] pid=%d type=%d hand=%d dudeFid=0x%x rhandPid=%d inCombat=%d\n",
                     pid, itemGetType(item), hand, gDude->fid, h2 ? h2->pid : -1, isInCombat() ? 1 : 0);
             }
-        } else { // invdrop — drop the whole top-level stack (partial drops = later)
+        } else { // invdrop — drop `count` of the addressed top-level stack
+            // `invdrop <netId> [count]`: the viewer's ctx-menu count modal answers how
+            // many (inventory_ui.cc). CLAMPED to the stack the server actually holds —
+            // the viewer's mirror can be a reconcile behind, and an absent/garbage count
+            // (an older client, or the drag-out leaf) means the whole stack, which is
+            // what this verb used to do unconditionally.
+            int qty = (n >= 3 && arg2 > 0) ? arg2 : stackQty;
+            if (qty > stackQty) {
+                qty = stackQty;
+            }
             // Dropping WORN armor must also strip its AC bonus (itemDropStack only moves
             // the object) — same _adjust_ac the invunwield-armor path uses.
             if (itemGetType(item) == ITEM_TYPE_ARMOR && (item->flags & OBJECT_WORN) != 0) {
                 _adjust_ac(gDude, item, nullptr);
             }
-            itemDropStack(gDude, item, stackQty);
-            fprintf(stderr, "f2_server: control invdrop pid=%d qty=%d\n", pid, stackQty);
+            itemDropStack(gDude, item, qty);
+            fprintf(stderr, "f2_server: control invdrop pid=%d qty=%d\n", pid, qty);
         }
         return;
     }
