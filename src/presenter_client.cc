@@ -126,14 +126,32 @@ public:
         _gsound_play_sfx_file_volume(name, volume);
     }
 
-    void screenFadeOut() override
+    // The address is irrelevant here: this presenter drives ONE screen belonging to
+    // ONE local player, so a fade aimed at that player and a fade aimed at everyone
+    // are the same fade. Byte-identical to before for single-player and the goldens.
+    void screenFadeOut(int actorNetId) override
     {
+        (void)actorNetId;
         paletteFadeTo(gPaletteBlack);
     }
 
-    void screenFadeIn() override
+    void screenFadeIn(int actorNetId) override
     {
+        (void)actorNetId;
         paletteFadeTo(_cmap);
+    }
+
+    // Same "one local screen, so addressed and broadcast are the same thing" argument
+    // as the fades. Byte-identical to the previous direct gameUiDisable/gameUiEnable
+    // call for single-player and the goldens.
+    void screenInputLock(bool locked, int actorNetId) override
+    {
+        (void)actorNetId;
+        if (locked) {
+            gameUiDisable(0);
+        } else {
+            gameUiEnable();
+        }
     }
 
     void hudEndButtonsShow(bool animated) override

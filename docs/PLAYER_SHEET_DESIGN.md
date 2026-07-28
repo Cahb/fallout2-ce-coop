@@ -261,8 +261,8 @@ A perk reaches the sim one of three ways, and only one of them ever needed fixin
 | Perk(s) | Site | Why still open |
 |---|---|---|
 | Awareness, Comprehension, Demolition Expert | proto_instance.cc:304/790/903, queue.cc:481 | ⚠ **UNAUDITED — the real candidates.** Nobody has opened these |
-| Silent Running | animation.cc:653/736/2531 | blocked on per-actor SNEAK (`dudeHasState` is a PC-global) |
-| Silent Death | combat.cc, both sites | same sneak blocker — generalising it without sneak grants an extra a x4 backstab whenever the HOST sneaks |
+| ~~Silent Running~~ | animation.cc:653/736 | **DONE 2026-07-25** — sneak is per-actor (`dudeHasState`/`dudeIsSneaking` take a subject), so both sites read the moving owner. Note animation.cc is f2_client-only; the server's mover is server_anim.cc |
+| ~~Silent Death~~ | combat.cc, both sites | **DONE 2026-07-25** — per-attacker, unblocked by the same change. The old note was right to hold it: generalising the perk alone would have handed an extra a x4 backstab whenever the HOST sneaked |
 | Educated | stat.cc:689/705 | inside `pcLevelUpApply`, blocked on per-player level-up |
 | Master Trader | item.cc:3782 | barter is stubbed for extras anyway |
 | Night Vision | light.cc:51 | bucket A — global light / camera, not a sheet read |
@@ -328,3 +328,138 @@ live in `character_editor_state.cc` (f2_core) because they round-trip through th
 **So the award must move off the screen-open trigger and onto the sheet, per actor**, driven
 from the same `pcAddExperienceWithOptions` level loop the announcement hooks. The perk
 DIALOG stays client-side and per-player; only the owed-pick bookkeeping moves.
+
+---
+
+## 9. FINISHING THE SHEET — audited state + the granular edit protocol (2026-07-25)
+
+►► **STATUS: BUILT 2026-07-25.** Owner-specified functionality, not a defect — nothing
+regressed, this was never built. Owner: *"clients gotta send intents i wanna bump (if allowed /
+if have points to spare cos of levelup and stuff) skills or perks xyz; it's not a gap, it's
+missing functionality i just explicitly said should exist."*
+
+What shipped, and where it lives:
+- `src/sheet_intent.{h,cc}` — the ruling layer: entitlement, range checks, the undo baseline,
+  and the `ServerActorScope` that makes the host-only skill leaves work for any actor. Its
+  header holds the four reasons the layer exists; read that before changing a leaf.
+- Wire verbs `sheetopen`/`sheetclose`/`skillup`/`skilldown`/`perkpick`/`tagpick`/`mutpick`
+  (`server_control.cc`), exempt from the dead-actor and busy gates via one shared predicate.
+- Admin verbs `sheet`/`sp`/`skillup`/`skilldown`/`perkpick` (`server_admin.cc`) — the same
+  rulings, addressed by slot, so the path is testable without two machines.
+- The client editor emits intents instead of mutating (`character_editor.cc`), and repaints
+  when the row lands. **The unconditional rollback is gone** — see §9.5.
+- `scripts/check_sheet.sh` (in `check.sh`) — a TWO-SEAT headless gate over the rulings. The
+  only gate that runs N>1, so the only one that can catch a spend landing in the wrong row.
+
+►► **THE ONE THING THAT WAS NOT IN THIS SECTION'S PLAN, and had to be built:** nobody was
+ever AWARDED anything to spend. `pcLevelUpApply` was called only by `characterEditorUpdateLevel`,
+i.e. lazily, the next time somebody opened the character screen — vanilla awards HP in the XP
+funnel but skill points on the screen. A dedicated server has no screen, and every player's
+screen is server-owned, so the intents would have been inert. The award moved into
+`pcAddExperienceWithOptions`' level loop, per earner, and `pcLevelUpApply` now takes a subject
+(it read gDude's INT / Educated / traits for whoever levelled). The owed perk moved off the
+shared `gCharacterEditorHasFreePerk` PC-global onto a per-actor flag (`perkOwedPickGet/Set`,
+perk.cc) that rides the sheet row, which also closes §8's "P1 opening their sheet consumes P2's
+perk" bug. Two goldens were re-blessed for the timing change (see run_golden.sh's notes on
+`arvillag_actions` / `arvillag_perks`): a level-13 character now HOLDS unspent points instead of
+being handed them by a screen.
+
+⚠ **Live-unverified**: the character SCREEN half (the +/- buttons, the perk dialog, the
+Tag!/Mutate! follow-ups, the repaint-on-delta) has no headless oracle. The rulings underneath it
+are gated.
+
+Owner: *"do we carry OK / respect: perks learnt, (negative traits on char creations), skill
+bumps ... the verbs protocol gotta be granular: i skilled a single point into GUNS or UNARMED;
+or i learnt this <perk> ... this should round trip from srv back to client ... + absolutely
+carry out in saves ... every single negative trait, every single perk and every single skill
+there is; it's time we finish char sheet right; 100% no excuses"*.
+
+Audited before planning. **Most of it already works** — the gap is narrower and more specific
+than "the sheet is unfinished", so this section records what NOT to rebuild.
+
+### 9.1 ALREADY DONE — per-actor storage, and it is all in the save
+`playerSheetRowWrite` (player_sheet.cc) writes SIX rows per slot into the PAC2 appendix, and
+`playerSheetRowRead` restores them. Everything the owner listed is already covered:
+
+| row writer | carries |
+|---|---|
+| `protoPlayerActorRowWrite` | SPECIAL **and every skill's base value** (`proto->critter.data.skills[]` — the dude's skills live in its proto, and each actor has its own proto row; slot 0's row IS gDudeProto) |
+| `perkPlayerActorRowWrite` | **every perk rank** (`perkPlayerActorRow(slot)` / `perkGetRankData(critter)`) |
+| `pcPlayerActorRowWrite` | XP, LEVEL, **unspent skill points** |
+| `traitsPlayerActorRowWrite` | **both trait slots, negatives included** (`traitRow(subject)`) |
+| `skillsPlayerActorTaggedRowWrite` | the tagged skills |
+| `critterPlayerActorNameRowWrite` | the name |
+
+So: perks, traits (including negatives), skill values and unspent points are per-actor and
+persisted **today**. Do not add storage or a save section for them.
+
+### 9.2 ALREADY DONE — the result round-trip
+`perkAdd` ends with `playerSheetMarkDirty(critter)`, and the sheet delta channel
+(`EVENT_PLAYER_SHEET`, one slot + a one-slot PSHT block) streams the WHOLE row to that actor's
+client. The owner's "the result of it essentially should round trip from srv back to client" is
+therefore **already the mechanism** — an applied edit re-streams the authoritative row, and the
+client's next sheet read shows it. Nothing new is needed on the return path.
+
+### 9.3 THE ACTUAL GAP — three items, all small
+1. ►► **No player can edit the sheet at all.** `characterEditorShowViewOnly()` is
+   `characterEditorShow(0)` followed by `characterEditorRestorePlayer()` — it deliberately
+   DISCARDS edits ("local edits are drift the next rebaseline reverts", main.cc). Every co-op
+   player is a viewer, so **nobody can spend a skill point or take a perk in co-op right now**,
+   host included. That is the whole reported problem.
+2. ►► **`skillAdd` / `skillAddForce` are HOST-ONLY and read the wrong budget.** `skill.cc:400`
+   opens with `if (obj != gDude) return -5;`, and inside, `pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS)`
+   and the matching `pcSetStat` are called **with no subject**, i.e. against gDude's row. The
+   skill WRITE itself is already per-actor (it indexes `obj->pid`'s proto), so only the budget
+   and the guard are wrong.
+   ►► **Fix by running the spend inside a `ServerActorScope(actor)`** rather than by rewriting
+   the leaves: the scope rebinds gDude to the acting actor, which makes `obj != gDude` pass AND
+   makes both pc-stat calls resolve to that actor's row. Same trick the per-reader narration and
+   the in-turn combat paths use. Rewriting the leaves to take a subject is the tidier long-term
+   shape but is NOT needed to ship this, and it touches vanilla signatures.
+3. **No granular verbs.** Needed, exactly as the owner framed them — one point, one perk, one
+   intent:
+   - `skillup <skillId>` — spend ONE point in one skill. Server: resolve the session's actor,
+     `ServerActorScope`, `skillAdd(actor, skill)`, honour its return (-4 not enough points, -3
+     at the 300%% cap, -5 invalid) and refuse with that reason.
+   - `perkpick <perkId>` — `perkAdd(actor, perk)`, which already validates prerequisites via
+     `perkCanAdd` and already marks the sheet dirty.
+   Both are INTENTS: the client sends them and renders whatever row comes back, never its own
+   optimistic edit. Validate the id against range + the real allow-lists (an untrusted index
+   into `gPerkDescriptions` / `gSkillDescriptions` is an out-of-bounds read on the one shared
+   sim — the same discipline as the `cattack` hitLocation clamp).
+
+### 9.4 Deferred spending comes free
+*"you can bump few skills and close exp / char view for later"* needs no work: unspent points
+live in the per-actor pc row (§9.1) and are already saved, so a partial spend persists across
+closing the screen, a rebaseline, and a save/load. It falls out of doing §9.3 correctly and
+should be verified rather than built.
+
+### 9.5 Client side — BUILT
+`characterEditorShowViewOnly` now brackets the screen with `sheetopen`/`sheetclose` and its
+spends emit verbs; `characterEditorSheetIsServerOwned()` (= `clientViewerActive()`) is the one
+predicate every converted leaf branches on. Three notes worth keeping:
+- ►► **The rollback had to GO, not just be bypassed.** It restored the snapshot taken when the
+  screen OPENED, so leaving it in place would have wiped the rows the server streamed in while
+  the screen was up. "Done" and "Cancel" now both just close; every spend was already committed
+  one at a time on the authority that owns it.
+- **No optimistic display and no hold-to-repeat.** A press sends one intent; the number moves
+  when the row comes back (`clientViewerConsumeSheetDirty` in the editor's main loop). Auto-repeat
+  would fire a verb per frame into a per-beat line cap and the extra presses would vanish
+  silently.
+- **The follow-up dialogs stay local** (which skill, which trait is a UI question) but commit
+  through `tagpick`/`mutpick` **by id, never by line number** — the perk dialog sorts
+  alphabetically, so a line index would make the protocol depend on the client's render order
+  and on the language of its message file. Cancel sends `-1`.
+
+~~Still to do: the level-up availability flag...~~ **The FLAG landed 2026-07-25.**
+`DUDE_STATE_LEVEL_UP_AVAILABLE` is per-actor (the whole `dude*State` trio takes a subject and marks
+the row dirty, so it streams), and — importantly — it is **re-derived**, not event-set:
+`pcLevelUpBadgeRefresh` computes it from unspent points + an owed perk pick, and the sheet intents
+call it after every spend. Vanilla's only clear path is "the player closed the character screen",
+which an authority without a screen never does, so an event-set badge would have lit forever
+([[no-re-derivation-path-bug-class]]). The client re-derives its indicator bar from each arriving
+sheet row (`client_net.cc onPlayerSheet` → `indicatorBarRefresh`).
+
+Still host-only, and correctly so: the interface REPAINTS in `pcAddExperienceWithOptions` (they act
+on this process's single interface bar) and the `levelup` chime, which has no addressed sfx seam
+yet — see the coverage doc's "addressing mechanism for personal sfx/fades".

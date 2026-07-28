@@ -46,18 +46,26 @@ static bool gTileScrollBlockingEnabled = true;
 // 0x51D958
 static bool gTileScrollLimitingEnabled = true;
 
-// F2_UNLOCK_CAMERA=1 removes the player-offset scroll LEASH (the ~480x/400y
-// "max distance the view may sit from gDude" clamp in tileSetCenter), so the
-// camera can be panned freely out to the map border. The map-edge border and
-// the script/cutscene scroll blockers are UNCHANGED — you can pan to the edge
-// of the world, not into the void. Read once. Off by default (vanilla feel +
-// golden-inert). Motivated by the co-op viewer, where the leash is anchored to
-// gDude and combat's recenter-on-actor leaves the view pinned against it, but
-// it is binary-agnostic. Overrides gTileScrollLimitingEnabled so a mid-session
-// script/map toggle of that global cannot re-arm the leash under the operator.
+// The player-offset scroll LEASH — the ~480x/400y "max distance the view may sit from
+// gDude" clamp in tileSetCenter — is REMOVED, so the camera pans freely out to the map
+// border. The map-edge border and the script/cutscene scroll blockers are UNCHANGED: you
+// can pan to the edge of the world, not into the void.
+//
+// ►► DEFAULT ON. It shipped default-off behind F2_UNLOCK_CAMERA=1, which was the wrong
+// way round and meant the feature effectively did not exist — the owner reported the
+// camera still leashed and reasonably assumed it had never been done. Every feature ships
+// on; the only sanctioned env var is a kill switch, so this is now F2_UNLOCK_CAMERA=0.
+//
+// It matters most on the co-op viewer, where the leash is anchored to gDude and combat's
+// recenter-on-actor leaves the view pinned against it — you cannot look at the fight you
+// are in. Overrides gTileScrollLimitingEnabled so a mid-session script/map toggle of that
+// global cannot re-arm the leash under the operator.
 static bool tileScrollLeashUnlocked()
 {
-    static bool unlocked = getenv("F2_UNLOCK_CAMERA") != nullptr;
+    static bool unlocked = []() {
+        const char* value = getenv("F2_UNLOCK_CAMERA");
+        return value == nullptr || value[0] != '0';
+    }();
     return unlocked;
 }
 

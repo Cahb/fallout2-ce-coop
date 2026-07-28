@@ -44,11 +44,6 @@ typedef struct ElevatorBackground {
     int panelFrmId;
 } ElevatorBackground;
 
-typedef struct ElevatorDescription {
-    int map;
-    int elevation;
-    int tile;
-} ElevatorDescription;
 
 static int elevatorWindowInit(int elevator);
 static void elevatorWindowFree();
@@ -89,183 +84,7 @@ static ElevatorBackground gElevatorBackgrounds[ELEVATORS_MAX] = {
     { 143, 150 },
 };
 
-// Number of levels for eleveators.
-//
-// 0x43EA1C
-static int gElevatorLevels[ELEVATORS_MAX] = {
-    4,
-    2,
-    3,
-    2,
-    3,
-    2,
-    3,
-    3,
-    3,
-    3,
-    3,
-    2,
-    4,
-    2,
-    3,
-    3,
-    3,
-    2,
-    2,
-    2,
-    2,
-    2,
-    2,
-    2,
-};
 
-// 0x43EA7C
-static ElevatorDescription gElevatorDescriptions[ELEVATORS_MAX][ELEVATOR_LEVEL_MAX] = {
-    {
-        { 14, 0, 18940 },
-        { 14, 1, 18936 },
-        { 15, 0, 21340 },
-        { 15, 1, 21340 },
-    },
-    {
-        { 13, 0, 20502 },
-        { 14, 0, 14912 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 33, 0, 12498 },
-        { 33, 1, 20094 },
-        { 34, 0, 17312 },
-        { 0, 0, -1 },
-    },
-    {
-        { 34, 0, 16140 },
-        { 34, 1, 16140 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 49, 0, 14920 },
-        { 49, 1, 15120 },
-        { 50, 0, 12944 },
-        { 0, 0, -1 },
-    },
-    {
-        { 50, 0, 24520 },
-        { 50, 1, 25316 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 42, 0, 22526 },
-        { 42, 1, 22526 },
-        { 42, 2, 22526 },
-        { 0, 0, -1 },
-    },
-    {
-        { 42, 2, 14086 },
-        { 43, 0, 14086 },
-        { 43, 2, 14086 },
-        { 0, 0, -1 },
-    },
-    {
-        { 40, 0, 14104 },
-        { 40, 1, 22504 },
-        { 40, 2, 17312 },
-        { 0, 0, -1 },
-    },
-    {
-        { 9, 0, 13704 },
-        { 9, 1, 23302 },
-        { 9, 2, 17308 },
-        { 0, 0, -1 },
-    },
-    {
-        { 28, 0, 19300 },
-        { 28, 1, 19300 },
-        { 28, 2, 20110 },
-        { 0, 0, -1 },
-    },
-    {
-        { 28, 2, 20118 },
-        { 29, 0, 21710 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 28, 0, 20122 },
-        { 28, 1, 20124 },
-        { 28, 2, 20940 },
-        { 29, 0, 22540 },
-    },
-    {
-        { 12, 1, 16052 },
-        { 12, 2, 14480 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 6, 0, 14104 },
-        { 6, 1, 22504 },
-        { 6, 2, 17312 },
-        { 0, 0, -1 },
-    },
-    {
-        { 30, 0, 14104 },
-        { 30, 1, 22504 },
-        { 30, 2, 17312 },
-        { 0, 0, -1 },
-    },
-    {
-        { 36, 0, 13704 },
-        { 36, 1, 23302 },
-        { 36, 2, 17308 },
-        { 0, 0, -1 },
-    },
-    {
-        { 39, 0, 17285 },
-        { 36, 0, 19472 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 109, 2, 10701 },
-        { 109, 1, 10705 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 109, 2, 14697 },
-        { 109, 1, 15099 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 109, 2, 23877 },
-        { 109, 1, 25481 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 109, 2, 26130 },
-        { 109, 1, 24721 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 137, 0, 23953 },
-        { 148, 1, 16526 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-    {
-        { 62, 0, 13901 },
-        { 63, 1, 17923 },
-        { 0, 0, -1 },
-        { 0, 0, -1 },
-    },
-};
 
 // NOTE: These values are also used as key bindings.
 //
@@ -332,77 +151,50 @@ static FrmImage _elevatorFrmImages[ELEVATOR_FRM_COUNT];
 static FrmImage _elevatorBackgroundFrmImage;
 static FrmImage _elevatorPanelFrmImage;
 
-// Ledger H-57 (extracted from the elevator UI): normalize the player's
-// current map/elevation into the elevator's gauge level index, including the
-// Sierra Army Depot / Military Base remap math.
-int elevatorResolveStartLevel(int elevator, int map, int elevation)
-{
-    const ElevatorDescription* elevatorDescription = gElevatorDescriptions[elevator];
-
-    int index;
-    for (index = 0; index < ELEVATOR_LEVEL_MAX; index++) {
-        if (elevatorDescription[index].map == map) {
-            break;
-        }
-    }
-
-    if (index < ELEVATOR_LEVEL_MAX) {
-        if (elevatorDescription[elevation + index].tile != -1) {
-            elevation += index;
-        }
-    }
-
-    if (elevator == ELEVATOR_SIERRA_2) {
-        if (elevation <= 2) {
-            elevation -= 2;
-        } else {
-            elevation -= 3;
-        }
-    } else if (elevator == ELEVATOR_MILITARY_BASE_LOWER) {
-        if (elevation >= 2) {
-            elevation -= 2;
-        }
-    } else if (elevator == ELEVATOR_MILITARY_BASE_UPPER && elevation == 4) {
-        elevation -= 2;
-    }
-
-    if (elevation > 3) {
-        elevation -= 3;
-    }
-
-    return elevation;
-}
-
-// Ledger H-57: resolve a chosen elevator level into its {map, elevation,
-// tile} destination from the elevator table.
-void elevatorResolveDestination(int elevator, int level, int* mapPtr, int* elevationPtr, int* tilePtr)
-{
-    const ElevatorDescription* description = &(gElevatorDescriptions[elevator][level]);
-    *mapPtr = description->map;
-    *elevationPtr = description->elevation;
-    *tilePtr = description->tile;
-}
 
 // Presents elevator dialog for player to pick a desired level.
 //
 // 0x43EF5C
 int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr)
 {
+    int startLevel = elevatorResolveStartLevel(elevator, *mapPtr, *elevationPtr);
+    int level = elevatorPickLevel(elevator, startLevel);
+    if (level < 0) {
+        return level == -2 ? -1 : 0; // -2 = could not open the screen; -1 = escaped
+    }
+
+    elevatorResolveDestination(elevator, level, mapPtr, elevationPtr, tilePtr);
+
+    return 0;
+}
+
+// THE PICKER, split out of elevatorSelectLevel so the co-op client can ask "which
+// button did the player press" WITHOUT resolving what that button means.
+//
+// ►► That separation is the trust boundary (elevator.h): in co-op the server owns the
+// destination table and resolves the level itself, so this returns a LEVEL INDEX and
+// nothing else. Returns -1 if the player escaped, -2 if the screen could not open.
+//
+// The gauge animation stays — it is local, already written, and it is what makes the
+// ride read as a ride. The RIDE itself is instant either way.
+int elevatorPickLevel(int elevator, int startLevel)
+{
     if (elevator < 0 || elevator >= ELEVATORS_MAX) {
-        return -1;
+        return -2;
     }
 
     // SFALL
     if (elevatorWindowInit(elevator) == -1) {
-        return -1;
+        return -2;
     }
 
-    *elevationPtr = elevatorResolveStartLevel(elevator, *mapPtr, *elevationPtr);
+    int elevationValue = startLevel;
+    int* elevationPtr = &elevationValue;
 
     debugPrint("\n the start elev level %d\n", *elevationPtr);
 
     int v18 = (_elevatorFrmImages[ELEVATOR_FRM_GAUGE].getWidth() * _elevatorFrmImages[ELEVATOR_FRM_GAUGE].getHeight()) / 13;
-    float v42 = 12.0f / (float)(gElevatorLevels[elevator] - 1);
+    float v42 = 12.0f / (float)(elevatorLevelCount(elevator) - 1);
     blitBufferToBuffer(
         _elevatorFrmImages[ELEVATOR_FRM_GAUGE].getData() + v18 * (int)((float)(*elevationPtr) * v42),
         _elevatorFrmImages[ELEVATOR_FRM_GAUGE].getWidth(),
@@ -442,7 +234,7 @@ int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tileP
         keyCode -= 500;
 
         if (*elevationPtr != keyCode) {
-            float v43 = (float)(gElevatorLevels[elevator] - 1) / 12.0f;
+            float v43 = (float)(elevatorLevelCount(elevator) - 1) / 12.0f;
 
             unsigned int delay = (unsigned int)(v43 * 276.92307);
 
@@ -455,7 +247,7 @@ int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tileP
                 numberOfLevelsTravelled = -numberOfLevelsTravelled;
             }
 
-            soundPlayFile(gElevatorSoundEffects[gElevatorLevels[elevator] - 2][numberOfLevelsTravelled]);
+            soundPlayFile(gElevatorSoundEffects[elevatorLevelCount(elevator) - 2][numberOfLevelsTravelled]);
 
             float v41 = (float)keyCode * v42;
             float v44 = (float)(*elevationPtr) * v42;
@@ -486,11 +278,7 @@ int elevatorSelectLevel(int elevator, int* mapPtr, int* elevationPtr, int* tileP
 
     elevatorWindowFree();
 
-    if (keyCode != KEY_ESCAPE) {
-        elevatorResolveDestination(elevator, keyCode, mapPtr, elevationPtr, tilePtr);
-    }
-
-    return 0;
+    return keyCode != KEY_ESCAPE ? keyCode : -1;
 }
 
 // 0x43F324
@@ -598,7 +386,7 @@ static int elevatorWindowInit(int elevator)
     }
 
     int y = 40;
-    for (int level = 0; level < gElevatorLevels[elevator]; level++) {
+    for (int level = 0; level < elevatorLevelCount(elevator); level++) {
         int btn = buttonCreate(gElevatorWindow,
             13,
             y,
@@ -663,8 +451,14 @@ static int elevatorGetLevelFromKeyCode(int elevator, int keyCode)
     return 0;
 }
 
+// The ART half of the sfall elevators.ini override; elevatorsDataInit()
+// (elevator_data.cc, f2_core) owns the level count and the destination table, and
+// is called from here so the one existing call site still initialises both halves.
+// The server calls the data half directly.
 void elevatorsInit()
 {
+    elevatorsDataInit();
+
     char* elevatorsFileName;
     configGetString(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_ELEVATORS_FILE_KEY, &elevatorsFileName);
     if (elevatorsFileName != nullptr && *elevatorsFileName == '\0') {
@@ -680,25 +474,9 @@ void elevatorsInit()
                 for (int index = 0; index < ELEVATORS_MAX; index++) {
                     snprintf(sectionKey, sizeof(sectionKey), "%d", index);
 
-                    if (index >= ELEVATOR_COUNT) {
-                        int levels = 0;
-                        configGetInt(&elevatorsConfig, sectionKey, "ButtonCount", &levels);
-                        gElevatorLevels[index] = std::clamp(levels, 2, ELEVATOR_LEVEL_MAX);
-                    }
-
                     configGetInt(&elevatorsConfig, sectionKey, "MainFrm", &(gElevatorBackgrounds[index].backgroundFrmId));
                     configGetInt(&elevatorsConfig, sectionKey, "ButtonsFrm", &(gElevatorBackgrounds[index].panelFrmId));
 
-                    for (int level = 0; level < ELEVATOR_LEVEL_MAX; level++) {
-                        snprintf(key, sizeof(key), "ID%d", level + 1);
-                        configGetInt(&elevatorsConfig, sectionKey, key, &(gElevatorDescriptions[index][level].map));
-
-                        snprintf(key, sizeof(key), "Elevation%d", level + 1);
-                        configGetInt(&elevatorsConfig, sectionKey, key, &(gElevatorDescriptions[index][level].elevation));
-
-                        snprintf(key, sizeof(key), "Tile%d", level + 1);
-                        configGetInt(&elevatorsConfig, sectionKey, key, &(gElevatorDescriptions[index][level].tile));
-                    }
                 }
 
                 // NOTE: Sfall implementation is slightly different. It uses one
@@ -713,7 +491,6 @@ void elevatorsInit()
                         type = std::clamp(type, 0, ELEVATORS_MAX - 1);
                         if (index != type) {
                             memcpy(&(gElevatorBackgrounds[index]), &(gElevatorBackgrounds[type]), sizeof(*gElevatorBackgrounds));
-                            memcpy(&(gElevatorLevels[index]), &(gElevatorLevels[type]), sizeof(*gElevatorLevels));
                             memcpy(&(gElevatorLevelLabels[index]), &(gElevatorLevelLabels[type]), sizeof(*gElevatorLevelLabels));
                         }
                     }

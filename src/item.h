@@ -76,6 +76,17 @@ int weaponGetCriticalFailureType(Object* weapon);
 int weaponGetPerk(Object* weapon);
 int weaponGetBurstRounds(Object* weapon);
 int weaponGetAnimationCode(Object* weapon);
+
+// ►► DOES THIS CRITTER'S ART HAVE FRAMES FOR WIELDING THIS WEAPON? Asks the SAME question
+// _invenWieldFunc asks before equipping (inventory.cc: buildFid + artExists), but from a
+// weapon PID, so a caller can pick a weapon a critter can actually hold WITHOUT creating a
+// candidate object per guess.
+//
+// Worth a named function because the failure it prevents is nasty and silent: a critter
+// handed a weapon its frame set has no animation for does not equip it and FIGHTS UNARMED —
+// looking armed to the operator while punching. A tribal body with a rifle, or the dude with
+// a throwing knife (both observed in this codebase).
+bool weaponArtSupportedForCritter(Object* critter, int weaponPid);
 int weaponGetProjectilePid(Object* weapon);
 int weaponGetAmmoTypePid(Object* weapon);
 char weaponGetSoundId(Object* weapon);

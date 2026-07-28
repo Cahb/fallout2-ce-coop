@@ -1,5 +1,10 @@
 #include "server_loop.h"
 
+#include <climits> // INT_MAX — an absent damage cap, see the CombatStartData note below
+#include <cstring>
+
+#include <functional>
+
 #include <cstdlib>
 #include <vector>
 
@@ -162,6 +167,15 @@ bool headlessProbeActive()
     return gHeadlessProbeActive;
 }
 
+bool serverFeatureEnabled(const char* name)
+{
+    const char* value = getenv(name);
+    if (value != nullptr) {
+        return strcmp(value, "0") != 0;
+    }
+    return !headlessProbeActive();
+}
+
 bool serverDedicatedActive()
 {
     return serverLoopActive() && !headlessProbeActive();
@@ -209,17 +223,18 @@ static void serverEmitJoinBlob()
         return;
     }
 
-    const char* tmpPath = getenv("F2_JOIN_TMP");
-    if (tmpPath == nullptr) {
-        tmpPath = "/tmp/f2ce_join_srv.bin";
-    }
 
     // mapSaveToStream stamps the saved bit and _map_save_file rewrites darkness /
     // elevation flags / var counts on gMapHeader — a live-state perturbation on the
     // RUNNING server (nit #6). Snapshot and restore the header around it.
     MapHeader savedHeader = gMapHeader;
 
-    File* out = fileOpen(tmpPath, "wb");
+    // ►► RAM, NOT /tmp. This used to write the blob to a scratch file and immediately read
+    // it straight back, only because there was no in-memory File to write into — leaving a
+    // file behind on every baseline and making two servers on one box fight over the path
+    // (F2_JOIN_TMP existed to work around exactly that). fileOpenMemoryWrite is that missing
+    // half; the bytes come out with fileMemoryData and there is nothing to clean up.
+    File* out = fileOpenMemoryWrite();
     if (out == nullptr) {
         gMapHeader = savedHeader;
         return;
@@ -228,23 +243,20 @@ static void serverEmitJoinBlob()
     int rc = mapSaveToStream(out, &mapBodyLen);
     int totalLen = (int)fileTell(out);
     int mapSaveVersion = gMapHeader.version;
-    fileClose(out);
     gMapHeader = savedHeader;
 
     if (rc == -1 || totalLen <= 0) {
+        fileClose(out);
         return;
     }
 
-    File* in = fileOpen(tmpPath, "rb");
-    if (in == nullptr) {
+    const unsigned char* written = fileMemoryData(out);
+    if (written == nullptr || fileMemorySize(out) < totalLen) {
+        fileClose(out);
         return;
     }
-    std::vector<unsigned char> blob(totalLen);
-    size_t got = fileRead(blob.data(), 1, (size_t)totalLen, in);
-    fileClose(in);
-    if ((int)got != totalLen) {
-        return;
-    }
+    std::vector<unsigned char> blob(written, written + totalLen);
+    fileClose(out);
 
     // dudeBlobLen is the whole post-map APPENDIX (dude + any extra actors); the
     // sections self-delimit, and actorCount tells the viewer how many to read.
@@ -305,6 +317,14 @@ void serverEmitPlayerRoster()
 // narrate presenters (none override the delimiters) → byte-identical.
 //
 // MUST be called after objectDeltaReset() has assigned netids, never before.
+// Server-authored holodisk announcer, installed by f2_server (see server_loop.h).
+static std::function<void()> gHolodiskAnnouncer;
+
+void serverSetHolodiskAnnouncer(std::function<void()> announcer)
+{
+    gHolodiskAnnouncer = std::move(announcer);
+}
+
 static void serverEmitBaseline()
 {
     gBaselineGeneration = mapGetLoadGeneration();
@@ -378,6 +398,12 @@ static void serverEmitBaseline()
     // its OWN screen (while others saw it correctly off the wire). No-op under the
     // null/file presenter, so goldens are unaffected. [[vault-suit-appearance-gap]]
     presenter()->movieSeenState(gameMoviesSeenData(), MOVIE_COUNT);
+
+    // Server-authored holodisks (SERVER INFORMATION). Re-announced with every baseline,
+    // which is why they need no persistence — see server_control.cc serverEmitHolodisks.
+    if (gHolodiskAnnouncer) {
+        gHolodiskAnnouncer();
+    }
 }
 
 // A map LOAD wholesale-replaces the object set AND recycles every netId:
@@ -463,6 +489,22 @@ void serverTick(int tick, const std::function<void(int)>& intentsDrain, bool adv
         CombatStartData csd {};
         csd.attacker = combatInitiator;
         csd.defender = nullptr;
+        // ►►►► maxDamage IS A CAP, AND ZERO MEANS ZERO. `_combat_attack` clamps
+        // `_main_ctd.defenderDamage` down to `_gcsd->maxDamage` (combat.cc:4380) whenever
+        // _gcsd is non-null, and _gcsd points at the combat session's copy of THIS struct
+        // until it is cleared after the first turn. A zero-initialised CSD therefore caps
+        // every attack in the opening turns at zero damage — owner-reported as "I munch
+        // people with bare hands for no damage, no damage, no damage", and measured with
+        // F2_TRACE_DAMAGE: a punch computing 2 and a shotgun computing 21 both landed for 0,
+        // while an attack made later (after _gcsd had been cleared) kept its damage. The
+        // narration was telling the truth the whole time; the damage really was gone.
+        //
+        // Vanilla never hits this because _gcsd is only non-null for a SCRIPTED attack
+        // (attack_setup / op_attack_complex), and those set min/max deliberately. We
+        // synthesise a CSD purely to seat initiative, so it has to express "no damage
+        // override" — and the honest encoding of an absent upper bound is INT_MAX, not 0.
+        csd.minDamage = 0;
+        csd.maxDamage = INT_MAX;
         _combat(&csd);
     }
 
@@ -482,6 +524,13 @@ void serverTick(int tick, const std::function<void(int)>& intentsDrain, bool adv
     // under the null presenter, so goldens are unaffected; auto-rebaselines on
     // the map change mapHandleTransition may have just performed.
     objectDeltaScan();
+
+    // Ship the global variables that changed this beat (quest steps, karma, "you have
+    // holodisk X"). Same discipline as objectDeltaScan — a shadow diff, no-op under the
+    // null presenter — and the reason it must exist at all is that NOTHING streamed
+    // gvars before, so every client froze its pipboy/character-screen state at its
+    // baseline. See object_delta.h.
+    gvarDeltaScan();
 
     // Ship any per-actor sheet rows that changed this beat (chem stat mods, etc.).
     // Same discipline as objectDeltaScan: no-op off a network presenter, so
@@ -596,6 +645,7 @@ static void serverInstall()
     // state rather than emitting the whole map as deltas. Also (re)assigns the
     // deterministic net ids that the snapshot below and the event stream carry.
     objectDeltaReset();
+    gvarDeltaReset(); // ...and the gvar shadow, against the same freshly-loaded world
 
     // Emit the join baseline snapshot (MP_PROTOCOL.md §7): the ground-truth
     // position of every object already present, which no lifecycle event will

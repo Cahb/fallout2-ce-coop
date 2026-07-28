@@ -38,6 +38,10 @@ int _invenWieldFunc(Object* critter, Object* item, int hand, bool animate);
 int _inven_unwield(Object* critter, int hand);
 // Same as inven_unwield but allows to unwield item without animation.
 int _invenUnwieldFunc(Object* critter, int hand, bool animate);
+// Recompute the fid's weapon nibble (0xF000) from the critter's CURRENT hand contents. Call
+// after any path that removes a wielded weapon without going through wield/unwield, or the
+// sprite keeps holding something that no longer exists. No-op when both hands are armed.
+void invenRederiveWeaponFid(Object* critter);
 int inventoryOpenLooting(Object* looter, Object* target);
 int inventoryOpenStealing(Object* thief, Object* target);
 void inventoryOpenTrade(int win, Object* barterer, Object* playerTable, Object* bartererTable, int barterMod);
@@ -57,6 +61,35 @@ void barterSetServerPump(std::function<bool()> pump);
 // and hold the screen until the server ends the trade. Not a trade -- the trade
 // is the server's; this is what it looks like. See the note at the definition.
 void inventoryOpenTradeViewer(Object* merchant, Object* playerTable, Object* merchantTable);
+
+// -- STEAL / PICKPOCKET / PLANT, server-authoritative (co-op) ---------------
+// The dedicated server owns the steal screen the way it owns a trade: it runs
+// the session, rolls the Steal skill for every transfer, and parks the tick
+// while the thief works. See stealSessionRun's definition for the whole shape.
+
+// Run a steal session on the server. Called from the dedicated server's
+// SCRIPT_REQUEST_STEALING handler; blocks (pumping the control channel) until
+// the thief closes the screen, is caught, or the pump bails.
+void stealSessionRun(Object* thief, Object* target);
+
+// Park the server tick inside an OPEN steal screen and service the control
+// channel until the thief's next intent lands (the steal twin of
+// barterSetServerPump). Returning false bails the session. Installed by
+// f2_server only; nullptr everywhere else.
+void stealSetServerPump(std::function<bool()> pump);
+
+// Is a steal session live right now, and who is in it? The trust boundary for
+// the stake/splant/sdone verbs: a steal verb is meaningless (and must be
+// refused) outside a session the sender's own actor is driving.
+bool stealSessionActive();
+Object* stealSessionThief();
+Object* stealSessionTarget();
+
+// VIEWER-side steal screen: render the vanilla loot/steal window anchored on
+// the THIEF (so every player watches the same pockets being emptied, which is
+// the point), with transfers rerouted to the steal verbs for the thief and
+// refused for everyone else.
+void inventoryOpenStealingViewer(Object* thief, Object* target);
 int _inven_set_timer(Object* item);
 Object* inven_get_current_target_obj();
 

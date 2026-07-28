@@ -47,6 +47,30 @@ void perkPlayerActorClearRanksSlot(int slot);
 int perkPlayerActorRowWrite(File* stream, int slot);
 int perkPlayerActorRowRead(File* stream, int slot);
 
+// The OWED FREE PERK PICK for one actor — the level-up entitlement, per player.
+// The XP funnel (pcAddExperienceWithOptions) sets it when a level crosses the
+// perk cadence; the pick clears it. `nullptr` means gDude, the same "no subject
+// in hand" default the stat/trait resolvers use.
+//
+// ⚠ This is what makes a perk pick BOUNDED. perkAdd/perkCanAdd only check
+// prerequisites, never entitlement, so a caller that skips this flag lets a
+// player take every perk they qualify for.
+// Does this actor owe at least one free perk pick?
+bool perkOwedPickGet(Object* critter);
+// How many — a multi-level XP award can owe several (levels 3, 6, 9, …).
+int perkOwedPickCount(Object* critter);
+// Award (+1) or spend (-1) ONE pick, clamped at zero. EVERY award/spend must come
+// through here: perkOwedPickSet is absolute, so using it to spend would wipe a
+// two- or three-perk debt down to nothing.
+void perkOwedPickAdd(Object* critter, int delta);
+// ABSOLUTE set (0 or 1) — restoring a snapshot, or a load. Not for award/spend.
+void perkOwedPickSet(Object* critter, bool owed);
+
+// The owed-pick flag as a sheet-row field (one byte). Slot 0's copy is what the
+// savegame's characterEditorSave/Load byte holds, so this pair carries extras.
+int perkPlayerActorOwedPickRowWrite(File* stream, int slot);
+int perkPlayerActorOwedPickRowRead(File* stream, int slot);
+
 // Returns true if perk is valid.
 static inline bool perkIsValid(int perk)
 {

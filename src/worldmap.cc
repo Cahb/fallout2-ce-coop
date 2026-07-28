@@ -28,6 +28,7 @@
 #include "input.h"
 #include "interface.h"
 #include "item.h"
+#include "map.h" // mapSetEnteringLocation — an entrance carries its arrival spot
 #include "kb.h"
 #include "memory.h"
 #include "mouse.h"
@@ -40,6 +41,8 @@
 #include "queue.h"
 #include "random.h"
 #include "scripts.h"
+#include "server_players.h" // playerActorAt/Online — the party is every player, not slot 0
+#include "msg_channel.h" // kMsgChannelReward — the encounter-catch XP is addressed
 #include "client_net.h" // clientViewerActive — viewer skips the local map teardown
 #include "server_loop.h"
 #include "settings.h"
@@ -277,6 +280,23 @@ static const char* wmFormationStrs[ENCOUNTER_FORMATION_TYPE_COUNT] = {
     "cone",
     "huddle",
 };
+
+// The "You have encountered…" line, held from wmSetupRandomEncounter (which runs
+// inside mapLoad, where every network emission is suppressed) until the driver can
+// emit it on the far side of the load. Empty = nothing pending. See the note at the
+// snprintf that fills it and wmEncounterDescriptionFlush that drains it.
+static char wmEncounterDescription[512] = "";
+
+// TEST HOOK (`encnext` on the admin port): arm the NEXT encounter check to fire and to
+// be DETECTED, so the accept/decline prompt is reachable on demand. Without it the
+// prompt sits behind two dice — the frequency roll and the Outdoorsman roll — and
+// exercising it means travelling for minutes with a pumped skill and hoping. One-shot:
+// consumed by the check it arms, so it can never leave the sim biased.
+//
+// It arms the ORDINARY path rather than short-circuiting to a map: wmForceEncounter
+// (the sfall opcode) is NOT the same thing — that branch skips the detection roll and
+// the prompt entirely and calls mapLoadById itself, so it tests neither.
+static bool wmForceNextEncounter = false;
 
 // 0x51DEA0
 unsigned int wmLastRndTime = 0;
@@ -2684,18 +2704,31 @@ void worldmapEncounterAnswer(bool accept)
 // any other viewer still showing the prompt on release.
 static bool wmEncounterPromptBarrier(const char* title, const char* body)
 {
+    // TEMP DIAGNOSTIC [wmenc]: "I got the Outdoorsman XP but no prompt appeared, and
+    // then I was in the encounter anyway" has three indistinguishable causes and this
+    // is the only place that can tell them apart: no pump installed (we return enter
+    // without ever asking), a bail (nobody left to answer → enter), or an ANSWER that
+    // arrived so fast it must have come from the client's own queued input rather than
+    // from a person. Ordinary play prints two lines per encounter.
     if (gEncounterServerPump == nullptr) {
+        fprintf(stderr, "[wmenc] prompt SKIPPED — no server pump installed; defaulting to ENTER\n");
         return true; // no viewers to prompt (probe / bare server) → enter
     }
+    fprintf(stderr, "[wmenc] prompt emitted: \"%s\" / \"%s\"\n",
+        title != nullptr ? title : "(null)", body != nullptr ? body : "(null)");
     presenter()->encounterPrompt(title, body);
     gEncounterAnswered = false;
     bool bailed = false;
+    int spins = 0;
     while (!gEncounterAnswered) {
+        spins++;
         if (!gEncounterServerPump()) {
             bailed = true;
             break;
         }
     }
+    fprintf(stderr, "[wmenc] prompt released: bailed=%d accept=%d pumpSpins=%d\n",
+        bailed ? 1 : 0, gEncounterAccepted ? 1 : 0, spins);
     presenter()->encounterClose(); // break other viewers out of their prompt box
     return bailed ? true : gEncounterAccepted;
 }
@@ -2807,7 +2840,12 @@ static int wmRndEncounterOccurred()
     }
 
     int chance = randomBetween(0, 100);
-    if (chance >= frequency) {
+    // Consume the test hook here, where the frequency roll would otherwise end the
+    // check. Taken BEFORE the early return and unconditionally, so one `encnext` arms
+    // exactly one encounter whether or not the dice would have obliged.
+    bool forced = wmForceNextEncounter;
+    wmForceNextEncounter = false;
+    if (!forced && chance >= frequency) {
         return 0;
     }
 
@@ -2857,11 +2895,26 @@ static int wmRndEncounterOccurred()
 
     bool randomEncounterIsDetected = false;
     if (frequency > chance) {
-        int outdoorsman = partyGetBestSkillValue(SKILL_OUTDOORSMAN);
-        Object* scanner = objectGetCarriedObjectByPid(gDude, PROTO_ID_MOTION_SENSOR);
-        if (scanner != nullptr) {
-            if (gDude == scanner->owner) {
+        // GROUP scope: travelling is something the whole party does, so every online
+        // living player's Outdoorsman counts (partyGetBestSkillValue widens to them).
+        // Before this an extra who was the party's designated scout contributed nothing
+        // and it read as bad luck.
+        int partyBest = partyGetBestSkillValue(SKILL_OUTDOORSMAN);
+        int outdoorsman = partyBest;
+
+        // The Motion Sensor helps whoever is CARRYING it, not only the host: the bonus
+        // used to search gDude's inventory alone, so an extra packing the scanner gave
+        // the party no benefit at all.
+        int actorCount = playerActorCount();
+        for (int slot = 0; slot < actorCount; slot++) {
+            Object* carrier = playerActorAt(slot);
+            if (carrier == nullptr || !playerActorOnline(slot)) {
+                continue;
+            }
+            Object* scanner = objectGetCarriedObjectByPid(carrier, PROTO_ID_MOTION_SENSOR);
+            if (scanner != nullptr && carrier == scanner->owner) {
                 outdoorsman += 20;
+                break;
             }
         }
 
@@ -2874,9 +2927,29 @@ static int wmRndEncounterOccurred()
         wmFindCurTileFromPos(wmGenData.worldPosX, wmGenData.worldPosY, &tile);
         debugPrint("\nEncounter Difficulty Mod: %d", tile->encounterDifficultyModifier);
 
+        int outdoorsmanBeforeTile = outdoorsman;
         outdoorsman += tile->encounterDifficultyModifier;
 
-        if (randomBetween(1, 100) < outdoorsman) {
+        // TEMP DIAGNOSTIC [wmenc]: THE DECISION POINT for "I have never once seen the
+        // encounter yes/no prompt". Detection is the ONLY gate in front of it, and it is
+        // this single comparison — so the question is whether the roll is unlucky or
+        // whether `outdoorsman` is simply 0, in which case the prompt is unreachable by
+        // construction and no amount of playing will ever show it. partyGetBestSkillValue
+        // is the suspect: on a dedicated server there is no acting-player scope out here
+        // on the worldmap, and a 0 from it looks exactly like bad luck from the outside.
+        // Vanilla start is ~25-35, so a party best of 0 is the tell.
+        int detectRoll = randomBetween(1, 100);
+        if (forced) {
+            // Arm detection too: an undetected encounter drops you straight in with no
+            // prompt, which is the one outcome this hook exists to skip past.
+            detectRoll = 0;
+        }
+        fprintf(stderr, "[wmenc] detect: partyBest=%d +sensor/cap=%d +tileMod=%d => outdoorsman=%d roll=%d -> %s\n",
+            partyBest, outdoorsmanBeforeTile,
+            tile->encounterDifficultyModifier, outdoorsman, detectRoll,
+            detectRoll < outdoorsman ? "DETECTED (prompt)" : "undetected (no prompt, straight in)");
+
+        if (detectRoll < outdoorsman) {
             randomEncounterIsDetected = true;
 
             int xp = 100 - outdoorsman;
@@ -2884,15 +2957,21 @@ static int wmRndEncounterOccurred()
                 // SFALL: Display actual xp received.
                 debugPrint("WorldMap: Giving Player [%d] Experience For Catching Rnd Encounter!", xp);
 
+                // Credit the player whose Outdoorsman actually carried the roll. The
+                // award used to have no subject at all, so it landed on slot 0 however
+                // the encounter was spotted — and the line was broadcast, telling every
+                // player they had earned it.
+                Object* spotter = partyGetBestSkillPlayerActor(SKILL_OUTDOORSMAN);
                 int xpGained;
-                pcAddExperience(xp, &xpGained);
+                pcAddExperience(xp, &xpGained, spotter);
 
                 MessageListItem messageListItem;
                 char* text = getmsg(&gMiscMessageList, &messageListItem, 8500);
                 if (strlen(text) < 110) {
                     char formattedText[120];
                     snprintf(formattedText, sizeof(formattedText), text, xpGained);
-                    presenter()->consoleMessage(formattedText);
+                    presenter()->consoleMessageStyled(spotter != nullptr ? spotter->netId : 0,
+                        kMsgChannelReward, formattedText);
                 } else {
                     debugPrint("WorldMap: Error: Rnd Encounter string too long!");
                 }
@@ -2904,6 +2983,14 @@ static int wmRndEncounterOccurred()
 
     wmGenData.oldWorldPosX = wmGenData.worldPosX;
     wmGenData.oldWorldPosY = wmGenData.worldPosY;
+
+    // TEMP DIAGNOSTIC [wmenc]: the SPOT decision, which is what decides whether a
+    // prompt happens at all. A failed Outdoorsman roll means the party never saw the
+    // encounter coming, so vanilla gives no prompt and drops you straight in — that
+    // is correct, and it is indistinguishable from a broken prompt without this line.
+    fprintf(stderr, "[wmenc] roll: table=%d entry=%d map=%d detected=%d (chance=%d freq=%d inCar=%d)\n",
+        wmGenData.encounterTableId, wmGenData.encounterEntryId, wmGenData.encounterMapId,
+        randomEncounterIsDetected ? 1 : 0, chance, frequency, wmGenData.isInCar ? 1 : 0);
 
     if (randomEncounterIsDetected) {
         MessageListItem messageListItem;
@@ -3087,6 +3174,15 @@ int wmSetupRandomEncounter()
         getmsg(&wmMsgFile, &messageListItem, 2998),
         getmsg(&wmMsgFile, &messageListItem, 3000 + 50 * wmGenData.encounterTableId + wmGenData.encounterEntryId));
     presenter()->consoleMessage(formattedText);
+    // ►► ...AND THAT CALL REACHES NO VIEWER, because we are INSIDE mapLoad's emission
+    // suppression window (map.cc opens it at the top and closes it at the very bottom;
+    // wmSetupRandomEncounter is called from the middle). The network presenter drops
+    // every console line for the duration — deliberately, so a joining client is not
+    // buried in the map's own lifecycle flood — while the local/SP presenter ignores
+    // the flag and prints as always. So single player names the encounter and co-op
+    // says nothing at all: you fade in surrounded by hostiles with no idea what they
+    // are. Keep a copy for the driver to emit once the window has closed.
+    snprintf(wmEncounterDescription, sizeof(wmEncounterDescription), "%s", formattedText);
 
     int gameDifficulty = settings.preferences.game_difficulty;
     switch (encounterTableEntry->scenery) {
@@ -3119,7 +3215,9 @@ int wmSetupRandomEncounter()
             break;
         }
 
-        int partyMemberCount = _getPartyMemberCount();
+        // Sizing, not gating: a bigger real group draws a bigger encounter, which is
+        // the group-effects ruling and costs nobody access to anything.
+        int partyMemberCount = partyGroupSize();
         if (partyMemberCount > 2) {
             critterCount += 2;
         }
@@ -3829,6 +3927,38 @@ void wmTransitionSaveMap()
 void wmTransitionSuspendScripts()
 {
     scriptsDisable();
+
+    // ►►►► THE VIEWER'S HALF OF @1b007f6, AND IT KILLED THE CLIENT. The server driver
+    // stopped doing this destructive step at screen-open for exactly one reason:
+    // vanilla's worldmap has ONE exit (enter a location) so a mapLoadById always
+    // rebuilds what was destroyed, while OURS can exit having loaded nothing (ESC, and
+    // every pump bail). The client's worldmap has the same two doors — and the same
+    // teardown, which nobody moved. The sibling above already refuses the object half
+    // for a viewer; this is the script half.
+    //
+    // Left in, it is a hard crash, not a degradation: _scr_remove_all SKIPS scripts
+    // flagged SCRIPT_FLAG_0x10 (the dude script and every party member) but still calls
+    // programListFree(), which frees their Program. Those survivors keep both the freed
+    // pointer AND SCRIPT_FLAG_0x01 ("program already loaded"), so scriptExecProc never
+    // reloads them — it reads program->flags out of freed memory and calls
+    // _executeProcedure on it. Cancelling the trip re-enables scripts over that
+    // wreckage, and the next map_update heartbeat runs it:
+    //   _executeProcedure -> _setupCall -> programReturnStackPushValue: "Stack overflow"
+    //   (a garbage return-stack count) -> programFatalError -> siglongjmp on a jmp_buf
+    //   that was never set -> SIGSEGV.
+    // Exactly the trace in the 2026-07-27 core (queueProcessEvents ->
+    // scriptsExecMapUpdateScripts -> scriptExecProc), and it is the SECOND worldmap trip
+    // that dies because the first one is what frees the programs.
+    //
+    // Skipping it costs the viewer nothing: scriptsDisable() alone covers the whole trip
+    // (scriptExecProc is the single funnel for every proc, queued timed events included,
+    // and early-returns while disabled), and the real teardown still happens where it
+    // belongs — the rebaseline's mapLoad -> _obj_remove_all -> _scr_remove_all. Single
+    // player keeps the vanilla behavior; it has no ESC out of the worldmap.
+    if (clientViewerActive()) {
+        return;
+    }
+
     _scr_remove_all();
 }
 
@@ -3840,6 +3970,29 @@ void wmEncounterStagingClear()
     wmGenData.encounterMapId = -1;
     wmGenData.encounterTableId = -1;
     wmGenData.encounterEntryId = -1;
+    // Drop an unflushed description with the encounter it describes. Single player
+    // never flushes (its presenter printed the line at the source, suppression flag
+    // and all), and this is the one call vanilla already makes on every worldmap
+    // exit — so the buffer cannot survive into a later, unrelated encounter.
+    wmEncounterDescription[0] = '\0';
+}
+
+// Emit the encounter description that mapLoad's suppression window swallowed. Called
+// by the server's worldmap driver immediately after the encounter map is loaded, i.e.
+// once emissions are live again and the world the line is about actually exists. A
+// no-op when there is nothing pending, so calling it on a plain city arrival is free.
+void worldmapForceNextEncounter()
+{
+    wmForceNextEncounter = true;
+}
+
+void wmEncounterDescriptionFlush()
+{
+    if (wmEncounterDescription[0] == '\0') {
+        return;
+    }
+    presenter()->consoleMessage(wmEncounterDescription);
+    wmEncounterDescription[0] = '\0';
 }
 
 // ...and resume the script engine for the entered map.
@@ -4043,6 +4196,11 @@ static void wmHotspotDimensions(int* widthPtr, int* heightPtr)
     if (!wasLocked) {
         wmGenData.hotspotNormalFrmImage.unlock();
     }
+}
+
+int wmAreaCount()
+{
+    return wmMaxAreaNum;
 }
 
 // 0x4C3F00
@@ -4477,6 +4635,45 @@ int wmAreaFindFirstValidMap(int* mapIdxPtr)
 
     EntranceInfo* entrance = &(city->entrances[0]);
     entrance->state = 1;
+
+    *mapIdxPtr = entrance->map;
+    return 0;
+}
+
+// ►► THE CLIENT MAY NAME AN ENTRANCE; ONLY THE SERVER SAYS WHERE IT LEADS.
+//
+// The town map is the district picker every city has and co-op did not: with streaming
+// on, the viewer used to send an unconditional "enter" and the server took
+// wmAreaFindFirstValidMap, so you always arrived at a city's FIRST map and could never
+// choose a district or a named entrance anywhere in the game.
+//
+// The screen belongs to the client (it is city art plus buttons, and the server has no
+// art), so the viewer renders vanilla's own town map and sends back an ENTRANCE INDEX.
+// The destination is resolved HERE, against the server's own table — exactly the
+// elevator rule, and for the same reason: a map index arriving off the wire would be a
+// teleport-anywhere primitive. An out-of-range index, or an entrance this world has not
+// discovered yet, is refused rather than clamped.
+int wmAreaResolveEntrance(int entranceIndex, int* mapIdxPtr)
+{
+    *mapIdxPtr = -1;
+
+    if (wmGenData.currentAreaId == -1) {
+        return -1;
+    }
+
+    CityInfo* city = &(wmAreaInfoList[wmGenData.currentAreaId]);
+    if (entranceIndex < 0 || entranceIndex >= city->entrancesLength) {
+        return -1;
+    }
+
+    EntranceInfo* entrance = &(city->entrances[entranceIndex]);
+    if (entrance->state == 0) {
+        return -1;
+    }
+
+    // Where in the map you appear is part of the entrance, not of the map — this is
+    // what makes "the north gate" different from "the docks".
+    mapSetEnteringLocation(entrance->elevation, entrance->tile, entrance->rotation);
 
     *mapIdxPtr = entrance->map;
     return 0;

@@ -33,6 +33,7 @@
 #include "random.h"
 #include "reaction.h"
 #include "scripts.h"
+#include "server_loop.h" // serverDedicatedActive — the Motion Sensor opens the USER's automap
 #include "server_players.h" // playerActorIs — per-actor traits/perks
 #include "sfall_config.h"
 #include "skill.h"
@@ -1810,6 +1811,31 @@ int weaponGetAnimationCode(Object* weapon)
     return proto->item.data.weapon.animationCode;
 }
 
+bool weaponArtSupportedForCritter(Object* critter, int weaponPid)
+{
+    if (critter == nullptr) {
+        return false;
+    }
+    Proto* proto;
+    if (protoGetProto(weaponPid, &proto) == -1 || proto == nullptr) {
+        return false;
+    }
+    if (PID_TYPE(weaponPid) != OBJ_TYPE_ITEM || proto->item.type != ITEM_TYPE_WEAPON) {
+        return false; // reading weapon.animationCode off a non-weapon proto is garbage
+    }
+    // MIRRORS inventory.cc's pre-wield check exactly, including its use of the PRIMARY
+    // right-hand hit mode (index = extendedFlags & 0xF). If that computation ever changes,
+    // this must change with it or the pre-check stops predicting the real one.
+    int weaponAnimationCode = proto->item.data.weapon.animationCode;
+    int index = proto->item.extendedFlags & 0xF;
+    int hitModeAnimationCode = (index >= 0 && index < (int)(sizeof(_attack_anim) / sizeof(_attack_anim[0])))
+        ? _attack_anim[index]
+        : ANIM_THROW_PUNCH;
+    int fid = buildFid(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, hitModeAnimationCode,
+        weaponAnimationCode, critter->rotation + 1);
+    return artExists(fid);
+}
+
 // 0x478DD0
 int weaponGetProjectilePid(Object* weapon)
 {
@@ -2293,7 +2319,17 @@ int _item_m_use_charged_item(Object* critter, Object* miscItem)
     } else if (pid == PROTO_ID_MOTION_SENSOR) {
         // NOTE: Uninline.
         if (miscItemConsumeCharge(miscItem) == 0) {
-            automapShow(true, true);
+            // ►► THIS USED TO KILL THE SERVER. automapShow opens a modal screen, so on
+            // the core-only server it resolved to the aborting client stub — and the
+            // Motion Sensor is an ordinary carryable item, so any player using one ended
+            // everybody's session. The automap is viewer-local state (the server keeps
+            // none: automapSaveCurrent is a deliberate no-op), so the authority tells
+            // THIS user's client to open ITS own, and nobody else's.
+            if (serverDedicatedActive()) {
+                presenter()->automapOpen(critter->netId, true);
+            } else {
+                automapShow(true, true);
+            }
         } else {
             MessageListItem messageListItem;
             // %s has no charges left.
@@ -3309,6 +3345,15 @@ bool inventoryApCostApply(Object* critter)
         }
 
         presenter()->hudActionPoints(critter->data.critter.combat.ap, _combat_free_move);
+        // TEMP DIAGNOSTIC (inventory-AP-not-repainted): did the charge land, and with
+        // what before/after? hudActionPoints is a no-op on the network presenter, so
+        // the only way this reaches a viewer is the next objectDeltaScan's AP bit.
+        if (getenv("F2_TRACE_EVENTS") != nullptr) {
+            fprintf(stderr, "[invap] charged net=%d cost=%d ap %d -> %d\n",
+                critter->netId, actionPointsRequired,
+                critter->data.critter.combat.ap + actionPointsRequired,
+                critter->data.critter.combat.ap);
+        }
     }
 
     return true;
@@ -3806,14 +3851,21 @@ int barterComputeValue(Object* dude, Object* npc, Object* barterTable, int barte
     int caps = itemGetTotalCaps(barterTable);
     int costWithoutCaps = cost - caps;
 
+    // MASTER TRADER belongs to whoever is at the table. `dude == gDude` was correct only
+    // because a ServerActorScope rebinds gDude to the barter driver — asking the actor
+    // directly is the same answer without depending on that.
     double perkBonus = 0.0;
-    if (dude == gDude) {
-        if (perkHasRank(gDude, PERK_MASTER_TRADER)) {
+    if (playerActorIs(dude)) {
+        if (perkHasRank(dude, PERK_MASTER_TRADER)) {
             perkBonus = 25.0;
         }
     }
 
-    int partyBarter = partyGetBestSkillValue(SKILL_BARTER);
+    // ►► THE PRICE IS SET BY THE PLAYER AT THE TABLE (plus their companions), not by the
+    // best haggler in the session. Owner ruling: a trade is a solo act. Before this,
+    // partyGetBestSkillValue walked gPartyMembers — which extras are not in — so an
+    // extra's Barter skill was worth exactly nothing and they paid host prices.
+    int partyBarter = partyGetBestSkillValueFor(SKILL_BARTER, dude);
     int npcBarter = skillGetValue(npc, SKILL_BARTER);
 
     // VERIFIED against fallout2.exe 1.02d @ 0x474B2C: the literal constants

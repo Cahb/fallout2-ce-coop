@@ -180,6 +180,10 @@ void _scripts_request_combat_locked(CombatStartData* combat);
 void scripts_request_townmap();
 void scriptsRequestWorldMap();
 int scriptsRequestElevator(Object* a1, int a2);
+// The player who pressed the elevator button, captured at REQUEST time (the drain
+// runs a beat later, outside that player's ServerActorScope). Never null — falls
+// back to gDude.
+Object* scriptsRequestedElevatorRider();
 int scriptsRequestExplosion(int tile, int elevation, int minDamage, int maxDamage);
 void scriptsRequestDialog(Object* a1);
 void scriptsRequestEndgame();

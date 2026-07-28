@@ -43,7 +43,7 @@ kill -0 "$SRV" 2>/dev/null || fail "server died at boot"
 
 # Viewer A: joins at stream start (the classic path). No DEBUGACTIVE (see above).
 ( cd "$GAME" && exec env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-    F2_CLIENT_CONNECT=127.0.0.1:$WIRE F2_JOIN_TMP_CLIENT=/tmp/f2ce_gate_viewA.bin \
+    F2_CLIENT_CONNECT=127.0.0.1:$WIRE \
     "$ROOT/build/fallout2-ce" >/dev/null 2>&1 ) &
 VIEW_A=$!
 sleep 3
@@ -58,7 +58,7 @@ sleep 2
 
 # Viewer B: the mid-stream joiner. DEBUGACTIVE=log → FO2/debug.log is B's.
 ( cd "$GAME" && exec env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy DEBUGACTIVE=log \
-    F2_CLIENT_CONNECT=127.0.0.1:$WIRE F2_JOIN_TMP_CLIENT=/tmp/f2ce_gate_viewB.bin \
+    F2_CLIENT_CONNECT=127.0.0.1:$WIRE \
     "$ROOT/build/fallout2-ce" >/dev/null 2>&1 ) &
 VIEW_B=$!
 sleep 4
@@ -84,5 +84,5 @@ echo "$TRIP" | grep -q "bad=0" || fail "tripwire misalignment: $TRIP"
 echo "$TRIP" | grep -Eq "ok=[1-9]" || fail "tripwire scored zero objects: $TRIP"
 grep -aq "world loaded (load #1)" "$GAME/debug.log" || fail "joiner never loaded a world"
 
-rm -f "$GAME/debug.log" /tmp/f2ce_gate_viewA.bin /tmp/f2ce_gate_viewB.bin
+rm -f "$GAME/debug.log"
 echo "PASS midjoin — joiner tripwire clean ($TRIP), viewer A survived the rebaseline"

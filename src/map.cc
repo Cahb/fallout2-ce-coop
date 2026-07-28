@@ -823,9 +823,22 @@ int mapLoad(File* stream)
         scriptExecProc(gMapSid, SCRIPT_PROC_MAP_ENTER);
         _scr_spatials_enable();
 
-        error = "Error Setting up random encounter";
-        if (wmSetupRandomEncounter() == -1) {
-            goto err;
+        // ►► NOT ON A VIEWER. A viewer builds this map from the server's blob, and
+        // every encounter critter in it is an ordinary streamed object with a netId —
+        // so spawning our own here would double the ambush with a set of ghosts the
+        // server has never heard of, unaddressable by any verb. The exposure is real
+        // rather than theoretical: encounterMapId is part of the SAVED worldmap block
+        // (worldmap.cc wmWorldMap_save), and the baseline is emitted from inside this
+        // same mapLoad, one step below — so a blob taken on arrival carries a live
+        // staged encounter to every client that applies it.
+        //
+        // Same reasoning as the map-enter script suppression above: the server already
+        // ran this, and its result is in the blob we are adopting.
+        if (!gMapViewerLoad) {
+            error = "Error Setting up random encounter";
+            if (wmSetupRandomEncounter() == -1) {
+                goto err;
+            }
         }
     }
 

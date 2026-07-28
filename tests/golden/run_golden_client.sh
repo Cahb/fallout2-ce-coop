@@ -54,7 +54,7 @@ run_case() {
     (cd "$GAME_DIR" && env \
         SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         F2_FAKE_CLOCK=1 F2_HEADLESS_PROBE=1 F2_SERVER_LOOP=1 \
-        F2_NETSTREAM="$nets" F2_JOIN_TMP="$nets.srvblob" \
+        F2_NETSTREAM="$nets" \
         F2_PROBE_MAP="$map" F2_PROBE_SEED="$seed" F2_PROBE_TICKS="$ticks" \
         F2_PROBE_DUMP="$sdump" \
         ${actions:+F2_PROBE_ACTIONS="$actions"} \
@@ -68,7 +68,7 @@ run_case() {
         SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         F2_FAKE_CLOCK=1 F2_HEADLESS_PROBE=1 \
         F2_PROBE_MAP="$map" F2_PROBE_SEED="$seed" \
-        F2_CLIENT_STREAM_IN="$nets" F2_JOIN_TMP_CLIENT="$nets.cliblob" \
+        F2_CLIENT_STREAM_IN="$nets" \
         F2_PROBE_DUMP="$cdump" \
         timeout -k 5 300 "$BIN" >/dev/null 2>&1) || {
         echo "FAIL $name — client exited non-zero / timed out (decode failure?)"; return; }

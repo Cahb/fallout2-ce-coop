@@ -40,11 +40,23 @@ CASES=(
   "melee|artemple.map|4000|500:cattack:60,505:aggro:3"
 )
 
-run() { # $1=dump path  $2=err path  $3=REC (non-empty => record on)
+# ►► AND SO MUST THE PACING. F2_SERVER_PACE_MS is a wall-clock sleep PER TICK whose
+# default belongs to live play, not to a harness: at the shipped 100 ms this case's 4000
+# ticks need 400 s and the 120 s timeout below kills the run, which the loop then reports
+# as "off run crashed" — a real 2026-07-27 false positive that cost an A/B bisect to
+# unmask. A golden must pin every server default it cannot afford, exactly as it pins the
+# recorder below.
+#
+# ►► THE "OFF" ARM MUST DISABLE EXPLICITLY. Features are ON by default for a server
+# (server_loop.h serverFeatureEnabled) — this harness drives f2_server, not the headless
+# probe, so an unset F2_SERVER_PRES_RECORD would now mean RECORD ON and both arms would be
+# identical, making the gate vacuously pass. It is the GOLDEN's job to opt out.
+run() { # $1=dump path  $2=err path  $3=REC (non-empty => record on, else explicitly off)
     (cd "$GAME_DIR" && env \
         F2_SERVER_MAP="$MAP" F2_SERVER_SEED="$SEED" F2_SERVER_TICKS="$TICKS" \
         F2_SERVER_ACTIONS="$ACTIONS" F2_SERVER_DUMP="$1" F2_SERVER_LEAKPROBE=1 \
-        ${3:+F2_SERVER_PRES_RECORD=1} \
+        F2_SERVER_PACE_MS=0 \
+        F2_SERVER_PRES_RECORD="${3:+1}${3:-0}" \
         timeout -k 5 120 "$BIN" > /dev/null 2>"$2") || { echo "  (binary exited non-zero)"; return 1; }
 }
 

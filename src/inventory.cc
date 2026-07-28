@@ -43,6 +43,7 @@
 #include "random.h"
 #include "reaction.h"
 #include "server_loop.h"
+#include "server_players.h"
 #include "scripts.h"
 #include "skill.h"
 #include "stat.h"
@@ -372,11 +373,48 @@ int _invenWieldFunc(Object* critter, Object* item, int handIndex, bool animate)
             hand = HAND_RIGHT;
         }
 
-        int weaponAnimationCode = weaponGetAnimationCode(item);
-        int hitModeAnimationCode = weaponGetAnimationForHitMode(item, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+        // ►►►► THE GATE BELOW IS A WEAPON QUESTION, AND ONLY A WEAPON HAS THE FIELDS IT
+        // READS. weaponGetAnimationCode reads proto->item.data.weapon.animationCode — the
+        // FIRST INT OF A UNION. On a misc item that is `misc.powerTypePid`, on a drug it is
+        // `drug.stat[0]`; the number that comes back is not an animation code, it is
+        // whatever the other arm happens to hold. A shovel (pid 289) has powerTypePid -1,
+        // so this built a fid with weapon nibble 0xF, artExists said no, and the wield was
+        // REFUSED — you could not put a shovel in your hand. A stimpak reads stat[0] = 7
+        // and fails the same way. Vanilla gets away with it because its inventory screen
+        // never calls this for a hand drop (_switch_hand just parks the item in the UI
+        // slot); our co-op viewer routes every hand equip through the invwield verb, so the
+        // server runs the wield for real and the garbage read became a player-visible wall.
+        //
+        // Vanilla's own code, 90 lines below, is the oracle: it recomputes this exact value
+        // as `itemGetType(item) == ITEM_TYPE_WEAPON ? weaponGetAnimationCode(item) : 0`.
+        // The guard existed; the gate simply predated it. Non-weapon = unarmed art, which
+        // every critter has, so the wield proceeds and the hand slot works as it does in
+        // single player. (weaponArtSupportedForCritter already refuses to read a non-weapon
+        // proto for the same reason — this is that rule applied where it was missing.)
+        bool itemIsWeapon = itemType == ITEM_TYPE_WEAPON;
+        int weaponAnimationCode = itemIsWeapon ? weaponGetAnimationCode(item) : 0;
+        int hitModeAnimationCode = itemIsWeapon
+            ? weaponGetAnimationForHitMode(item, HIT_MODE_RIGHT_WEAPON_PRIMARY)
+            : ANIM_STAND;
         int fid = buildFid(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, hitModeAnimationCode, weaponAnimationCode, critter->rotation + 1);
         if (!artExists(fid)) {
+            // ►►►► THIS FAILURE WAS INVISIBLE ON THE DEDICATED SERVER, and it silently
+            // degrades combat: the critter does NOT equip the weapon, so it fights
+            // UNARMED — no wielded weapon on any client, no draw, and punch-range
+            // attacks from something the operator believes is armed. Vanilla only
+            // debugPrints it, and f2_server never installs gDebugPrintProc, so the line
+            // goes nowhere ([[presentation-backpressure-gap]]'s gotcha).
+            //
+            // The cause is ART, not logic: this critter's base body has no animation for
+            // (hit-mode, weapon) — a tribal/civilian frame set with a rifle, say. Already
+            // confirmed once in this codebase: it is why the check.sh combat gates fought
+            // unarmed on klatoxcv (@3d5021f).
             debugPrint("\ninven_wield failed!  ERROR ERROR ERROR!");
+            fprintf(stderr, "f2_server: inven_wield FAILED (art missing) critter_net=%d pid=%d "
+                            "item_pid=%d fid=0x%x baseFrm=%d hitAnim=%d weapAnim=%d — it will "
+                            "fight UNARMED\n",
+                critter->netId, critter->pid, item->pid, fid, critter->fid & 0xFFF,
+                hitModeAnimationCode, weaponAnimationCode);
             if (recording) {
                 presRecordSectionAbort();
             }
@@ -526,13 +564,74 @@ int _inven_unwield(Object* critter_obj, int hand)
 }
 
 // 0x472A64
+// Re-derive the WEAPON half of a critter's fid from what is actually in its hands.
+//
+// Bits 0xF000 of the fid are what the SPRITE is holding, and they are normally written by
+// wield/unwield EVENTS. Any path that removes a weapon without going through those events
+// leaves the sprite holding a gun that no longer exists — owner-reported after a critical
+// destroyed a shotgun: "no weapon equipped, but my character is still holding some kind of
+// rifle." Asking "what is in the hands NOW?" cannot go stale the way an event can.
+//
+// ►► And unlike _invenUnwieldFunc this needs no agreement about which hand is ACTIVE. That
+// agreement is exactly what broke the first attempt at this fix: the client's interface said
+// LEFT while the server registry's default said RIGHT, so `activeHand == hand` failed and the
+// re-derive never ran. A post-condition ("nothing armed, so show nothing") has no such
+// dependency. Deliberately does NOT guess when both hands hold weapons — there the active
+// hand genuinely decides, and this function has no business inventing an answer.
+void invenRederiveWeaponFid(Object* critter)
+{
+    if (critter == nullptr || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
+        return;
+    }
+
+    Object* leftItem = critterGetItem1(critter);
+    Object* rightItem = critterGetItem2(critter);
+    bool leftIsWeapon = leftItem != nullptr && itemGetType(leftItem) == ITEM_TYPE_WEAPON;
+    bool rightIsWeapon = rightItem != nullptr && itemGetType(rightItem) == ITEM_TYPE_WEAPON;
+
+    int weaponAnimationCode;
+    if (!leftIsWeapon && !rightIsWeapon) {
+        weaponAnimationCode = 0;
+    } else if (leftIsWeapon != rightIsWeapon) {
+        weaponAnimationCode = weaponGetAnimationCode(leftIsWeapon ? leftItem : rightItem);
+    } else {
+        return; // both hands armed — the active hand decides, and it is not knowable here
+    }
+
+    if (((critter->fid & 0xF000) >> 12) == weaponAnimationCode) {
+        return;
+    }
+
+    // objectSetFrame because objectSetFid does NOT reset obj->frame, and a frame index past
+    // the new art's count renders NOTHING ([[frame-index-render-gotcha]]).
+    int fid = buildFid(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_STAND, weaponAnimationCode,
+        (critter->fid & 0x70000000) >> 28);
+    _dude_stand(critter, critter->rotation, fid);
+    objectSetFrame(critter, 0, nullptr);
+}
+
 int _invenUnwieldFunc(Object* critter, int hand, bool animate)
 {
     int activeHand;
     Object* item;
     int fid;
 
-    if (critter == gDude) {
+    // The ACTIVE hand decides whether this unwield touches the fid at all — only the active
+    // hand's weapon is on the SPRITE (fid bits 0xF000). Three answers, in authority order:
+    //
+    // ►► A PLAYER ACTOR ON A DEDICATED SERVER: the per-seat registry value (`hand` verb).
+    // interfaceGetCurrentHand() is a STUB there — `return HAND_LEFT`, server_stubs.cc, and
+    // already noted as a banked gap in that file — so asking it made every RIGHT-hand
+    // unwield fail `activeHand == hand` and skip the fid re-derive below. Owner-reported
+    // symptom: "no weapon equipped, but my character is still holding some kind of rifle."
+    // It is a shared-path defect, not a co-op one; a caller working around it (destroying a
+    // weapon and then re-deriving the fid itself) would just fork this function.
+    //
+    // gDude ON A CLIENT keeps its own interface, so single-player and the goldens are
+    // untouched; anyone else keeps vanilla's NPCs-only-use-the-right-slot assumption.
+    if (serverDedicatedActive() && playerActorIs(critter)) {
+        activeHand = serverActorActiveHand(playerActorSlotOf(critter));
+    } else if (critter == gDude) {
         activeHand = interfaceGetCurrentHand();
     } else {
         activeHand = HAND_RIGHT; // NPC's only ever use right slot

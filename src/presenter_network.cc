@@ -1,5 +1,9 @@
 #include "presenter_network.h"
 
+#include "object_delta.h" // objectDeltaScan — flush the change a fade is hiding
+#include "state_audit.h" // StateAuditRecord — the live mirror-divergence oracle
+#include "game_dialog.h" // GAME_DIALOG_REACTION_* — per-option reaction on the wire
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -211,6 +215,31 @@ enum EventType : unsigned char {
     EVENT_PLAYER_SHEET = 48,
     EVENT_ENCOUNTER_PROMPT = 49, // random-encounter accept/decline prompt (title+body); ack via encaccept/encdecline
     EVENT_ENCOUNTER_CLOSE = 50, // first viewer answered — break the others out of the prompt box
+
+    // Global variables that changed this beat (index/value pairs). A NEW type rather
+    // than extra worldDelta fields: unknown types are skipped whole via the event
+    // length by both the client and tools/replay.py, so this cannot move a gate.
+    EVENT_GVAR_DELTA = 51,
+
+    // Server-authored holodisks: CLEAR then one ADD per disk (pipboy.h). Text on the wire
+    // because the client has no data file for these.
+    EVENT_HOLODISK_CLEAR = 52,
+    EVENT_HOLODISK_ADD = 53,
+    EVENT_ELEVATOR_PROMPT = 54, // co-op: show the rider vanilla's elevator panel
+    EVENT_AUTOMAP_OPEN = 55, // co-op: the Motion Sensor's user opens ITS OWN automap
+
+    // Co-op STEAL: the server owns the steal screen (the roll is a skill check,
+    // and a client may not roll its own dice). BEGIN names the thief and the
+    // victim — both real world objects, so both are netId-addressable, which is
+    // why STATE carries no payload: the item movement itself rides the ordinary
+    // OBJECT_DELTA_INVENTORY reconcile and STATE is only the flush heartbeat for
+    // a tick parked in the steal barrier. See Presenter::stealState.
+    EVENT_STEAL_BEGIN = 56,
+    EVENT_STEAL_STATE = 57,
+    EVENT_STEAL_END = 58,
+    EVENT_LOOT_GRANT = 59, // co-op: the server opened a container for THIS actor — show the screen
+    EVENT_STATE_AUDIT = 60, // authoritative per-object state, for mirror divergence checking
+    EVENT_UI_LOCK = 61, // scripted cutscene input lock (op_game_ui_disable/_enable), addressed
 };
 
 // Event flag bits.
@@ -418,6 +447,15 @@ public:
     void objectDisconnected(Object* obj) override
     {
         if (presenterEmissionsSuppressed() || obj == nullptr) return;
+        // ►► The missing half of the pair. objectConnected has traced since it was
+        // written; this one never did, so "the item vanished off the floor and I do not
+        // know who took it" was unanswerable from a server log — and on the viewer a
+        // DISCONNECT for an adopt-entangled netId DESTROYS the mirror outright
+        // (client_net.cc onDisconnect), so it is the single most consequential state
+        // event we were not printing. `_obj_disconnect` has ~20 call sites (pickup,
+        // consume, unload, script obj_disconnect), which is exactly why the netId+pid
+        // alone is worth having: it names WHICH object left the world and when.
+        if (eventTraceEnabled()) fprintf(stderr, "[evt] DISCONNECT net=%d pid=%d tile=%d elev=%d\n", obj->netId, obj->pid, obj->tile, obj->elevation);
         beginEvent(EVENT_DISCONNECT, EVENT_FLAG_STATE);
         putI32(obj->netId);
         putI32(obj->pid);
@@ -434,6 +472,57 @@ public:
         }
         if ((changedFields & WORLD_DELTA_LIGHT) != 0) {
             putI32(lightGetAmbientIntensity());
+        }
+        endEvent();
+    }
+
+    void holodiskSetBegin() override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        beginEvent(EVENT_HOLODISK_CLEAR, EVENT_FLAG_STATE);
+        endEvent();
+    }
+
+    void holodiskAdd(const char* name, const char* const* lines, int lineCount) override
+    {
+        if (presenterEmissionsSuppressed() || name == nullptr) return;
+        beginEvent(EVENT_HOLODISK_ADD, EVENT_FLAG_STATE);
+        putString(name);
+        putU16((unsigned short)(lineCount > 0 ? lineCount : 0));
+        for (int i = 0; i < lineCount; i++) {
+            putString(lines[i] != nullptr ? lines[i] : "");
+        }
+        endEvent();
+    }
+
+    void elevatorPrompt(int actorNetId, int elevator, int startLevel) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        beginEvent(EVENT_ELEVATOR_PROMPT, EVENT_FLAG_STATE);
+        putI32(actorNetId);
+        putI32(elevator);
+        putI32(startLevel);
+        endEvent();
+    }
+
+    void automapOpen(int actorNetId, bool usingScanner) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        beginEvent(EVENT_AUTOMAP_OPEN, EVENT_FLAG_STATE);
+        putI32(actorNetId);
+        putI32(usingScanner ? 1 : 0);
+        endEvent();
+    }
+
+    void gvarDelta(const int* indices, const int* values, int count) override
+    {
+        if (presenterEmissionsSuppressed() || indices == nullptr || values == nullptr) return;
+        if (count <= 0) return;
+        beginEvent(EVENT_GVAR_DELTA, EVENT_FLAG_STATE);
+        putU16((unsigned short)count);
+        for (int i = 0; i < count; i++) {
+            putI32(indices[i]);
+            putI32(values[i]);
         }
         endEvent();
     }
@@ -465,6 +554,10 @@ public:
         // reader stays aligned by walking the mask in bit order.
         if (changedFields & OBJECT_DELTA_FRAME) putI32(obj->frame);
         if (changedFields & OBJECT_DELTA_LIGHT) { putI32(obj->lightDistance); putI32(obj->lightIntensity); }
+        // PID last (highest bit), same rule as FRAME/LIGHT: the reader walks the mask in
+        // bit order, so a new field appends. See OBJECT_DELTA_PID for why a pid is not
+        // the constant it looks like.
+        if (changedFields & OBJECT_DELTA_PID) putI32(obj->pid);
         endEvent();
     }
 
@@ -621,9 +714,15 @@ public:
     void attackResult(const Attack* attack) override
     {
         if (presenterEmissionsSuppressed() || attack == nullptr) return;
-        if (eventTraceEnabled()) fprintf(stderr, "[atk] SEND attacker=%d defender=%d hitMode=%d weaponPid=%d\n",
+        if (eventTraceEnabled()) fprintf(stderr, "[atk] SEND attacker=%d defender=%d hitMode=%d weaponPid=%d "
+                                          "attackerFid=0x%x weapAnimNibble=%d\n",
             netIdOf(attack->attacker), netIdOf(attack->defender), attack->hitMode,
-            attack->weapon != nullptr ? attack->weapon->pid : -1);
+            attack->weapon != nullptr ? attack->weapon->pid : -1,
+            attack->attacker != nullptr ? attack->attacker->fid : 0,
+            // The armed state lives in the fid's weapon-animation nibble: 0 = unarmed.
+            // weaponPid != -1 with nibble 0 means the sim thinks it has a weapon that its
+            // BODY cannot hold — i.e. the inven_wield art failure above.
+            attack->attacker != nullptr ? ((attack->attacker->fid & 0xF000) >> 12) : 0);
         // PRESENTATION, deliberately: presenter.h calls this "the causal envelope —
         // who hit whom, with what, where", NOT a second place damage is applied.
         // Every bit of STATE it implies (hp/AP/results/death) already rides
@@ -739,6 +838,50 @@ public:
         endEvent();
     }
 
+    void stateAuditChunk(const void* records, int count, bool isFinal) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        const StateAuditRecord* rec = (const StateAuditRecord*)records;
+        beginEvent(EVENT_STATE_AUDIT, 0);
+        putU8(isFinal ? 1 : 0);
+        putU16((unsigned short)count);
+        for (int i = 0; i < count; i++) {
+            putI32(rec[i].netId);
+            putI32(rec[i].pid);
+            putI32(rec[i].tile);
+            putI32(rec[i].elevation);
+            putI32(rec[i].fid);
+            putI32(rec[i].frame);
+            putI32(rec[i].rotation);
+            putI32((int)rec[i].flags);
+            putI32(rec[i].lightDistance);
+            putI32(rec[i].lightIntensity);
+            putI32(rec[i].hp);
+            putI32(rec[i].radiation);
+            putI32(rec[i].poison);
+            putI32(rec[i].ap);
+            putI32(rec[i].combatResults);
+            putI32(rec[i].inventoryCount);
+            putI32((int)rec[i].inventoryHash);
+        }
+        endEvent();
+        if (isFinal) flushFrame();
+    }
+
+    void lootGrant(int actorNetId, int containerNetId) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        if (eventTraceEnabled()) fprintf(stderr, "[lootgrant] SEND actor=%d container=%d\n",
+            actorNetId, containerNetId);
+        beginEvent(EVENT_LOOT_GRANT, 0);
+        putI32(actorNetId);
+        putI32(containerNetId);
+        endEvent();
+        // Flushed immediately, like the inventory grant: it answers a click that has
+        // already been paid for, and the screen it opens is where the player is going.
+        flushFrame();
+    }
+
     void inventoryGrant(int actorNetId) override
     {
         if (presenterEmissionsSuppressed()) return;
@@ -764,7 +907,8 @@ public:
 
     void dialogNode(Object* speaker, Object* driver, int reaction,
         const char* reply, const char* const* options, int optionCount,
-        const char* audioFileName = nullptr, int headFid = -1) override
+        const char* audioFileName = nullptr, int headFid = -1,
+        const int* optionReactions = nullptr) override
     {
         if (presenterEmissionsSuppressed()) return;
         if (eventTraceEnabled()) fprintf(stderr, "[dialog] SEND node speaker=%d driver=%d reaction=%d headFid=0x%X audio=%s opts=%d\n",
@@ -782,6 +926,9 @@ public:
         putU16((unsigned short)optionCount);
         for (int i = 0; i < optionCount; i++) {
             putString(options != nullptr && options[i] != nullptr ? options[i] : "");
+            // Per-option reaction rides WITH its option so the two can never drift out
+            // of step, and so a truncated list truncates both halves together.
+            putI32(optionReactions != nullptr ? optionReactions[i] : GAME_DIALOG_REACTION_NEUTRAL);
         }
         endEvent();
         // Modal: the server tick is BLOCKED in the dialog barrier for the whole
@@ -938,6 +1085,39 @@ public:
         flushFrame();
     }
 
+    // ---- Steal / pickpocket / plant -----------------------------------------
+    // All three FLUSH for the barter reason: the server is BLOCKED in the steal
+    // barrier when it emits them. Unlike barter, STATE carries nothing — the item
+    // movement rides OBJECT_DELTA_INVENTORY, which the session scans for
+    // immediately before this call; the flush here is what ships those deltas.
+    void stealBegin(Object* thief, Object* target) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        if (eventTraceEnabled()) fprintf(stderr, "[steal] SEND begin thief=%d target=%d\n", netIdOf(thief), netIdOf(target));
+        beginEvent(EVENT_STEAL_BEGIN, 0);
+        putI32(netIdOf(thief));
+        putI32(netIdOf(target));
+        endEvent();
+        flushFrame();
+    }
+
+    void stealState() override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        beginEvent(EVENT_STEAL_STATE, 0);
+        endEvent();
+        flushFrame();
+    }
+
+    void stealEnd() override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        if (eventTraceEnabled()) fprintf(stderr, "[steal] SEND end\n");
+        beginEvent(EVENT_STEAL_END, 0);
+        endEvent();
+        flushFrame();
+    }
+
     void worldmapBegin() override
     {
         if (presenterEmissionsSuppressed()) return;
@@ -957,7 +1137,8 @@ public:
     }
 
     void worldmapState(int worldPosX, int worldPosY, int walkDestX, int walkDestY,
-        bool isWalking, int walkDistance, int carFuel, int currentAreaId, bool isInCar) override
+        bool isWalking, int walkDistance, int carFuel, int currentAreaId, bool isInCar,
+        int currentAreaVisitedState = 0, unsigned int currentAreaEntranceMask = 0) override
     {
         if (presenterEmissionsSuppressed()) return;
         if (eventTraceEnabled()) fprintf(stderr, "[worldmap] SEND state pos=%d,%d dst=%d,%d walk=%d dist=%d area=%d\n",
@@ -972,6 +1153,8 @@ public:
         putI32(carFuel);
         putI32(currentAreaId);
         putU8(isInCar ? 1 : 0);
+        putI32(currentAreaVisitedState);
+        putI32((int)currentAreaEntranceMask);
         endEvent();
         flushFrame();
     }
@@ -1073,18 +1256,51 @@ public:
         endEvent();
     }
 
-    void screenFadeOut() override
+    // ►►►► A FADE MUST BRACKET THE CHANGE IT IS HIDING, AND IT WAS BRACKETING NOTHING.
+    // The script fades out, mutates the world (digs the grave, moves the actor, passes
+    // the time), then fades in — but the MUTATION only reaches the wire as an
+    // objectDelta at the END of the beat, i.e. after BOTH fade events. So the frame
+    // said: fade out, fade in, and only then "the grave is now open". The owner saw
+    // exactly that — the grave popped open and THEN the screen went black, which is
+    // the fade doing the opposite of its job.
+    //
+    // Flushing the pending deltas at each fade boundary puts the beat in the order the
+    // script wrote it: FADE_OUT, [everything the script changed], FADE_IN. Same
+    // move stealEmitState makes for the same reason — a scan is the only way to get
+    // state out of a tick that is parked inside a script. Flushing on the way OUT
+    // matters too: whatever happened BEFORE the fade should land while the screen can
+    // still show it, not get swept past the black with everything else.
+    void screenFadeOut(int actorNetId) override
     {
         if (presenterEmissionsSuppressed()) return;
+        objectDeltaScan();
         beginEvent(EVENT_FADE_OUT, 0);
+        putI32(actorNetId);
         endEvent();
+        flushFrame();
     }
 
-    void screenFadeIn() override
+    void screenFadeIn(int actorNetId) override
     {
         if (presenterEmissionsSuppressed()) return;
+        objectDeltaScan(); // see screenFadeOut: the change happens BETWEEN the two
         beginEvent(EVENT_FADE_IN, 0);
+        putI32(actorNetId);
         endEvent();
+        flushFrame(); // the black period ends here; do not sit on it until the tail
+    }
+
+    // Flushed like the fades, and for the same reason: the lock brackets a cutscene the
+    // script is about to play, so it has to land BEFORE the things it is meant to stop
+    // the player interrupting — sitting in the outbox until the tail defeats the point.
+    void screenInputLock(bool locked, int actorNetId) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        beginEvent(EVENT_UI_LOCK, 0);
+        putI32(locked ? 1 : 0);
+        putI32(actorNetId);
+        endEvent();
+        flushFrame();
     }
 
     void errorBox(const char* text) override

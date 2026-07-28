@@ -16,10 +16,15 @@
 #include "actions.h" // _action_use_an_object / actionPickUp / actionPush / actionUseSkill
 #include "animation.h"
 #include "barter_intent.h" // BARTER_INTENT_* / barterIntentPush — the trade verbs
+#include "state_audit.h" // stateAuditEmit — the `audit` verb
+#include "steal_intent.h" // STEAL_INTENT_* / stealIntentPush — the steal-screen verbs
 #include "art.h" // buildFid / artExists / ANIM_STAND — server-authoritative equip fid
 #include "combat.h"
 #include "combat_intent.h" // COMBAT_INTENT_* / combatIntentPush (P3)
 #include "critter.h" // critterIsDead
+#include "rest.h" // restPerform — player-initiated rest (the server owns the clock)
+#include "party_member.h" // restOptionDecode / restHealReset — the pipboy menu's own kinds
+#include "elevator.h" // elevatorLevelCount / elevatorResolveDestination / elevatorRideApply
 #include "dialog_intent.h" // DIALOG_INTENT_* / dialogIntentPush (A2 dialog streaming)
 #include "worldmap.h" // worldmapEncounterAnswer — random-encounter prompt barrier
 #include "worldmap_intent.h" // WM_INTENT_* / worldmapIntentPush (worldmap streaming)
@@ -47,7 +52,9 @@
 #include "server_boot.h" // serverSpawnPlayerActor / playerActorSeedSheetFromHost
 #include "server_loop.h" // serverEmitPlayerRoster / serverSetSlotSessionQuery
 #include "server_players.h" // the player-actor registry + ServerActorScope
-#include "skill.h" // SKILL_* (skilldex allow-list)
+#include "sheet_intent.h" // sheetEdit* — the character-sheet edit intents (§9)
+#include "perk.h" // PERK_CHOICE_PENDING_* — the Tag!/Mutate! follow-up
+#include "skill.h" // SKILL_* (skilldex allow-list) + skillGetValue for the edit trace
 #include "stat.h" // critterGetStat / STAT_GENDER — armor skin is gender-specific
 #include "tile.h" // tileIsValid / gHexGridSize
 #include "wire_defs.h" // kNoSessionId
@@ -155,6 +162,14 @@ static bool serverControlIsHostSession(int sessionId)
 //
 // kMsgChannelRefusal is the grey "nothing happened" style (msg_channel.h): the
 // player should register it and move on, not read it as the world speaking.
+// Kick primitive, installed by f2_server (server_control.h). Null off a socket server.
+static std::function<bool(int)> gSessionKicker;
+
+void serverControlSetKicker(std::function<bool(int sessionId)> kicker)
+{
+    gSessionKicker = std::move(kicker);
+}
+
 static void serverControlRefuseV(Object* actor, const char* fmt, va_list args)
 {
     if (actor == nullptr) {
@@ -525,6 +540,18 @@ static void interactionFire(int verb, Object* actor, Object* target, int arg)
             break;
         }
         _obj_use_container(actor, target);
+        // ►► TELL THE CLIENT TO OPEN IT. This was the one interaction outcome with no
+        // line in the log AND no word on the wire: the viewer re-judged adjacency for
+        // itself and opened the screen when IT thought the dude had arrived. When the
+        // two judgements disagreed the player got nothing at all, and every retry
+        // re-fired this arm — and _obj_use_container is a TOGGLE, so an owner clicking
+        // a grave twenty times opened and shut it twenty times while the screen never
+        // appeared. The server is the one that knows the interaction fired; addressed
+        // to the actor who asked.
+        fprintf(stderr, "f2_server: interact FIRE loot netId=%d actorTile=%d targetTile=%d dist=%d\n",
+            target->netId, actor->tile, target->tile,
+            objectGetDistanceBetween(actor, target));
+        presenter()->lootGrant(actor->netId, target->netId);
         break;
     case kInteractUseItemOn: {
         // arg = the item pid. Re-resolve it on the actor's TOP-LEVEL inventory at
@@ -628,12 +655,37 @@ static void interactionEmitGesture(int verb, Object* actor, Object* target)
     if (anim < 0) {
         return;
     }
+    // ►► FACE THE TARGET FIRST. Owner-reported: running to a door and opening it played
+    // the magic hands on whatever facing the actor happened to end the walk with, which
+    // reads as reaching sideways through a wall.
+    //
+    // Vanilla never has this problem because it gets the rotation for free INSIDE the
+    // approach: animationRegisterMoveToObject ends with animationRegisterRotateToTile
+    // (animation.cc:624). Our out-of-combat path does not record the walk at all, so
+    // nothing ever taught the viewer to turn — the gesture section was the actor's only
+    // recorded op. Rotating here covers BOTH paths and is idempotent when the approach
+    // already faced the right way.
+    bool faceTarget = target->tile >= 0 && actor->tile >= 0 && target->tile != actor->tile;
     presRecordSectionBegin();
     reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+    if (faceTarget) {
+        animationRegisterRotateToTile(actor, target->tile);
+    }
     animationRegisterAnimate(actor, anim, 0);
     reg_anim_end();
     presRecordSectionEnd();
     presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), actor->netId);
+    // ►► AND SET THE AUTHORITATIVE FACING, because the leaf above did NOT: inside a
+    // record section animationRegisterRotateToTile is RECORD-ONLY by design (server_anim
+    // .cc:782 — "the state is authoritative via the fast-path + objectDelta; applying
+    // here too would double-mutate"). Recording alone would rotate the viewer while the
+    // server still believed the old facing, and the next rotation delta would snap the
+    // sprite back. With both, the beat's OBJECT_DELTA_ROTATION merely CONFIRMS what the
+    // sequence animated — the viewer's rotation hold (dHasRot) commits it at the
+    // sequence's end as a no-op. Rect is null: the server draws nothing.
+    if (faceTarget) {
+        objectSetRotation(actor, tileGetRotationTo(actor->tile, target->tile), nullptr);
+    }
 }
 
 // Present a successful reload: the weapon-ready CLICK + the magic-hands gesture.
@@ -1219,6 +1271,73 @@ static const char* serverDisplayName()
     return name;
 }
 
+// ─── SERVER-AUTHORED HOLODISKS ──────────────────────────────────────────────
+//
+// The first one is a SERVER INFORMATION disk: who you are connected to, and who else is
+// on it. It is the in-fiction version of a MOTD — the player finds it in their own pipboy
+// instead of reading chat scrollback — and it doubles as the worked example for authoring
+// any other custom disk (pipboy.h has the data model: a name plus body lines).
+//
+// Re-announced on EVERY baseline, which is what makes it need no persistence and no
+// savegame change: it is server config, not sim state. That also keeps it fresh, since a
+// baseline is exactly when the crew list or the map can have changed.
+//
+// Formatting notes for anyone adding a disk: one array entry is one rendered LINE, drawn
+// with no indent (so leading spaces are yours to place), and the literal line
+// "**END-PAR**" renders as a blank spacer rather than as text. Keep lines under ~60
+// characters — the pipboy's content column is narrow and it does not wrap.
+void serverEmitHolodisks()
+{
+    // Dedicated sessions only. Single-player and every golden take this branch and emit
+    // nothing at all, so no client data, no save and no gate is touched.
+    if (!serverDedicatedActive()) {
+        return;
+    }
+
+    std::vector<std::string> lines;
+    char buffer[128];
+
+    lines.push_back("SERVER");
+    lines.push_back("**END-PAR**");
+    snprintf(buffer, sizeof(buffer), "  Name:      %s", serverDisplayName());
+    lines.push_back(buffer);
+    snprintf(buffer, sizeof(buffer), "  Platform:  %s", serverPlatformName());
+    lines.push_back(buffer);
+
+    int online = 0;
+    int seats = playerActorCount();
+    for (int slot = 0; slot < seats; slot++) {
+        if (playerActorOnline(slot)) {
+            online++;
+        }
+    }
+    snprintf(buffer, sizeof(buffer), "  Seats:     %d of %d occupied", online, seats);
+    lines.push_back(buffer);
+    lines.push_back("**END-PAR**");
+
+    lines.push_back("CREW");
+    lines.push_back("**END-PAR**");
+    for (int slot = 0; slot < seats; slot++) {
+        const char* name = critterGetNameForSlot(slot);
+        // Slot 0 IS the host body — the one screens still gated on the host belong to.
+        snprintf(buffer, sizeof(buffer), "  %d. %-16s %s%s",
+            slot + 1,
+            (name != nullptr && name[0] != '\0') ? name : "(unnamed)",
+            slot == 0 ? "host, " : "",
+            playerActorOnline(slot) ? "online" : "offline");
+        lines.push_back(buffer);
+    }
+
+    std::vector<const char*> pointers;
+    pointers.reserve(lines.size());
+    for (const std::string& line : lines) {
+        pointers.push_back(line.c_str());
+    }
+
+    presenter()->holodiskSetBegin();
+    presenter()->holodiskAdd("Server Information", pointers.data(), (int)pointers.size());
+}
+
 // Greet the session that just claimed `slot`, and tell everyone else they have
 // company. Server chrome, not world narration — hence kMsgChannelSystem.
 //
@@ -1547,6 +1666,70 @@ void serverControlDrainPresence()
     }
 }
 
+// The longest rest a single verb may ask for: 24 hours. The whole simulation is
+// parked inside the loop (one clock, one world), so an unbounded duration would let
+// one client freeze every other player for as long as it liked.
+static constexpr int kMaxRestMinutes = 24 * 60;
+
+// The elevator each slot has been OFFERED. Transient: set when the panel is streamed,
+// cleared when the ride happens (or when another offer replaces it). Never persisted —
+// a reconnect just means the next button press offers again.
+//
+// ►► THE PRESENCE FLAG IS SEPARATE ON PURPOSE, and the reason is a bug this exact code
+// shipped for one gate run: an id alone cannot carry "nothing offered", because a
+// zero-initialised array reads 0 and 0 IS a valid elevator
+// (ELEVATOR_BROTHERHOOD_OF_STEEL_MAIN). With a lazily-initialised -1 sentinel, any
+// client that sent `elev <n>` before any elevator had ever been offered to anybody was
+// RIDDEN to elevator 0's destination — a teleport-anywhere primitive, on a fresh
+// server, from an ordinary session. A bool that means false when zeroed is correct by
+// construction and needs no initialisation path to be right.
+static bool gHasPendingElevator[kMaxPlayerActors];
+static int gPendingElevator[kMaxPlayerActors];
+
+void serverControlSetPendingElevator(int slot, int elevator)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return;
+    }
+
+    if (elevator < 0) {
+        gHasPendingElevator[slot] = false;
+        return;
+    }
+
+    gHasPendingElevator[slot] = true;
+    gPendingElevator[slot] = elevator;
+}
+
+// The character-sheet edit intents, as ONE list. They are exempt from both the
+// dead-actor and the busy gates, and the two bypass lists below have to agree —
+// naming them once is what keeps the next verb added from being forgotten in one
+// of them (the failure mode is silent: an unlisted sheet verb simply stops working
+// while a walk animation plays).
+static bool serverControlIsSheetVerb(const char* verb)
+{
+    return strcmp(verb, "sheetopen") == 0
+        || strcmp(verb, "sheetclose") == 0
+        || strcmp(verb, "skillup") == 0
+        || strcmp(verb, "skilldown") == 0
+        || strcmp(verb, "perkpick") == 0
+        || strcmp(verb, "tagpick") == 0
+        || strcmp(verb, "mutpick") == 0;
+}
+
+// The steal-screen verbs, as one list for the same reason as the sheet verbs.
+// They are exempt from the BUSY gate: the screen is only open because the server
+// just opened it for this actor, the world is PARKED inside the session, and a
+// steal transfer plays no animation of its own — so the wall-clock busy window
+// left over from the approach walk would refuse the thief's first clicks into
+// their own open screen, which reads as the screen being broken.
+static bool serverControlIsStealVerb(const char* verb)
+{
+    return strcmp(verb, "stake") == 0
+        || strcmp(verb, "splant") == 0
+        || strcmp(verb, "sdone") == 0;
+}
+
 void serverControlLine(int sessionId, const char* line)
 {
     if (++gLineCounts[sessionId] > kMaxLinesPerBeat) {
@@ -1590,6 +1773,63 @@ void serverControlLine(int sessionId, const char* line)
         if (sscanf(line, "%*s %23s", plat) == 1 && plat[0] != '\0') {
             gSessionPlatform[sessionId] = plat;
         }
+        return;
+    }
+
+    if (strcmp(verb, "say") == 0) {
+        // ─── Player chat ─────────────────────────────────────────────────────────
+        // `say <text>` — this player says something out loud. Echoed to EVERYONE as
+        // floating text over the speaker's head (EVENT_FLOAT_TEXT, already wired) plus
+        // one styled line in every message log (kMsgChannelChat).
+        //
+        // Handled UP HERE, ahead of the claimant and per-actor action gates, on purpose:
+        // talking is not an action. It costs no AP, it must not be refused because an
+        // animation is still playing, and it must not consume a turn. The only gate is
+        // needing a body to speak from. Line-rate is already bounded for every verb by
+        // kMaxLinesPerBeat, so chat spam is capped by the same limiter as everything else.
+        Object* speaker = serverControlActorForSession(sessionId);
+        if (speaker == nullptr) {
+            serverControlRefuse(sessionId, "You have no character to speak with.");
+            return;
+        }
+
+        // Everything after the verb, verbatim — chat is a sentence, so it cannot go
+        // through the int-only top-level sscanf.
+        const char* text = line;
+        while (*text != '\0' && !isspace((unsigned char)*text)) {
+            text++; // skip "say"
+        }
+        while (*text != '\0' && isspace((unsigned char)*text)) {
+            text++; // skip the separator
+        }
+        if (*text == '\0') {
+            return; // empty line: nothing said, nothing to broadcast
+        }
+
+        // TRUST BOUNDARY: this string came off the wire and is about to be shown to
+        // every other player, so bound it and strip control bytes. A newline here would
+        // otherwise let one chat line forge a second verb in anyone's log, and a stray
+        // byte can scramble a text object's layout. The client caps at 120; a client
+        // that ignores that gets truncated rather than trusted.
+        char said[128];
+        size_t out = 0;
+        for (const char* p = text; *p != '\0' && out + 1 < sizeof(said); p++) {
+            unsigned char ch = (unsigned char)*p;
+            said[out++] = (ch < 0x20 || ch == 0x7F) ? ' ' : *p;
+        }
+        said[out] = '\0';
+
+        // Float over the head first, then the log line: the same order a player reads
+        // them in. font/color are dropped by the encoder (client-local styling), so the
+        // values here are placeholders the viewer never sees.
+        presenter()->floatText(speaker, said, 101, 0, 0);
+
+        char logLine[192];
+        snprintf(logLine, sizeof(logLine), "%s: %s", critterGetName(speaker), said);
+        presenter()->consoleMessageStyled(0, kMsgChannelChat, logLine);
+
+        fprintf(stderr, "f2_server: control say slot=%d '%s'\n",
+            serverControlSlotForSession(sessionId), said);
         return;
     }
 
@@ -1695,8 +1935,20 @@ void serverControlLine(int sessionId, const char* line)
                 return;
             }
             if (gBindings[slot] != kNoSessionId) {
-                fprintf(stderr, "f2_server: login '%s' from session %d denied (slot %d already driven)\n",
-                    name, sessionId, slot);
+                // ►► ALREADY LOGGED IN → KICK THE NEW ATTEMPT. Denying the bind alone (what
+                // this did) left the loser CONNECTED BUT UNBOUND: it receives the whole world,
+                // renders it, and can drive nothing — which reads to the player as a broken
+                // game, and to us as "confuses whole system" (owner). There is no per-session
+                // event channel to explain it over (see serverControlRefuseV: one encoder, one
+                // broadcast buffer), so the honest move is to close the socket. The client
+                // reports it from its own side.
+                fprintf(stderr, "f2_server: login '%s' from session %d REFUSED — already logged in"
+                                " (slot %d is driven by session %d); kicking the new attempt\n",
+                    name, sessionId, slot, gBindings[slot]);
+                if (gSessionKicker && gSessionKicker(sessionId)) {
+                    fprintf(stderr, "f2_server: session %d kicked (duplicate login '%s')\n",
+                        sessionId, name);
+                }
                 return;
             }
 
@@ -1912,6 +2164,7 @@ void serverControlLine(int sessionId, const char* line)
         bool readOnlyVerb = strcmp(verb, "invopen") == 0
             || strcmp(verb, "invclose") == 0
             || strcmp(verb, "look") == 0
+            || serverControlIsSheetVerb(verb) // sheet bookkeeping, no world footprint
             || strcmp(verb, "cancel") == 0; // aborting your own pending walk is not an action
         // (`claim` needs no entry — it is answered above, before an actor is resolved.)
         if (!readOnlyVerb) {
@@ -1936,8 +2189,13 @@ void serverControlLine(int sessionId, const char* line)
             || strcmp(verb, "cancel") == 0
             || strcmp(verb, "invopen") == 0
             || strcmp(verb, "invclose") == 0
+            || serverControlIsSheetVerb(verb) // costs no AP and plays no animation
+            || serverControlIsStealVerb(verb) // inside a parked session the server opened
             || strcmp(verb, "claim") == 0
-            || strcmp(verb, "login") == 0;
+            || strcmp(verb, "login") == 0
+            // A read-only diagnostic must never be refused for being busy — busy is
+            // exactly when you want to ask (state_audit.h).
+            || strcmp(verb, "audit") == 0;
         if (busySlot >= 0 && !bypass && serverActorBusyIs(busySlot)) {
             fprintf(stderr, "f2_server: control %s dropped (actor busy, session %d)\n",
                 verb, sessionId);
@@ -2023,6 +2281,25 @@ void serverControlLine(int sessionId, const char* line)
             serverControlSupersedePending(sessionId, "a hand switch");
             serverControlSwapHand(actor, slot, hand);
         }
+        return;
+    }
+
+    // -- sneak: toggle THIS actor's sneak state --------------------------------
+    // The last skilldex entry with no wire path. It is a SELF-state toggle with no
+    // target, no AP and no animation (vanilla charges nothing and plays nothing —
+    // the indicator bar is the entire feedback), which is why it never fitted the
+    // `skill <netId> <skillId>` shape every other skill uses.
+    //
+    // It only became answerable per-player when the DUDE_STATE_* flags stopped being
+    // slot 0's: before that, an extra toggling sneak would have flipped the HOST's
+    // flag — the host's indicator bar lighting up, the host's AI visibility changing,
+    // and the sneaker still walking around in plain sight. Now the flag lands on the
+    // actor's own sheet row and streams back to that actor's client, which re-derives
+    // its indicator bar from it.
+    if (strcmp(verb, "sneak") == 0) {
+        dudeToggleState(DUDE_STATE_SNEAKING, actor);
+        bool sneaking = dudeHasState(DUDE_STATE_SNEAKING, actor);
+        fprintf(stderr, "f2_server: control sneak=%d (session %d)\n", sneaking ? 1 : 0, sessionId);
         return;
     }
 
@@ -2153,6 +2430,80 @@ void serverControlLine(int sessionId, const char* line)
         return;
     }
 
+    // `audit` — ►► THE MIRROR DIVERGENCE CHECK, on demand, mid-play. Snapshots every
+    // syncable object's FULL field set and ships it to every viewer, which diffs it
+    // against its own world and prints one line per divergent field (state_audit.h).
+    // This exists because the gates cannot see this class of bug at all: they
+    // reconstruct tile and elevation and nothing else, so "the art changed but the
+    // proto did not", "the mirror kept a thing the server retired" and every other
+    // field-level drift was invisible until a player clicked something and got
+    // nothing. Ungated on purpose — it is read-only, it costs one object walk, and a
+    // diagnostic you have to earn access to is a diagnostic nobody runs.
+    if (strcmp(verb, "audit") == 0) {
+        stateAuditEmit();
+        return;
+    }
+
+    // -- Steal verbs (the steal screen, entered by using Steal on a critter) --
+    // `stake <pid> [qty]` lifts a stack out of the victim's pockets, `splant
+    // <pid> [qty]` pushes one of the thief's own items in, `sdone` closes the
+    // screen. They feed the steal_intent queue the server's steal session drains
+    // — the same add-a-route-not-a-mechanism shape as the barter verbs.
+    //
+    // ►► NO netId ARGUMENT, AND THAT IS THE POINT. The victim is not named by
+    // the client: the session already knows who is being robbed, so a steal verb
+    // cannot be aimed. Otherwise this would be a primitive for reaching into any
+    // critter's pockets from any session, with the roll attached.
+    if (strcmp(verb, "stake") == 0 || strcmp(verb, "splant") == 0
+        || strcmp(verb, "sdone") == 0) {
+        // Liveness first, for the barter reason: an intent pushed with no session
+        // open would sit in the queue and be spent inside the NEXT one, moving
+        // real items out of a victim the sender never chose. (The session clears
+        // the queue on open as a second belt.)
+        if (!stealSessionActive()) {
+            fprintf(stderr, "f2_server: control %s ignored (no active steal)\n", verb);
+            // CLOSING SOMETHING ALREADY CLOSED IS NOT AN ERROR. A viewer's screen
+            // only goes away when EVENT_STEAL_END arrives, so a player pressing ESC
+            // on a session that is mid-teardown sends several `sdone`s and used to
+            // be scolded once per press ("You aren't stealing from anyone." x5) for
+            // doing exactly what closed the window. sdone is idempotent: swallow it.
+            // A stake/splant with no session is still worth answering — that one is
+            // a real click on a real item that did nothing.
+            if (strcmp(verb, "sdone") != 0) {
+                serverControlRefuse(sessionId, "You aren't stealing from anyone.");
+            }
+            return;
+        }
+        // OWNERSHIP IS THE THIEF, not the dialog driver and not the claimant: the
+        // session belongs to whoever put their hands in the pockets. Every other
+        // player has the same screen open and is a WITNESS, so their clicks must
+        // do nothing rather than move someone else's loot.
+        int slot = serverControlSlotForSession(sessionId);
+        Object* actor = slot >= 0 ? playerActorAt(slot) : nullptr;
+        if (actor == nullptr) {
+            // The debug CMD port has no session; it drives the host, which is the
+            // same default every other verb gives it.
+            actor = playerActorAt(0);
+        }
+        if (actor != stealSessionThief()) {
+            fprintf(stderr, "f2_server: control %s dropped (not the thief)\n", verb);
+            serverControlRefuse(sessionId, "You're only watching.");
+            return;
+        }
+
+        int pid = n >= 2 ? arg : -1;
+        int qty = n >= 3 ? arg2 : 0;
+        if (strcmp(verb, "sdone") == 0) {
+            stealIntentPush(STEAL_INTENT_DONE, 0, 0);
+        } else if (strcmp(verb, "stake") == 0) {
+            stealIntentPush(STEAL_INTENT_TAKE, pid, qty);
+        } else {
+            stealIntentPush(STEAL_INTENT_PLANT, pid, qty);
+        }
+        fprintf(stderr, "f2_server: control %s pid=%d qty=%d\n", verb, pid, qty);
+        return;
+    }
+
     // -- Worldmap travel verbs -----------------------------------------------
     // wmmove <x> <y> / wmenter / wmesc route the viewer's travel intents
     // through the trust boundary into the worldmap intent queue, which the
@@ -2175,8 +2526,13 @@ void serverControlLine(int sessionId, const char* line)
             worldmapIntentPush(WM_INTENT_ESCAPE, 0, 0);
             fprintf(stderr, "f2_server: control wmesc\n");
         } else if (strcmp(verb, "wmenter") == 0) {
-            worldmapIntentPush(WM_INTENT_ENTER, 0, 0);
-            fprintf(stderr, "f2_server: control wmenter\n");
+            // Optional arg = the town-map entrance the player picked (a district / named
+            // gate). Absent means "the city's first valid map", which is what a viewer
+            // sends for a city whose layout it has never seen. The index is validated
+            // against the SERVER's entrance table, never trusted as a destination.
+            int entrance = n >= 2 ? arg : -1;
+            worldmapIntentPush(WM_INTENT_ENTER, entrance, 0);
+            fprintf(stderr, "f2_server: control wmenter entrance=%d\n", entrance);
         } else {
             if (n < 3) {
                 fprintf(stderr, "f2_server: control wmmove missing coords ignored\n");
@@ -2497,6 +2853,216 @@ void serverControlLine(int sessionId, const char* line)
         return;
     }
 
+    // -- CHARACTER-SHEET EDIT INTENTS (PLAYER_SHEET_DESIGN.md §9) -------------
+    // A player spending a level-up: one point into one skill, one perk, and the
+    // follow-up choice Tag!/Mutate! demand. The client sends the intent and renders
+    // whatever row comes back — it never applies its own optimistic edit, because
+    // only the server can answer "are you allowed, and do you have the points".
+    //
+    // GRANULAR BY DESIGN, one point / one perk per verb: that is the unit the player
+    // acts in, it makes every refusal specific ("not enough points" vs "that skill is
+    // maxed"), and it needs no transaction protocol — each intent is independently
+    // valid or refused, so a dropped line loses one click instead of desyncing a
+    // batch. Deferred spending ("bump two, close the screen, spend the rest later")
+    // needs nothing extra: unspent points live in the actor's own PC row and are
+    // saved with it.
+    //
+    // The RULING and range checks live in sheet_intent.cc (which also takes the
+    // ServerActorScope that makes the host-only skill leaves work for any actor) —
+    // this layer only parses, dispatches and reports.
+    //
+    // NOT ACTIONS: they cost no AP, take no turn and touch no world state, so they
+    // are exempt from the busy gate and allowed while dead (see the two bypass lists
+    // above) — being a corpse awaiting a stimpak is no reason to be unable to read
+    // your own sheet and spend a level you already earned.
+    if (strcmp(verb, "sheetopen") == 0 || strcmp(verb, "sheetclose") == 0) {
+        if (strcmp(verb, "sheetopen") == 0) {
+            sheetEditSessionOpen(actor);
+        } else {
+            sheetEditSessionClose(actor);
+        }
+        fprintf(stderr, "f2_server: control %s slot=%d\n",
+            verb, serverControlSlotForSession(sessionId));
+        return;
+    }
+
+    if (strcmp(verb, "skillup") == 0 || strcmp(verb, "skilldown") == 0) {
+        if (n < 2) {
+            return;
+        }
+        bool up = strcmp(verb, "skillup") == 0;
+        int rc = up ? sheetEditSkillUp(actor, arg) : sheetEditSkillDown(actor, arg);
+        if (rc != kSheetEditOk) {
+            serverControlRefuse(sessionId, "%s", sheetEditReason(rc));
+        }
+        // Greppable sheet-edit trace: scripts/check_sheet.sh matches this prefix.
+        fprintf(stderr, "f2_server: control %s slot=%d skill=%d rc=%d value=%d sp=%d\n",
+            verb, serverControlSlotForSession(sessionId), arg, rc,
+            skillIsValid(arg) ? skillGetValue(actor, arg) : -1,
+            pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS, actor));
+        return;
+    }
+
+    if (strcmp(verb, "perkpick") == 0) {
+        if (n < 2) {
+            return;
+        }
+        int pendingChoice = PERK_CHOICE_PENDING_NONE;
+        int rc = sheetEditPerkPick(actor, arg, &pendingChoice);
+        if (rc != kSheetEditOk) {
+            serverControlRefuse(sessionId, "%s", sheetEditReason(rc));
+        }
+        fprintf(stderr, "f2_server: control perkpick slot=%d perk=%d rc=%d pending=%d\n",
+            serverControlSlotForSession(sessionId), arg, rc, pendingChoice);
+        return;
+    }
+
+    if (strcmp(verb, "tagpick") == 0 || strcmp(verb, "mutpick") == 0) {
+        // tagpick <skill>            (-1 = cancelled, which takes Tag! back off)
+        // mutpick <dropTrait> <gain> (both -1 = cancelled)
+        // A missing arg parses as 0, which is a REAL skill/trait id, so require it.
+        if (n < 2) {
+            return;
+        }
+        int rc;
+        if (strcmp(verb, "tagpick") == 0) {
+            rc = sheetEditTagPick(actor, arg);
+        } else {
+            rc = sheetEditMutatePick(actor, arg, n >= 3 ? arg2 : -1);
+        }
+        if (rc != kSheetEditOk) {
+            serverControlRefuse(sessionId, "%s", sheetEditReason(rc));
+        }
+        fprintf(stderr, "f2_server: control %s slot=%d a=%d b=%d rc=%d\n",
+            verb, serverControlSlotForSession(sessionId), arg, n >= 3 ? arg2 : -1, rc);
+        return;
+    }
+
+    // -- rest <minutes> | restopt <option>: pass time and heal ---------------------
+    // Player-initiated rest, which co-op simply did not have: the server owns the
+    // clock and everyone's hit points, so a client cannot rest locally (the pipboy's
+    // own leaf refuses a viewer), and until now there was no way to ask.
+    //
+    // ►► RESTING IS A GROUP ACT, and not by choice — one clock. Advancing it moves the
+    // world for everybody, so this is the standing group-effects ruling in its most
+    // literal form: one player rests, everyone's night passes, and rest heals every
+    // player actor (party_member.cc, owner ruling). Announced to the others for the
+    // same reason a conversation is: from another seat the world silently jumps hours,
+    // and an unexplained jump reads as a bug.
+    //
+    // `rest <minutes>` for a plain duration; `restopt <option>` for the pipboy menu's
+    // own kinds, including until-healed / until-the-party-is-healed, whose two-pass
+    // chunking lives inside the shared loop.
+    if (strcmp(verb, "rest") == 0 || strcmp(verb, "restopt") == 0) {
+        if (isInCombat()) {
+            serverControlRefuse(sessionId, "You can't rest in combat.");
+            return;
+        }
+        // Vanilla's own gate, and the same one the pipboy checks before it even offers
+        // the rest menu: some maps forbid resting outright.
+        if (!_critter_can_obj_dude_rest()) {
+            serverControlRefuse(sessionId, "You cannot rest at this location!");
+            return;
+        }
+        if (n < 2 || arg < 0) {
+            return;
+        }
+
+        int hours = 0;
+        int minutes = 0;
+        int kind = 0;
+        if (strcmp(verb, "rest") == 0) {
+            // Bounded: a client asking for a year of rest would spin the sim through
+            // every queued event in between with every other player frozen.
+            int wanted = arg > kMaxRestMinutes ? kMaxRestMinutes : arg;
+            hours = wanted / 60;
+            minutes = wanted % 60;
+        } else {
+            restOptionDecode(arg, &hours, &minutes, &kind);
+        }
+
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            Object* other = playerActorAt(slot);
+            if (other == nullptr || other == actor) {
+                continue;
+            }
+            char line[256];
+            snprintf(line, sizeof(line), "%s is resting. Time passes for everyone.",
+                critterGetName(actor));
+            presenter()->consoleMessageStyled(other->netId, kMsgChannelSystem, line);
+        }
+
+        // The heal-cadence accumulator is per SESSION (the pipboy resets it when the
+        // screen opens), so reset it here — this verb IS the session.
+        restHealReset();
+
+        RestOutcome outcome;
+        {
+            ServerActorScope restScope(actor);
+            outcome = restPerform(hours, minutes, kind, nullptr);
+        }
+
+        if (outcome == kRestInterrupted) {
+            // Something the clock was carrying came due — vanilla's own "you were
+            // woken" signal, which the player is owed an explanation for.
+            serverControlRefuse(sessionId, "You were interrupted.");
+        }
+        fprintf(stderr, "f2_server: control %s slot=%d %d:%02d kind=%d outcome=%d hp=%d time=%u\n",
+            verb, serverControlSlotForSession(sessionId), hours, minutes, kind,
+            (int)outcome, critterGetHitPoints(actor), gameTimeGetTime());
+        return;
+    }
+
+    // -- elev <level>: ride the elevator whose panel this player was shown --------
+    // The answer to EVENT_ELEVATOR_PROMPT. The client says which BUTTON was pressed;
+    // everything that button MEANS is resolved here, from the server's own table
+    // (elevator.h) — a destination arriving from a client would be a teleport-anywhere
+    // primitive. Three checks make this safe: the actor must hold an offer, the level
+    // must be inside that elevator's button count, and the resolved destination must
+    // be a real one (unused buttons carry tile -1 in the table).
+    if (strcmp(verb, "elev") == 0) {
+        int slot = serverControlSlotForSession(sessionId);
+        if (slot < 0 || slot >= kMaxPlayerActors || !gHasPendingElevator[slot]) {
+            fprintf(stderr, "f2_server: control elev with no elevator offered (session %d)\n",
+                sessionId);
+            return;
+        }
+        int elevator = gPendingElevator[slot];
+        if (n < 2 || arg < 0 || arg >= elevatorLevelCount(elevator)) {
+            fprintf(stderr, "f2_server: control elev bad level=%d (elevator %d has %d)\n",
+                n >= 2 ? arg : -1, elevator, elevatorLevelCount(elevator));
+            serverControlRefuse(sessionId, "That floor doesn't exist.");
+            return;
+        }
+
+        int map = -1;
+        int elevation = -1;
+        int tile = -1;
+        elevatorResolveDestination(elevator, arg, &map, &elevation, &tile);
+        if (tile == -1) {
+            // A button the table has no destination for. Vanilla's panel does not
+            // offer it; a client that asks anyway gets nothing.
+            fprintf(stderr, "f2_server: control elev level=%d of elevator %d has no destination\n",
+                arg, elevator);
+            serverControlRefuse(sessionId, "That floor doesn't exist.");
+            return;
+        }
+
+        // One offer, one ride.
+        gHasPendingElevator[slot] = false;
+
+        // The scope matters for the SAME-MAP case: objectSetLocation only moves the
+        // camera elevation (mapSetElevation) for gDude, and the whole party is riding,
+        // so the rider must BE gDude for the elevation change to take effect.
+        {
+            ServerActorScope rideScope(actor);
+            elevatorRideApply(actor, map, elevation, tile);
+        }
+        fprintf(stderr, "f2_server: control elev slot=%d elevator=%d level=%d -> map=%d elev=%d tile=%d\n",
+            slot, elevator, arg, map, elevation, tile);
+        return;
+    }
+
     // -- Dude inventory verbs (player-UI Slice 3b: equip / unequip / drop) ---
     // The viewer's inventory screen reroutes its drag-drop resolution + ctx-menu
     // DROP to these instead of mutating the local mirror (which would fight the
@@ -2717,8 +3283,24 @@ void serverControlLine(int sessionId, const char* line)
             }
         }
         if (item == nullptr) {
-            fprintf(stderr, "f2_server: control %s no dude item %s=%d ignored\n",
+            // ►► SAY WHAT WE DO HAVE. "No such item" is the least useful half of this
+            // failure: the interesting question is always whether the CLIENT is naming a
+            // ghost (a mirror entry the server dropped) or the server has the item under a
+            // different netId (an identity that got re-minted under it). One line of the
+            // real inventory answers both, and there is no other way to see it — the
+            // viewer's mirror is the only other copy and it is the suspect. Appended after
+            // the existing greppable prefix, so the gates' log contract is untouched.
+            fprintf(stderr, "f2_server: control %s no dude item %s=%d ignored (dude has:",
                 verb, byNetId ? "netId" : "pid", n >= 2 ? arg : -1);
+            Inventory* inv = &gDude->data.inventory;
+            for (int i = 0; i < inv->length; i++) {
+                Object* candidate = inv->items[i].item;
+                fprintf(stderr, " [net=%d pid=%d qty=%d]",
+                    candidate != nullptr ? candidate->netId : -1,
+                    candidate != nullptr ? candidate->pid : -1,
+                    inv->items[i].quantity);
+            }
+            fprintf(stderr, "%s)\n", inv->length == 0 ? " nothing" : "");
             serverControlRefuse(sessionId, "You don't have that item.");
             return;
         }

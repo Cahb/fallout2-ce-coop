@@ -193,6 +193,30 @@ void serverActorBusyClearAll();
 int serverActorActiveHand(int slot);
 void serverActorSetActiveHand(int slot, int hand);
 
+// TEST HOOK — force a seat's NEXT attack roll to a critical. A critical sits behind two
+// dice (the accuracy roll, then STAT_CRITICAL_CHANCE), which makes every critical EFFECT
+// effectively unreproducible on demand — the same problem `encnext` solves for worldmap
+// encounters, solved the same way: force the ROLL, never the outcome, so the crit tables,
+// the effect flags, the state application and the narration all run untouched and what you
+// observe is the real code path rather than a staged result.
+// One-shot: serverActorTakeForceCrit READS AND CLEARS, so a forgotten arming cannot leave
+// the sim biased. Armed by the `crithit` / `critfail` admin verbs.
+enum {
+    kForceCritNone = 0,
+    kForceCritHit = 1,
+    kForceCritFail = 2,
+};
+// `severity` pins WHICH critical failure, 0 (mildest) .. 4 (worst), or -1 to leave it to
+// the dice. It matters because the effect is a SECOND roll that the forced roll does not
+// touch: attackComputeCriticalFailure buckets randomBetween(1,100) - 5*(LUCK-5) into those
+// five columns of _cf_table, so the weapon-explosion row is the >95 bucket ONLY — and high
+// Luck pushes the roll DOWN, making the worst outcomes rarer the better your character is.
+// Without a pin, "arm a critical failure" still cannot reach the interesting effects.
+// Ignored for kForceCritHit (a critical HIT picks its effect from the hit-location tables).
+int serverActorTakeForceCrit(int slot);
+int serverActorTakeForceCritSeverity(int slot);
+void serverActorSetForceCrit(int slot, int mode, int severity);
+
 // Master enable for the GATE ENFORCEMENT (reject + defer) only — the `hand` verb, the
 // recording and the cost helper are inert-to-existing-behavior regardless. Default ON;
 // set env F2_SERVER_ACTION_GATE=0 to disable (the escape hatch if a wire gate probe

@@ -1,5 +1,6 @@
 #include "player_sheet.h"
 
+#include <stdio.h> // TEMP [psht]: stderr trace of the sheet-delta emit
 #include <stdlib.h> // getenv — sheet-delta temp-file path
 
 #include "critter.h"
@@ -23,7 +24,16 @@ namespace fallout {
 // silent misread rather than a short read — and the first thing a misread would
 // scribble on is the host's live sheet (slot 0 is gDudeProto itself). Cheap
 // enough to be worth it at once per join.
-static constexpr int kPlayerSheetBlockMagic = 0x50534854; // 'PSHT'
+// TWO versions, both still readable:
+//   'PSHT' (v1) — six rows: proto, perk ranks, PC stats, traits, tagged skills, name.
+//   'PSH2' (v2) — appends the OWED FREE PERK PICK byte (perk.cc), the level-up
+//                 entitlement a player spends through the sheet edit intents. A v1
+//                 row simply leaves the flag at whatever the seed left, i.e. owing
+//                 nothing, which is what an actor saved before the flag existed had.
+// Writes v2; the reader accepts either, so co-op saves taken before this change
+// still load.
+static constexpr int kPlayerSheetBlockMagic = 0x50534854; // 'PSHT' (v1)
+static constexpr int kPlayerSheetBlockMagicV2 = 0x50534832; // 'PSH2' (v2)
 
 // Sentinel ahead of the DISK appendix (extra actor bodies + sheets). Doubles as
 // the "is there an appendix" probe: the loader reads this word at the tail and
@@ -55,9 +65,9 @@ static bool gPlayerSheetDirty[kMaxPlayerActors] = { false };
 
 // The members, in the order stage 2 seeds them (protoPlayerActorSheetsSeed,
 // perkPlayerActorSeedRanks, pcPlayerActorSeedStats, traitsPlayerActorSeed,
-// skillsPlayerActorSeed, critterPlayerActorSeedNames). Keeping the two orders
-// identical is what makes "seeded but not shipped" a reviewable one-line diff
-// instead of a hunt — add to both or the actor is a chimera.
+// skillsPlayerActorSeed, critterPlayerActorSeedNames), plus the v2 tail. Keeping
+// the two orders identical is what makes "seeded but not shipped" a reviewable
+// one-line diff instead of a hunt — add to both or the actor is a chimera.
 static int playerSheetRowWrite(File* stream, int slot)
 {
     if (protoPlayerActorRowWrite(stream, slot) == -1) {
@@ -84,10 +94,16 @@ static int playerSheetRowWrite(File* stream, int slot)
         return -1;
     }
 
+    // v2 tail: the owed free perk pick. Last on purpose — appending keeps the
+    // v1 prefix byte-identical, which is what lets the reader below take either.
+    if (perkPlayerActorOwedPickRowWrite(stream, slot) == -1) {
+        return -1;
+    }
+
     return 0;
 }
 
-static int playerSheetRowRead(File* stream, int slot)
+static int playerSheetRowRead(File* stream, int slot, bool withOwedPick)
 {
     if (protoPlayerActorRowRead(stream, slot) == -1) {
         return -1;
@@ -113,6 +129,12 @@ static int playerSheetRowRead(File* stream, int slot)
         return -1;
     }
 
+    if (withOwedPick) {
+        if (perkPlayerActorOwedPickRowRead(stream, slot) == -1) {
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -126,7 +148,7 @@ int playerSheetBlockWrite(File* stream, int firstSlot)
         return 0;
     }
 
-    if (fileWriteInt32(stream, kPlayerSheetBlockMagic) == -1) {
+    if (fileWriteInt32(stream, kPlayerSheetBlockMagicV2) == -1) {
         return -1;
     }
 
@@ -154,7 +176,8 @@ int playerSheetBlockRead(File* stream)
         return -1;
     }
 
-    if (magic != kPlayerSheetBlockMagic) {
+    bool v2 = magic == kPlayerSheetBlockMagicV2;
+    if (magic != kPlayerSheetBlockMagic && !v2) {
         debugPrint("player_sheet: bad block magic 0x%08x\n", magic);
         return -1;
     }
@@ -179,7 +202,7 @@ int playerSheetBlockRead(File* stream)
     }
 
     for (int slot = firstSlot; slot < firstSlot + count; slot++) {
-        if (playerSheetRowRead(stream, slot) == -1) {
+        if (playerSheetRowRead(stream, slot, v2) == -1) {
             debugPrint("player_sheet: slot %d row read failed\n", slot);
             return -1;
         }
@@ -253,25 +276,50 @@ int playerActorAppendixSave(File* stream)
 
 int playerActorAppendixLoad(File* stream)
 {
-    int magic;
-    if (fileReadInt32(stream, &magic) == -1) {
-        // EOF at the tail: a vanilla-shaped save with no appendix. Not an error.
+    // ►►►► DO NOT USE fileReadInt32 TO DETECT EOF HERE, AND THAT IS NOT A STYLE
+    // PREFERENCE — IT COST EVERY SOLO SAVE ON DISK. fileReadInt32 tests
+    // `xfileRead(...) == -1` (db.cc), but xfileRead returns a size_t COUNT OF
+    // ELEMENTS READ: 0 at end of file, never -1, and being unsigned it cannot ever
+    // equal -1. So fileReadInt32 CANNOT FAIL AT EOF. It returns 0 (success) with
+    // `value` left as uninitialised stack garbage, byte-swapped into the out-param.
+    //
+    // Which turned the guard below inside out. A single-player-shaped save writes NO
+    // appendix at all (playerActorAppendixSave returns early at extras <= 0, on
+    // purpose, to keep a solo save byte-for-byte a vanilla save) — so the intended
+    // "clean EOF => no appendix => not an error" path was UNREACHABLE, the magic read
+    // as garbage (0 in practice), and the loader rejected the whole file as corrupt.
+    // Every save made while playing alone was unloadable: `boot failed for slot N`,
+    // with nothing wrong with the save. 5 of the owner's 8 slots, including the
+    // autosave. The three that loaded were the ones with a real appendix.
+    //
+    // A COUNTED read is the only honest EOF test on this API. Byte order matches
+    // fileReadInt32's big-endian swap, because that is how the magic was written.
+    unsigned char magicBytes[4];
+    if (fileRead(magicBytes, 1, sizeof(magicBytes), stream) != sizeof(magicBytes)) {
+        // Fewer than 4 bytes left: a vanilla-shaped save with no appendix. Not an error.
         return 0;
     }
+    int magic = (magicBytes[0] << 24) | (magicBytes[1] << 16) | (magicBytes[2] << 8) | magicBytes[3];
 
     bool v2 = magic == kPlayerActorAppendixMagicV2;
     if (magic != kPlayerActorAppendixMagic && !v2) {
+        // Reached only with 4 real bytes in hand that are not either magic, i.e. an
+        // actually malformed tail — which is worth refusing, unlike EOF.
         debugPrint("player_sheet: bad appendix magic 0x%08x\n", magic);
+        fprintf(stderr, "player_sheet: bad appendix magic 0x%08x — refusing the save\n", magic);
         return -1;
     }
 
     int extras;
     if (fileReadInt32(stream, &extras) == -1) {
+        fprintf(stderr, "player_sheet: appendix truncated before the extra count\n");
         return -1;
     }
 
     if (extras < 0 || extras >= kMaxPlayerActors) {
         debugPrint("player_sheet: appendix extra count %d out of range\n", extras);
+        fprintf(stderr, "player_sheet: appendix extra count %d out of range (max %d)\n",
+            extras, kMaxPlayerActors - 1);
         return -1;
     }
 
@@ -281,6 +329,7 @@ int playerActorAppendixLoad(File* stream)
     if (v2) {
         if (accountTableRead(stream, extras + 1) == -1) {
             debugPrint("player_sheet: appendix account table read failed\n");
+            fprintf(stderr, "player_sheet: appendix ACCOUNT TABLE read failed (%d slots)\n", extras + 1);
             return -1;
         }
     } else {
@@ -310,6 +359,7 @@ int playerActorAppendixLoad(File* stream)
         Object* actor = nullptr;
         if (_obj_load_player_actor(stream, &actor) == -1 || actor == nullptr) {
             debugPrint("player_sheet: appendix actor %d body load failed\n", slot);
+            fprintf(stderr, "player_sheet: appendix ACTOR %d BODY load failed\n", slot);
             return -1;
         }
 
@@ -349,6 +399,8 @@ int playerActorAppendixLoad(File* stream)
         if (actor->pid != playerActorSheetPid(slot)) {
             debugPrint("player_sheet: appendix actor %d pid 0x%X != slot pid 0x%X\n",
                 slot, actor->pid, playerActorSheetPid(slot));
+            fprintf(stderr, "player_sheet: appendix actor %d pid 0x%X != slot pid 0x%X\n",
+                slot, actor->pid, playerActorSheetPid(slot));
             return -1;
         }
     }
@@ -363,13 +415,22 @@ int playerActorAppendixLoad(File* stream)
     // Re-queue each extra's timed effects now that the bodies exist and are
     // registered (queueAddEvent binds to the fresh Object*). EOF here = a save
     // written before this section existed → nothing to re-queue, not an error.
-    int eventsMagic;
-    if (fileReadInt32(stream, &eventsMagic) == -1) {
+    //
+    // ►► COUNTED READ, for the same reason as the appendix magic above: fileReadInt32
+    // cannot fail at EOF, so this "not an error" path was unreachable too and an older
+    // co-op save — one with real extras, written before this section existed — was
+    // rejected outright on the garbage magic. Both optional-tail probes in this file
+    // had the same hole; this was the second one.
+    unsigned char eventsMagicBytes[4];
+    if (fileRead(eventsMagicBytes, 1, sizeof(eventsMagicBytes), stream) != sizeof(eventsMagicBytes)) {
         return 0;
     }
+    int eventsMagic = (eventsMagicBytes[0] << 24) | (eventsMagicBytes[1] << 16)
+        | (eventsMagicBytes[2] << 8) | eventsMagicBytes[3];
 
     if (eventsMagic != kPlayerActorEventsMagic) {
         debugPrint("player_sheet: bad appendix events magic 0x%08x\n", eventsMagic);
+        fprintf(stderr, "player_sheet: bad appendix EVENTS magic 0x%08x — refusing the save\n", eventsMagic);
         return -1;
     }
 
@@ -383,11 +444,11 @@ int playerActorAppendixLoad(File* stream)
     return 0;
 }
 
-// A one-slot PSHT block, byte-compatible with playerSheetBlockRead (magic +
+// A one-slot sheet block, byte-compatible with playerSheetBlockRead (magic +
 // firstSlot=slot + count=1 + the row). Used by the live delta channel.
 static int playerSheetBlockWriteOne(File* stream, int slot)
 {
-    if (fileWriteInt32(stream, kPlayerSheetBlockMagic) == -1) {
+    if (fileWriteInt32(stream, kPlayerSheetBlockMagicV2) == -1) {
         return -1;
     }
     if (fileWriteInt32(stream, slot) == -1) {
@@ -431,36 +492,40 @@ void playerSheetDeltaEmit()
             continue;
         }
 
-        // Serialize the one-slot block through a temp file, same idiom as
-        // serverEmitJoinBlob — XFILE_TYPE_MEMORY is read-only, so there is no
-        // in-memory File to write into.
-        const char* tmpPath = getenv("F2_SHEET_TMP");
-        if (tmpPath == nullptr) {
-            tmpPath = "/tmp/f2ce_sheet_srv.bin";
-        }
-
-        File* out = fileOpen(tmpPath, "wb");
+        // Serialize the one-slot block into RAM. This used to go through a scratch file
+        // because XFILE_TYPE_MEMORY was read-only; it is not any more (db.h
+        // fileOpenMemoryWrite), which matters more here than for the join blob — a sheet
+        // delta fires whenever a stat changes, so the old path touched /tmp repeatedly
+        // during ordinary play.
+        File* out = fileOpenMemoryWrite();
         if (out == nullptr) {
             continue;
         }
         int rc = playerSheetBlockWriteOne(out, slot);
         int len = (int)fileTell(out);
-        fileClose(out);
         if (rc == -1 || len <= 0) {
+            fileClose(out);
             continue;
         }
 
-        File* in = fileOpen(tmpPath, "rb");
-        if (in == nullptr) {
+        const unsigned char* written = fileMemoryData(out);
+        if (written == nullptr || fileMemorySize(out) < len) {
+            fileClose(out);
             continue;
         }
-        std::vector<unsigned char> buf((size_t)len);
-        size_t got = fileRead(buf.data(), 1, (size_t)len, in);
-        fileClose(in);
-        if ((int)got != len) {
+        std::vector<unsigned char> buf(written, written + len);
+        int got = len;
+        fileClose(out);
+        if (got != len) {
             continue;
         }
 
+        // TEMP DIAGNOSTIC [psht]: "the perk/skill only shows up if I RECONNECT" has
+        // exactly three possible cuts and this is the first of them — the row was
+        // marked dirty and shipped. Its ABSENCE after an applied `perkpick rc=0` means
+        // nothing marked the row (a mutation site missing playerSheetMarkDirty); its
+        // presence moves the hunt to the client's matching [psht] line.
+        fprintf(stderr, "[psht] emit slot=%d len=%d\n", slot, len);
         presenter()->playerSheetDelta(slot, buf.data(), len);
     }
 }

@@ -100,6 +100,7 @@
 #include <vector>
 
 #include "actions.h" // actionShowDeathCallbackPtr / actionDeathDropItems — the STATE half
+#include "art.h" // artExists — "can this mover's walk be realized" (see serverAnimMoveArtAvailable)
 #include "combat.h"
 #include "map.h"
 #include "movement.h"
@@ -150,7 +151,9 @@ static const int kServerAnimMaxPath = 3200;
 
 static bool smoothWalkEnabled()
 {
-    static bool enabled = getenv("F2_SERVER_SMOOTH_WALK") != nullptr;
+    // Default ON for a server (serverFeatureEnabled): out-of-combat walkers should
+    // ANIMATE, not teleport. F2_SERVER_SMOOTH_WALK=0 restores the instant-apply path.
+    static bool enabled = serverFeatureEnabled("F2_SERVER_SMOOTH_WALK");
     return enabled;
 }
 
@@ -164,10 +167,7 @@ static bool smoothWalkEnabled()
 // that path is the stepped-walk registry above.
 static bool combatGlideEnabled()
 {
-    static bool enabled = [] {
-        const char* v = getenv("F2_SERVER_RESUMABLE_COMBAT");
-        return v != nullptr && strcmp(v, "1") == 0;
-    }();
+    static bool enabled = serverFeatureEnabled("F2_SERVER_RESUMABLE_COMBAT");
     return enabled;
 }
 
@@ -516,6 +516,9 @@ static DeferredWalk gDeferredWalk;
 
 static int serverAnimMoveToTileApply(Object* owner, int tile, int elevation, int actionPoints, bool run);
 static int serverAnimMoveToObjectApply(Object* owner, Object* destination, int actionPoints, bool run);
+// Defined with the sequence bookkeeping at the bottom of the file; the move leaves above
+// need it to abandon a sequence they cannot realize.
+static int serverAnimSeqFail();
 
 static void serverAnimCommitDeferredWalk()
 {
@@ -618,6 +621,50 @@ void serverAnimAdvanceWalks()
 // (the per-step AP cost and route are identical); under stepped walking `run`
 // additionally selects the every-beat pace instead of every 2nd beat.
 
+// ►► CAN THIS MOVER'S WALK ACTUALLY BE REALIZED? The one leaf-level failure test the
+// server needs, mirroring animationRegister{Move,Run}To* in animation.cc leaf for leaf:
+//
+//   * RunTo first asks artExists(ANIM_RUNNING) and DOWNGRADES to ANIM_WALK when there is
+//     no run art (animation.cc:737). The server never did this either, so a critter with
+//     no run art was walked at RUN pace here while the viewer played the walk — a
+//     smaller sibling of the same divergence, fixed for free by asking the same question.
+//   * Both then _anim_preload the CHOSEN anim's fid and fail the sequence if the art is
+//     absent (animation.cc:700, :751). artExists is the right server-side spelling: it is
+//     the same predicate, and unlike artLock it does not pull frames into a cache the
+//     server has no intention of rendering from.
+//
+// Critters only — the fid anim nibble is a critter concept; scenery/items reach the
+// world through MoveToTileStraight (projectile arcs), which vanilla preloads differently.
+// `effectiveRun` reports the post-downgrade choice so the caller paces and RECORDS the
+// anim the viewer will really play.
+static bool serverAnimMoveArtAvailable(Object* owner, bool run, bool* effectiveRun)
+{
+    *effectiveRun = run;
+    if (owner == nullptr || FID_TYPE(owner->fid) != OBJ_TYPE_CRITTER) {
+        return true;
+    }
+
+    // Vanilla passes weaponCode 0 for this probe but the real weapon code for the
+    // preload; mirror that asymmetry rather than tidying it (animation.cc:737 vs :748).
+    if (run && !artExists(buildFid(OBJ_TYPE_CRITTER, owner->fid & 0xFFF, ANIM_RUNNING, 0, owner->rotation + 1))) {
+        *effectiveRun = false;
+    }
+
+    int anim = *effectiveRun ? ANIM_RUNNING : ANIM_WALK;
+    if (artExists(buildFid(OBJ_TYPE_CRITTER, owner->fid & 0xFFF, anim, (owner->fid & 0xF000) >> 12, owner->rotation + 1))) {
+        return true;
+    }
+    // Name the refusal. A rooted critter is INVISIBLE otherwise — the AI simply stops
+    // asking to move and nothing in the log says why — so this is the line that tells a
+    // "why is this thing not chasing me" question from a real AI bug. pid names the proto,
+    // which is what you look up.
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        fprintf(stderr, "[anim-noart] net=%d pid=0x%08X anim=%d — no art, move refused (sequence abandoned)\n",
+            owner->netId, owner->pid, anim);
+    }
+    return false;
+}
+
 // The authoritative body: build the path and walk (or enqueue out-of-combat). Byte-identical
 // to the pre-record path; also the deferred-commit target for a recorded in-combat move.
 static int serverAnimMoveToTileApply(Object* owner, int tile, int elevation, int actionPoints, bool run)
@@ -627,7 +674,12 @@ static int serverAnimMoveToTileApply(Object* owner, int tile, int elevation, int
     }
 
     unsigned char rotations[kServerAnimMaxPath];
-    int steps = _make_path(owner, owner->tile, tile, rotations, 0);
+    // WIDE budget when a PLAYER asked to go there: vanilla's 2000-node search gives up on
+    // long-but-walkable routes and the caller then registers nothing, so the click looks
+    // like the game refusing to move. AI and scripts keep the vanilla budget (path.cc).
+    int steps = playerActorIs(owner)
+        ? _make_path_wide(owner, owner->tile, tile, rotations, 0)
+        : _make_path(owner, owner->tile, tile, rotations, 0);
     if (steps == 0) {
         // No route. The engine registers the move and it fails silently at
         // execution; the register itself still returns success.
@@ -656,8 +708,29 @@ static int serverAnimMoveToTileApply(Object* owner, int tile, int elevation, int
 
 static int serverAnimMoveToTile(Object* owner, int tile, int elevation, int actionPoints, bool run)
 {
+    // ►►►► DO NOT POISON THE SEQUENCE HERE, EVEN THOUGH VANILLA DOES (_anim_cleanup on
+    // actionPoints == 0). Tried it; it FAILED the record-purity melee gate — record mode
+    // ended with the dude one tile further along and a thrown Spear on the ground that the
+    // non-record run did not have. `actionPoints` is MUTABLE STATE, and record mode
+    // legitimately DEFERS the authoritative walk (gDeferredWalk below), so the AP pool has
+    // not been charged yet when this is called and the zero-test can answer differently in
+    // the two modes. While the -1 was being ignored that asymmetry was harmless; routing it
+    // into rc propagated it into whether the caller runs _combat_turn_run(), i.e. straight
+    // into the simulation. Same shape as the record-purity AP asymmetry already on file
+    // (actionPickUp's ignored _check_scenery_ap_cost return — do not honor it either).
+    // ►► THE RULE THIS BUYS: only MODE-INVARIANT facts may fail a sequence. The art test
+    // below qualifies (a critter's FRMs do not depend on record mode); an AP read does not.
+    // Restoring vanilla's AP-driven cleanup needs the deferred-AP asymmetry solved first.
     if (actionPoints == 0) {
         return -1;
+    }
+    // A mover with no art for the walk cannot move — refuse the leaf and abandon the
+    // sequence, exactly as _anim_preload's failure does in the real engine. This must sit
+    // ABOVE the record branch: recording the move and then deferring it would ship the
+    // viewer a walk it cannot play AND still relocate the critter authoritatively, which
+    // is precisely the teleport.
+    if (!serverAnimMoveArtAvailable(owner, run, &run)) {
+        return serverAnimSeqFail();
     }
     // In-combat record: capture the leaf's REAL args and DEFER the authoritative walk (the
     // composite commits it after shipping the presSeq). presRecordActive() is true only
@@ -706,7 +779,9 @@ static int serverAnimMoveToObjectApply(Object* owner, Object* destination, int a
     unsigned char rotations[kServerAnimMaxPath];
     bool wasHidden = (destination->flags & OBJECT_HIDDEN) != 0;
     destination->flags |= OBJECT_HIDDEN;
-    int steps = _make_path(owner, owner->tile, destination->tile, rotations, 0);
+    int steps = playerActorIs(owner)
+        ? _make_path_wide(owner, owner->tile, destination->tile, rotations, 0)
+        : _make_path(owner, owner->tile, destination->tile, rotations, 0);
     if (!wasHidden) {
         destination->flags &= ~OBJECT_HIDDEN;
     }
@@ -742,11 +817,19 @@ static int serverAnimMoveToObjectApply(Object* owner, Object* destination, int a
 
 static int serverAnimMoveToObject(Object* owner, Object* destination, int actionPoints, bool run)
 {
+    // Mode-invariant facts only — see the *ToTile twin above for why this one must NOT
+    // fail the sequence.
     if (actionPoints == 0) {
         return -1;
     }
     if (owner->tile == destination->tile && owner->elevation == destination->elevation) {
         return 0;
+    }
+    // Same art gate as the *ToTile family — the AI reaches a target through this entry
+    // (_ai_move_steps_closer), so leaving it ungated would let a rooted critter still
+    // chase, just via the other verb.
+    if (!serverAnimMoveArtAvailable(owner, run, &run)) {
+        return serverAnimSeqFail();
     }
     // In-combat record: capture the RunTo/MoveToObject leaf's REAL args and DEFER the
     // authoritative walk. The client replays *ToObject, so the real engine appends its own
@@ -838,12 +921,54 @@ int animationRegisterUnsetFlag(Object* object, int flag, int delay)
 
 // ---- Sequence bookkeeping ------------------------------------------------
 // We apply each action at register time, so begin/clear/end have nothing to
-// accumulate or run. reg_anim_begin returns success (0) unconditionally: the
+// accumulate or run. reg_anim_begin still returns success (0) unconditionally: the
 // engine's -1 cases (a sequence already open, or during animationStop) do not
 // arise in the server's single-threaded, apply-immediately model.
+//
+// ►►►► BUT A SEQUENCE IS ATOMIC, AND reg_anim_end MUST BE ABLE TO SAY SO.
+// reg_anim_end used to return 0 unconditionally too, and that quietly dropped an
+// engine CONTRACT the callers depend on: in the real engine any leaf that cannot be
+// realized calls _anim_cleanup() (animation.cc), which abandons the whole sequence
+// and makes reg_anim_end() return -1 — and callers branch on exactly that:
+//
+//     reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+//     animationRegisterRunToTile(a1, destination, ...);
+//     int rc = reg_anim_end();
+//     if (rc == 0) { _combat_turn_run(); }        // combat_ai.cc:1218, :1268
+//
+// With `return 0` welded in, the server could never refuse a move, so the AI always
+// believed its move happened. That is how a SPORE PLANT walks: vanilla keeps plants
+// rooted with no rule that says "plants are rooted" — MAPLNT simply ships no walk
+// FRM, so _anim_preload's artLock fails, the sequence is abandoned, and the AI skips
+// its move. Emergent, but the mechanism is a real contract and this is the half of it
+// we had stubbed out. (It is not just plants: of 96 critter art sets, exactly six have
+// no walk frame — MAPLNT, MAGUNN/MAGUN2 gun turrets, MADEGG deathclaw egg, MABOS2 and
+// the RESERV placeholder. All of them are stationary props implemented as critters,
+// and we were walking every one of them.)
+//
+// ►► WHY THIS IS THE CONVERGENT FIX AND NOT A BAND-AID: the server and the viewer were
+// answering the SAME question from DIFFERENT information — the server said "always
+// yes", the client asked artExists and refused. An authority that decides one way while
+// the presenter decides the other is a desync generator by construction, and the
+// teleport IS that desync: the viewer's registration failed, nothing animated, and the
+// reap snapped the sprite onto the authoritative tile. Making the server ask the
+// question the client will ask removes the disagreement at the source instead of
+// papering over its symptom.
+static bool gSeqLeafFailed = false;
+
+// A leaf that cannot be realized poisons the open sequence — the server's stand-in for
+// _anim_cleanup(). Kept deliberately dumb (a flag, not a rollback): leaves apply
+// immediately here, so there is nothing to unwind; what the callers actually need is to
+// be TOLD the sequence did not happen.
+static int serverAnimSeqFail()
+{
+    gSeqLeafFailed = true;
+    return -1;
+}
 
 int reg_anim_begin(int requestOptions)
 {
+    gSeqLeafFailed = false;
     if (presRecordActive()) {
         presRecordSeqBegin(requestOptions);
     }
@@ -864,7 +989,11 @@ int reg_anim_end()
     if (presRecordActive()) {
         presRecordSeqEnd();
     }
-    return 0;
+    // Report the abandoned sequence, then clear — a caller that ignores the result
+    // must not inherit a stale poison from the previous bracket.
+    bool failed = gSeqLeafFailed;
+    gSeqLeafFailed = false;
+    return failed ? -1 : 0;
 }
 
 // Always "not busy": every animation completed the instant it was registered, so

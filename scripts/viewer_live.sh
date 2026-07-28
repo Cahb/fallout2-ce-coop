@@ -110,7 +110,7 @@ if [ "$VIEWERS" -gt 1 ]; then
             exec env F2_CLIENT_CONNECT="127.0.0.1:$WIRE_PORT" F2_WINDOWED=1 \
                 ${vname:+F2_PLAYER_NAME="$vname"} \
                 ${vcreate:+F2_PLAYER_CREATE="$vcreate"} \
-                F2_JOIN_TMP_CLIENT="/tmp/f2ce_join_view_$i.bin" "$ROOT/build/fallout2-ce"
+                "$ROOT/build/fallout2-ce"
         ) &
         EXTRA_PIDS="$EXTRA_PIDS $!"
     done

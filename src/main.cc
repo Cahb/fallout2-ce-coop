@@ -11,6 +11,7 @@
 #include "skilldex.h"
 #include "animation.h"
 #include "art.h"
+#include "automap.h" // automapShow — the Motion Sensor opens OUR automap
 #include "autorun.h"
 #include "barter_intent.h"
 #include "character_editor.h" // characterEditorShow — the creation screen, reused for co-op joins
@@ -19,7 +20,9 @@
 #include "client_present.h"
 #include "client_dialog.h"
 #include "client_barter.h"
+#include "client_steal.h" // viewer half of a server-owned steal session
 #include "client_net.h"
+#include "client_say.h"
 #include "combat.h" // _combat_attack_this + combatSetViewerAttackHook (§3.b crosshair attack)
 #include "color.h"
 #include "combat_intent.h"
@@ -28,9 +31,11 @@
 #include "critter.h"
 #include "cycle.h"
 #include "db.h"
+#include "dbox.h" // showDialogBox — vanilla pipboy-in-combat refusal
 #include "debug.h"
 #include "dialog_intent.h"
 #include "draw.h"
+#include "elevator.h" // elevatorPickLevel — the co-op elevator panel
 #include "endgame.h"
 #include "game.h"
 #include "game_dialog.h"
@@ -96,6 +101,17 @@ static int mainClientViewer(const char* connectSpec);
 static void _main_death_voiceover_callback();
 static int _mainDeathGrabTextFile(const char* fileName, char* dest);
 static int _mainDeathWordWrap(char* text, int width, short* beginnings, short* count);
+
+// VIEWER FADE WATCHDOG. The tick at which the server's fade-out took our screen to
+// black, or 0 for "not faded out by the wire". The main loop refuses to leave the
+// screen black longer than this — see the fade block in mainClientViewer for why
+// that bound is not optional.
+//
+// The ceiling is generous on purpose: a legitimate script sequence can hold a fade
+// across a time skip and a map-update proc, so this must not clip a working fade in
+// normal play. It is a brick-preventer, not a pacing knob.
+static constexpr unsigned int kViewerFadeBlackMaxMs = 6000;
+static unsigned int gViewerFadeBlackSinceMs = 0;
 
 // 0x5194C8
 static char _mainMap[] = "artemple.map";
@@ -619,11 +635,7 @@ static int mainHeadlessProbe()
         // S2 headless joining client (CLIENT_JOIN_DESIGN.md §D): decode a captured
         // F2NS wire — load the blob, apply the live event stream — then dump the
         // reconstructed state. The blob-load path already dumps with netid=.
-        const char* blobTmp = getenv("F2_JOIN_TMP_CLIENT");
-        if (blobTmp == nullptr) {
-            blobTmp = "/tmp/f2ce_join_cli.bin";
-        }
-        if (!clientApplyStreamFile(streamIn, blobTmp)) {
+        if (!clientApplyStreamFile(streamIn)) {
             debugPrint("headless-probe: stream apply from '%s' FAILED\n", streamIn);
             return 1;
         }
@@ -714,15 +726,34 @@ static void viewerArmPendingLoot(ClientConnection& conn, int netId)
 // mask). Drops the pending open on timeout, a vanished target, or combat.
 static void viewerPollPendingLoot(ClientConnection& conn)
 {
+    // ►► THE SERVER'S ANSWER OUTRANKS OUR GUESS. It fires the loot interaction (on
+    // arrival, or immediately when the dude is already adjacent) and now says so with
+    // an addressed grant; that is the authoritative "the container is open". The
+    // adjacency poll below stays as the fallback for a container opened without a
+    // grant, but the grant is what normally lands, and it ends the deadlock where the
+    // server thought we had arrived and we did not.
+    int granted = conn.takeLootGrant();
+    if (granted != 0) {
+        gViewerPendingLootNetId = granted;
+    }
     if (gViewerPendingLootNetId == 0) {
         return;
     }
     Object* container = objectFindByNetId(gViewerPendingLootNetId);
     if (container == nullptr || gDude == nullptr || container->elevation != gDude->elevation) {
+        // ►► NOT SILENTLY. These three bail-outs (gone / wrong floor / timeout) used to
+        // drop the pending open without a word, so "I clicked and no screen appeared"
+        // had four indistinguishable causes and no way to tell them apart.
+        if (getenv("F2_TRACE_EVENTS") != nullptr) {
+            fprintf(stderr, "[loot-drop] net=%d reason=%s\n", gViewerPendingLootNetId,
+                container == nullptr ? "no such object in the mirror"
+                    : gDude == nullptr ? "no dude"
+                                       : "different elevation");
+        }
         gViewerPendingLootNetId = 0;
         return;
     }
-    if (objectGetDistanceBetween(gDude, container) <= 1) {
+    if (granted != 0 || objectGetDistanceBetween(gDude, container) <= 1) {
         gViewerPendingLootNetId = 0;
         // The client's belief at the moment it decides to open the screen, to be read
         // against the server's "not adjacent" line (server_control.cc). If the tiles
@@ -756,6 +787,12 @@ static void viewerPollPendingLoot(ClientConnection& conn)
         // buffered while the modal was open is drained by the main loop below.
         clientViewerFlushDeferredItemFrees();
     } else if (getTicksSince(gViewerPendingLootSince) >= kViewerLootApproachTimeoutMs) {
+        if (getenv("F2_TRACE_EVENTS") != nullptr) {
+            fprintf(stderr, "[loot-drop] net=%d reason=approach timed out (dude tile=%d"
+                            " target tile=%d dist=%d — no grant arrived)\n",
+                gViewerPendingLootNetId, gDude->tile, container->tile,
+                objectGetDistanceBetween(gDude, container));
+        }
         gViewerPendingLootNetId = 0;
     }
 }
@@ -858,6 +895,21 @@ static void viewerSendActionMenuVerb(ClientConnection& conn, int menuItem, Objec
 static void viewerSendPrimaryVerb(ClientConnection& conn, Object* target)
 {
     char cmd[48];
+    // ►► THE DECIDING INPUTS, NOT THE OUTCOME. Every "I clicked it and nothing happened"
+    // report ends here, and the branch below is chosen from four values the player
+    // cannot see — and which can DISAGREE with each other, because the art type and the
+    // proto type are independent (an ITEM-proto gravesite can wear scenery art) and
+    // because a pid can change under a live object. Printing the outcome alone would
+    // just restate the symptom; printing the inputs says which one lied.
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        fprintf(stderr, "[primary] net=%d pid=%d(type=%d) fid=0x%X(fidType=%d)"
+                        " itemType=%d canUse=%d canUseOn=%d\n",
+            target->netId, target->pid, PID_TYPE(target->pid), target->fid,
+            FID_TYPE(target->fid),
+            PID_TYPE(target->pid) == OBJ_TYPE_ITEM ? itemGetType(target) : -1,
+            _obj_action_can_use(target) ? 1 : 0,
+            _proto_action_can_use_on(target->pid) ? 1 : 0);
+    }
     switch (FID_TYPE(target->fid)) {
     case OBJ_TYPE_ITEM:
         // Container → loot (walk-then-open); any other item → ground pickup.
@@ -902,15 +954,16 @@ static void viewerSendPrimaryVerb(ClientConnection& conn, Object* target)
 // the id against the skilldex allow-list, walks the dude adjacent, and runs the REAL
 // actionUseSkill (First Aid/Doctor heal + stream HP back, Lockpick opens the door,
 // etc). SNEAK (key 1 / skilldex sneak) is a self-TOGGLE (dudeToggleState) with no
-// target — a different path, deferred (needs a self-state wire verb).
+// target, so it rides its own `sneak` verb instead of the target-mode path.
 
 // Number key → skill target mode (or -1). Mirrors game_ui.cc:349-404; SNEAK (key 1)
-// is intentionally absent (self-toggle, deferred).
+// is intentionally absent — it is a self-toggle with no target and goes out as the
+// `sneak` verb at the key site, not through a target mode.
 static int viewerSkillModeForKey(int keyCode)
 {
     switch (keyCode) {
     case KEY_2: case KEY_AT: return GAME_MOUSE_MODE_USE_LOCKPICK;
-    // KEY_3 (Steal) intentionally parked — see viewerSkillModeForSkilldexRc.
+    case KEY_3: case KEY_NUMBER_SIGN: return GAME_MOUSE_MODE_USE_STEAL;
     case KEY_4: case KEY_DOLLAR: return GAME_MOUSE_MODE_USE_TRAPS;
     case KEY_5: case KEY_PERCENT: return GAME_MOUSE_MODE_USE_FIRST_AID;
     case KEY_6: case KEY_CARET: return GAME_MOUSE_MODE_USE_DOCTOR;
@@ -921,15 +974,18 @@ static int viewerSkillModeForKey(int keyCode)
 }
 
 // Skilldex result code → skill target mode (or -1 for cancel/error/sneak). Mirrors
-// game_ui.cc:274-304; SNEAK returns -1 (deferred self-toggle).
+// game_ui.cc:274-304; SNEAK returns -1 and is handled at the call site (self-toggle,
+// sent as the `sneak` verb).
 static int viewerSkillModeForSkilldexRc(int rc)
 {
     switch (rc) {
     case SKILLDEX_RC_LOCKPICK: return GAME_MOUSE_MODE_USE_LOCKPICK;
-    // STEAL parked: it is a request-driven modal (scriptsRequestStealing → the loot
-    // modal + _gIsSteal), server-side a no-op today, and needs a server-authoritative
-    // steal-roll/caught verb — a "loot slice v2". Deferred like SNEAK so it reads as
-    // "not wired" instead of walk-over-then-nothing. See the banked steal plan.
+    // STEAL is live: the click sends `skill <netId> STEAL` like every other skill,
+    // the server walks the thief over and answers SCRIPT_REQUEST_STEALING with a
+    // real session (inventory_ui.cc stealSessionRun) that rolls the skill and
+    // streams the screen to everyone. It was parked for as long as that request
+    // was a silent no-op.
+    case SKILLDEX_RC_STEAL: return GAME_MOUSE_MODE_USE_STEAL;
     case SKILLDEX_RC_TRAPS: return GAME_MOUSE_MODE_USE_TRAPS;
     case SKILLDEX_RC_FIRST_AID: return GAME_MOUSE_MODE_USE_FIRST_AID;
     case SKILLDEX_RC_DOCTOR: return GAME_MOUSE_MODE_USE_DOCTOR;
@@ -971,6 +1027,31 @@ static void viewerEnterSkillMode(int mode)
 // connectSpec is "host:port". The blob load path (client_net's decoder) reuses
 // the same mapLoad-with-viewer-suppression sequence the S1/S2 round trip proved,
 // so it inherits the puppet map load (no map-enter procs) verbatim.
+// ►► ONLY A REAL QUIT ENDS THE VIEWER. `_game_user_wants_to_quit` carries two
+// different meanings in this engine: 2 is "the human is leaving" (quit confirmed,
+// death, endgame), while 1 is an IN-BAND CONTROL SIGNAL meaning "break out of the
+// nested loop you are in" — set by mapSetTransition during combat, script opcodes,
+// op_terminate_combat and friends. Vanilla gets away with the overload because the
+// loop that raised the 1 also clears it (combat.cc:3294/3643) before anything else
+// looks. The VIEWER has no such loop to consume it, so a stray 1 walked straight
+// out of the frame loop and the process returned from main — indistinguishable from
+// a crash, and with no core file to prove otherwise.
+//
+// The known source is fixed at its origin (object.cc: a wire viewer no longer
+// discovers its own exit grids). This is the backstop for the rest of the class:
+// consume the signal, say so loudly, and keep rendering. It cannot mask a genuine
+// quit, which is always 2, and it cannot strand anyone — ESC still asks.
+static bool viewerKeepRunning()
+{
+    if (_game_user_wants_to_quit == 1) {
+        fprintf(stderr, "[viewer] consumed a stray in-band quit signal (=1); NOT exiting. "
+                        "Something outside the viewer's own loops raised it — see object.cc's "
+                        "exit-grid guard for the shape of this bug.\n");
+        _game_user_wants_to_quit = 0;
+    }
+    return _game_user_wants_to_quit == 0;
+}
+
 static int mainClientViewer(const char* connectSpec)
 {
     // Parse host:port.
@@ -1103,13 +1184,8 @@ static int mainClientViewer(const char* connectSpec)
     gameMouseSetCursor(MOUSE_CURSOR_NONE);
     mouseShowCursor();
 
-    const char* blobTmp = getenv("F2_JOIN_TMP_CLIENT");
-    if (blobTmp == nullptr) {
-        blobTmp = "/tmp/f2ce_join_view.bin";
-    }
-
     ClientConnection conn;
-    if (!conn.connect(host, port, blobTmp)) {
+    if (!conn.connect(host, port)) {
         debugPrint("client-viewer: connect to %s:%d failed\n", host, port);
         windowDestroy(win);
         main_unload_new();
@@ -1293,7 +1369,7 @@ static int mainClientViewer(const char* connectSpec)
     bool handSwitchPending = false;
     unsigned int handSwitchSince = 0;
 
-    while (_game_user_wants_to_quit == 0) {
+    while (viewerKeepRunning()) {
         sharedFpsLimiter.mark();
 
         // ►► RECONCILE DIALOG WINDOWS TO THE LATCHED WIRE STATE (viewer-modal I2/I6).
@@ -1322,6 +1398,18 @@ static int mainClientViewer(const char* connectSpec)
         // dangle the drag gesture / quantity dial); the trade loop above has since
         // broken and returned, so this is the safe point to actually free them.
         clientBarterFinalize();
+
+        // Steal streaming: the server opened a steal session. EVERY viewer puts up
+        // the same screen — the thief drives it, the rest of the party watches
+        // someone's pockets being emptied — and it comes down on EVENT_STEAL_END.
+        // Entered here for the barter reason: a blocking modal must not be entered
+        // from inside the wire decoder that would then run under it.
+        if (clientStealActive() && (GameMode::getCurrentGameMode() & GameMode::kLoot) == 0) {
+            inventoryOpenStealingViewer(clientStealThief(), clientStealTarget());
+        }
+        // The screen's loop broke on the latched end; this is the safe point to
+        // clear the session state it was reading (client_barter's rule).
+        clientStealFinalize();
 
         // Worldmap streaming: the wire decoder sets gPendingWorldmapEnter when the
         // server enters the worldmap travel driver. Enter the worldmap modal loop
@@ -1361,10 +1449,57 @@ static int mainClientViewer(const char* connectSpec)
         // sets client-side outlines (rendering), never touches the sim.
         lootHighlightUpdate();
 
+        // ─── Player chat (SAY) ───────────────────────────────────────────────────
+        // Non-blocking overlay, so it lives here in the frame loop rather than in a
+        // modal of its own (viewer-modal design of record: a new screen copies
+        // DIALOG's flag+dispatch shape, never barter's blocking loop). Order matters:
+        //
+        // 1. COMBAT FORCE-CLOSES IT, before any key is read. Combat entry clears the
+        //    screen of UI, and an open box would otherwise keep eating the keys that
+        //    drive the fight — including the RETURN that ends combat. The draft is
+        //    discarded: it was written for a peacetime room.
+        // 2. While it IS open it gets first refusal on every key, so typing cannot
+        //    leak into the gameplay dispatch below ("a" toggling combat mid-sentence).
+        // 3. RETURN opens it, but only OUT of combat and only when no dialog owns the
+        //    screen — in combat RETURN already means "attempt to end combat", and that
+        //    binding is load-bearing (it is also what the interface-bar button posts).
+        if (conn.inCombat() && clientSayActive()) {
+            clientSayCancel();
+        }
+        bool sayConsumedKey = false;
+        if (clientSayActive()) {
+            sayConsumedKey = clientSayHandleKey(keyCode);
+        } else if (keyCode == KEY_RETURN && !conn.inCombat() && !clientDialogActive()) {
+            clientSayOpen();
+            sayConsumedKey = true;
+        }
+        if (sayConsumedKey) {
+            keyCode = -1; // swallow it: nothing below may act on a typed character
+        }
+        clientSayRender();
+
         if (clientDialogActive()) {
             clientDialogHandleKey(keyCode);
         } else if (keyCode == KEY_ESCAPE) {
-            break;
+            // ►► ESC ASKS; IT DOES NOT QUIT. This used to `break` straight out of the
+            // frame loop, so one keypress ended the session with no confirmation and no
+            // way back — and it read as a CRASH, because a clean exit and a segfault look
+            // identical from the outside (no core dump was the tell).
+            //
+            // What makes a bare `break` untenable is that ESC is also the "get me out of
+            // this screen" key, and on a STREAMED modal the screen does not close on the
+            // keypress: the viewer sends its intent (worldmap_ui.cc -> `wmesc`) and waits
+            // for the server to end the session. So the natural thing a player does —
+            // press ESC until something happens — sends the intent, the modal closes when
+            // the server answers, and the NEXT buffered ESC lands here and kills the
+            // client. Every server-driven modal has that hazard.
+            //
+            // Vanilla never quits on a bare ESC either: game_ui.cc routes KEY_ESCAPE to
+            // showOptions(), whose Exit goes through this same confirmation. We ask
+            // directly instead of opening Options, because a viewer must not offer local
+            // Save/Load — the server owns the state. Confirming sets
+            // _game_user_wants_to_quit, which the loop condition picks up next iteration.
+            showQuitConfirmationDialog();
         }
 
         if (!clientDialogActive()) {
@@ -1451,7 +1586,48 @@ static int mainClientViewer(const char* connectSpec)
             interfaceGetItemActions(&leftAction, &rightAction);
             int curHand = interfaceGetCurrentHand();
             int action = curHand == HAND_LEFT ? leftAction : rightAction;
-            if (action == INTERFACE_ITEM_ACTION_RELOAD) {
+            // ►► WHAT IS IN THE HAND DECIDES, AND IT IS NOT ALWAYS A WEAPON. Vanilla's
+            // _intface_use_item (interface.cc) branches on isWeapon FIRST and has three
+            // arms, of which this handler had implemented one: a weapon attacks, an item
+            // that can be used ON something arms the USE crosshair, and a self-use item is
+            // simply used. Treating every hand item as a weapon meant the slot's one
+            // remaining behaviour was "start a fight" — equip a shovel, click it, and you
+            // drew on the room instead of digging (owner, live). None of the other two arms
+            // enters combat, in vanilla or here.
+            Object* handItem = nullptr;
+            if (interfaceGetActiveItem(&handItem) == -1) {
+                handItem = nullptr;
+            }
+            const bool handIsWeapon = handItem == nullptr
+                || itemGetType(handItem) == ITEM_TYPE_WEAPON;
+            // ►► AND WHEN NONE OF THE THREE APPLY, VANILLA DOES NOTHING AT ALL.
+            // _intface_use_item is three ifs with NO else: a hand item that is not a
+            // weapon, cannot be used on anything, and cannot be used on its own is
+            // simply not a usable thing, and clicking it is a no-op. Letting the
+            // non-weapon case fall through to the arms below made the slot do the one
+            // thing it must never do by accident — equip a pair of BOOTS, click the
+            // greyed-out slot, and you drew on the room (owner, live). Weapon-ness
+            // decides the branch first; nothing after this point is reachable for a
+            // non-weapon.
+            if (!handIsWeapon) {
+                // Use-on (shovel, lockpick, a stimpak on someone else): arm the vanilla
+                // USE crosshair. Pure local cursor state — the click that follows
+                // resolves the target and sends `useitemon`, the same split every skill
+                // cursor uses.
+                if (_proto_action_can_use_on(handItem->pid)) {
+                    gameMouseSetCursor(MOUSE_CURSOR_USE_CROSSHAIR);
+                    gameMouseSetMode(GAME_MOUSE_MODE_USE_CROSSHAIR);
+                } else if (_obj_action_can_use(handItem)) {
+                    // Self-use (a stimpak in hand): the whole point of the hand slot is
+                    // not having to open the pack mid-fight. The server owns the consume
+                    // + heal, so send the verb and skip vanilla's local _obj_use_item;
+                    // in combat the server queues it for our own turn and charges the AP.
+                    char cmd[32];
+                    snprintf(cmd, sizeof(cmd), "useitem %d", handItem->pid);
+                    conn.sendLine(cmd);
+                }
+                // No third case on purpose — see above.
+            } else if (action == INTERFACE_ITEM_ACTION_RELOAD) {
                 // Reload runs against the authoritative dude on the server; the loaded
                 // rounds / consumed ammo stream back via OBJECT_DELTA_INVENTORY. Do NOT
                 // enter combat and do NOT arm the crosshair.
@@ -1475,7 +1651,21 @@ static int mainClientViewer(const char* connectSpec)
             // which the branch below turns into the actual screen. A refusal
             // (someone else's turn, or not enough AP) simply never grants, and the
             // server streams the reason to the console.
-            conn.sendLine("invopen");
+            //
+            // ►► GATED ON combatBusy LIKE EVERY OTHER PRICED KEY, AND THE REASON IS
+            // THE ONE THING A VIEWER KNOWS THAT THE SERVER DOES NOT. The server's
+            // turn gate (_combat_whose_turn) is the truth, but the SCREEN is behind
+            // it: the previous actor's shots are still replaying out of the pres
+            // queue when the wire has already moved the turn to us. Ungated, an
+            // 'I' pressed during that window was a legal on-your-turn open — priced
+            // 4 AP — for a turn the player had not been shown yet, so you arrived at
+            // your own turn with 1 AP and no idea where it went (owner, live). Two
+            // misclicks emptied a turn. combatBusy is exactly "the presentation has
+            // not handed the turn over yet" (!myTurn || pres queue busy || an action
+            // in flight || our own glide), the same latch SPACE and RETURN wait on.
+            if (conn.myTurn() && !combatBusy) {
+                conn.sendLine("invopen");
+            }
         } else if ((keyCode == KEY_LOWERCASE_I || keyCode == KEY_UPPERCASE_I) && !conn.inCombat()) {
             // Open the vanilla inventory screen (player-UI Slice 3). Equip/drop are wired
             // (Slice 3b): each drop-resolution leaf fires a claim-gated wire verb and skips
@@ -1507,6 +1697,37 @@ static int mainClientViewer(const char* connectSpec)
             // Uniform with 'I'/'S': reap deferred frees, let the main loop drain a
             // blob that buffered while the screen blocked.
             clientViewerFlushDeferredItemFrees();
+        } else if (keyCode == KEY_UPPERCASE_P || keyCode == KEY_LOWERCASE_P) {
+            // 'P' → the pipboy. Owner-reported as a dead button: this dispatch is the
+            // viewer's OWN and deliberately never calls gameHandleKey, so until now there
+            // was no 'P' branch — and the interface bar's PIP button is registered with
+            // KEY_LOWERCASE_P (interface.cc), so the hotkey AND the button both fell
+            // through to nothing. Same one-branch-serves-both shape as 'C' above.
+            //
+            // This is where a player reads their HOLODISKS and QUEST list, both of which
+            // are rendered from gvars — so it only became worth opening once gvars were
+            // actually streamed (they used to freeze at the client's baseline).
+            //
+            // Status and automaps are read-only. REST is not, and it is refused inside the
+            // pipboy itself (pipboy.cc: it advances gameTime and heals, which the server
+            // owns) — player-initiated rest stays unimplemented for viewers until it
+            // becomes a server-driven verb, exactly as it was while this button was dead.
+            if (conn.inCombat()) {
+                // Vanilla refuses the pipboy in combat with this same sound + message
+                // (game_ui.cc). Mirrored rather than silently ignored — a dead button is
+                // what got reported in the first place.
+                soundPlayFile("iisxxxx1");
+                MessageListItem messageListItem;
+                char title[128];
+                strcpy(title, getmsg(&gMiscMessageList, &messageListItem, 7));
+                showDialogBox(title, nullptr, 0, 192, 116, _colorTable[32328], nullptr, _colorTable[32328], 0);
+            } else {
+                soundPlayFile("ib1p1xx1");
+                pipboyOpen(PIPBOY_OPEN_INTENT_UNSPECIFIED);
+                // Uniform with 'I'/'C'/'S': reap deferred frees, let the main loop drain a
+                // blob that buffered while the screen blocked.
+                clientViewerFlushDeferredItemFrees();
+            }
         } else if (keyCode == KEY_UPPERCASE_S || keyCode == KEY_LOWERCASE_S) {
             // 'S' → skilldex (player-UI skill hotkeys). Runs the vanilla read-only
             // selector; its blocking loop is pump-and-bailed by the service ticker
@@ -1517,13 +1738,22 @@ static int mainClientViewer(const char* connectSpec)
             // free — vanilla prices the inventory screen, not this one — and the
             // skill it arms is answered honestly on use: msg 902 for the seven
             // combat-forbidden skills, a real toggle for Sneak.
-            int mode = viewerSkillModeForSkilldexRc(skilldexOpen());
+            int rc = skilldexOpen();
+            int mode = viewerSkillModeForSkilldexRc(rc);
             // The ticker may have applied dude-inv deltas while the modal blocked — reap
             // deferred frees + let the main loop drain a deferred blob (uniform with 'I').
             clientViewerFlushDeferredItemFrees();
-            if (mode != -1) {
+            if (rc == SKILLDEX_RC_SNEAK) {
+                conn.sendLine("sneak");
+            } else if (mode != -1) {
                 viewerEnterSkillMode(mode);
             }
+        } else if (keyCode == KEY_1 || keyCode == KEY_EXCLAMATION) {
+            // Sneak (vanilla's '1'): a self-toggle with no target, so it goes straight
+            // out as its own verb instead of arming a target cursor. The authority
+            // flips the flag on OUR sheet row and streams it back — the indicator bar
+            // is repainted from the row that arrives, never optimistically here.
+            conn.sendLine("sneak");
         } else if (viewerSkillModeForKey(keyCode) != -1) {
             // Number keys 2-8 → skill target mode directly (vanilla game_ui.cc:349).
             viewerEnterSkillMode(viewerSkillModeForKey(keyCode));
@@ -1613,6 +1843,28 @@ static int mainClientViewer(const char* connectSpec)
                             }
                         }
                     }
+                } else if (mode == GAME_MOUSE_MODE_USE_CROSSHAIR) {
+                    // ►► THE OTHER HALF OF THE HAND SLOT. Vanilla answers this click in
+                    // game_mouse.cc with _action_use_an_item_on_object(gDude, object,
+                    // handItem); the viewer must not — that walks and mutates the local
+                    // mirror. Send `useitemon <netId> <pid>` instead, which is the verb the
+                    // inventory screen's use-on leaf already speaks, and let the server do
+                    // the approach + the 2 AP. Without this branch the click fell through to
+                    // MOVE and the shovel just walked you somewhere.
+                    Object* targetObj = gameMouseGetObjectUnderCursor(-1, true, gElevation);
+                    Object* handItem = nullptr;
+                    if (interfaceGetActiveItem(&handItem) == -1) {
+                        handItem = nullptr;
+                    }
+                    if (targetObj != nullptr && targetObj->netId > 0 && handItem != nullptr) {
+                        char cmd[48];
+                        snprintf(cmd, sizeof(cmd), "useitemon %d %d", targetObj->netId, handItem->pid);
+                        conn.sendLine(cmd);
+                    }
+                    // Back to MOVE either way, exactly as vanilla drops the cursor after a
+                    // use-crosshair click (game_mouse.cc) and as the skill modes do below.
+                    gameMouseSetCursor(MOUSE_CURSOR_NONE);
+                    gameMouseSetMode(GAME_MOUSE_MODE_MOVE);
                 } else if (viewerSkillForMode(mode) != -1) {
                     // Skill target-mode click (player-UI skill hotkeys): resolve the
                     // object under the cursor and fire `skill <netId> <skillId>`. The
@@ -1713,6 +1965,56 @@ static int mainClientViewer(const char* connectSpec)
         // and entering it from inside conn.pump() would re-enter the pump that is
         // still decoding the frame. This is the same no-modal-open point the
         // deferred rebaseline above uses, for the same reason.
+        // The server offered this player an elevator panel. Opened HERE, at the same
+        // no-modal-open point as the inventory grant, because the panel runs a blocking
+        // input loop that must not be entered from inside pump() (client_net.h).
+        //
+        // The panel is the only part of an elevator ride the client owns: it answers
+        // with a BUTTON INDEX and the server resolves what that button means against
+        // its own destination table, then rides the whole party there. Escaping sends
+        // nothing, which is exactly vanilla's cancel.
+        {
+            int elevator;
+            int startLevel;
+            if (conn.takeElevatorPrompt(&elevator, &startLevel)) {
+                int level = elevatorPickLevel(elevator, startLevel);
+                if (level >= 0) {
+                    clientViewerElevatorRide(level);
+                }
+            }
+        }
+
+        // ►► SCREEN FADES, with a WATCHDOG. A fade-out whose matching fade-in never
+        // arrives is a black screen forever — a bricked client — and the ways to lose
+        // the pair are all real: the script that opened it errors out, the actor dies
+        // mid-sequence, the sequence outlives our connection. So the black period is
+        // BOUNDED here: if nothing has faded us back in within kFadeBlackMaxMs we do it
+        // ourselves and say so. Fading back early costs a visual beat; staying black
+        // costs the session, and that trade is never close.
+        //
+        // ►► THE FADE ITSELF IS NOT APPLIED HERE ANY MORE, and that move is the fix for
+        // "the grave opened and THEN the screen went black". Object deltas are applied
+        // at DECODE; a fade applied out here ran after every delta in the frame, so the
+        // change the fade exists to hide was already on screen. It is now applied in the
+        // decoder, in wire order, next to the deltas it brackets. What is left here is
+        // only the watchdog.
+        if (conn.fadeWatchdogExpired(getTicks(), kViewerFadeBlackMaxMs)) {
+            debugPrint("client-viewer: no fade-in after %u ms — fading back in (watchdog)\n",
+                kViewerFadeBlackMaxMs);
+            paletteFadeTo(_cmap);
+            conn.clearFadeBlack();
+        }
+
+        // The server says we used a Motion Sensor: open OUR automap, with scanner
+        // detail. Same no-modal-open point and the same reason as the elevator panel.
+        {
+            bool usingScanner = false;
+            if (conn.takeAutomapOpen(&usingScanner)) {
+                automapShow(true, usingScanner);
+                clientViewerFlushDeferredItemFrees();
+            }
+        }
+
         if (conn.takeInventoryGrant()) {
             conn.setCombatModalOpen(true); // exempts it from the ticker's combat force-ESC
             inventoryOpen();
@@ -1728,6 +2030,23 @@ static int mainClientViewer(const char* connectSpec)
         // tile rects, so the next renderPresent redraws the moved objects.
         if (!conn.pump()) {
             debugPrint("client-viewer: server disconnected\n");
+            // ►► SAY WHY, ON STDERR. If we were never bound to a slot, the server refused
+            // our login and closed the socket rather than leave us connected-but-unbound —
+            // and by far the most common reason is that this ACCOUNT NAME IS ALREADY LOGGED
+            // IN (the server kicks the second attempt; see server_control.cc). The wire has
+            // no per-session channel to carry a reason, so this is reported from our side
+            // rather than quoted from the server; the server prints the authoritative line.
+            if (!conn.everBoundToSlot()) {
+                const char* who = getenv("F2_PLAYER_NAME");
+                fprintf(stderr, "client-viewer: disconnected WITHOUT ever being bound to a player"
+                                " slot — the server refused this login.\n");
+                fprintf(stderr, "client-viewer: ►► most likely ALREADY LOGGED IN%s%s%s."
+                                " One session per account; close the other client or use a"
+                                " different F2_PLAYER_NAME. The server log has the reason.\n",
+                    who != nullptr ? " as '" : "", who != nullptr ? who : "", who != nullptr ? "'" : "");
+            } else {
+                fprintf(stderr, "client-viewer: server disconnected.\n");
+            }
             break;
         }
 

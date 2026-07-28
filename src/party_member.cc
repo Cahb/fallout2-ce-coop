@@ -85,6 +85,8 @@ static int _partyMemberItemSave(Object* object);
 static int _partyMemberItemRecover(PartyMemberListItem* a1);
 static int _partyMemberClearItemList();
 static int partyFixMultipleMembers();
+// Defined with the party-skill readers below, used by _getPartyMemberCount above them.
+static bool partySkillPlayerEligible(Object* actor, int slot);
 static int _partyMemberCopyLevelInfo(Object* object, int a2);
 
 // 0x519D9C
@@ -1203,6 +1205,35 @@ int _getPartyMemberCount()
     return count;
 }
 
+// ►►►► THIS COUNT DELIBERATELY EXCLUDES PLAYERS, AND THAT IS THE WHOLE POINT.
+//
+// I widened it to include extra players once, on the theory that "how many of us are
+// there" should tell the truth. The owner killed it immediately and correctly: the
+// question vanilla asks with this number is "how many FOLLOWERS are you dragging
+// around", and scripts use it to REFUSE ENTRY — Vault City, the Sierra doors, escort
+// quests, "leave some of your friends outside". In co-op the followers ARE the other
+// players, so counting them turns every one of those gates into a wall and the game
+// stops being playable at three seats. A truthful number that locks the party out of
+// the map is worse than vanilla's undercount.
+//
+// ►► THE RULE, for anything reading a party size: if a script can REFUSE something
+// based on it, players do not count. If it only sizes or offers something, they do —
+// that is partyGroupSize below.
+int partyGroupSize()
+{
+    int count = _getPartyMemberCount();
+
+    // Slot 0 is skipped: it is gPartyMembers[0], already counted above.
+    int actorCount = playerActorCount();
+    for (int slot = 1; slot < actorCount; slot++) {
+        if (partySkillPlayerEligible(playerActorAt(slot), slot)) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
 // True iff at least one companion has been recruited (index 0 is always gDude,
 // added at object.cc:322). Unlike _getPartyMemberCount this counts the RAW list —
 // a dead/hidden companion still counts, because its body is still an OBJECT_NO_SAVE
@@ -1455,10 +1486,41 @@ int partyMemberGetBestSkill(Object* object)
     return bestSkill;
 }
 
+// ►► WHY PLAYER ACTORS ARE NOT IN gPartyMembers, AND WHY THESE READERS WIDEN INSTEAD.
+//
+// Adding extra players to the party list would be the obvious fix and it is a trap.
+// The list is not just a set of pointers, it is a MAINTAINED structure: partyMembersSave
+// writes it from index 1 (so a player's body would be saved twice — once here, once in
+// the co-op appendix — and restored as a companion), _partyMemberIncLevels levels every
+// member with the host (a second level track), _partyMemberSyncPosition drags members to
+// the dude on a map change (a leash co-op deliberately does not have), and
+// partyFixMultipleMembers walks the whole object list and objectDestroy()s anything it
+// reads as a duplicate. Player bodies escape that last loop today only because their pids
+// are not in party.txt — it is one table edit away from deleting a player.
+//
+// So membership stays fixed and the QUESTIONS widen. Each helper below adds candidates on
+// top of the untouched vanilla loop, which is what keeps single-player byte-identical:
+// with an empty registry playerActorAt(0) IS gPartyMembers[0], so every max() is unchanged.
+
+// A player actor eligible to contribute to a party-wide skill read. Offline players are
+// parked off-map with no body in the world, and a corpse contributes nothing.
+//
+// NOTE the asymmetry with the companion loops, and keep it: those check HIDDEN and critter
+// type but NOT death, because that is what vanilla does and changing it would move
+// single-player. The added candidates are ours, so they get the stricter test.
+static bool partySkillPlayerEligible(Object* actor, int slot)
+{
+    return actor != nullptr
+        && playerActorOnline(slot)
+        && (actor->flags & OBJECT_HIDDEN) == 0
+        && PID_TYPE(actor->pid) == OBJ_TYPE_CRITTER
+        && !critterIsDead(actor);
+}
+
 // Returns party member with highest skill level.
 //
 // 0x495560
-Object* partyMemberGetBestInSkill(int skill)
+Object* partyMemberGetBestInSkill(int skill, Object* actor)
 {
     int bestValue = 0;
     Object* bestPartyMember = nullptr;
@@ -1474,13 +1536,29 @@ Object* partyMemberGetBestInSkill(int skill)
         }
     }
 
+    // The acting player is a candidate for their OWN skill use. Without this an extra
+    // who is the best in the group at Doctor gets silently replaced by a worse companion
+    // — or by the host — because the only player in the list is slot 0.
+    if (actor != nullptr && playerActorIs(actor)) {
+        int slot = playerActorSlotOf(actor);
+        if (partySkillPlayerEligible(actor, slot)) {
+            int value = skillGetValue(actor, skill);
+            if (value > bestValue) {
+                bestValue = value;
+                bestPartyMember = actor;
+            }
+        }
+    }
+
     return bestPartyMember;
 }
 
 // Returns highest skill level in party.
 //
 // 0x4955C8
-int partyGetBestSkillValue(int skill)
+// The companion-only walk, verbatim vanilla. Shared by both public forms so the two
+// scopes differ ONLY in which players they add.
+static int partyCompanionBestSkillValue(int skill)
 {
     int bestValue = 0;
 
@@ -1495,6 +1573,79 @@ int partyGetBestSkillValue(int skill)
     }
 
     return bestValue;
+}
+
+// GROUP scope: companions + every online living player. For things the whole party does
+// together — travelling, and therefore avoiding an encounter.
+int partyGetBestSkillValue(int skill)
+{
+    int bestValue = partyCompanionBestSkillValue(skill);
+
+    int count = playerActorCount();
+    for (int slot = 0; slot < count; slot++) {
+        Object* actor = playerActorAt(slot);
+        if (!partySkillPlayerEligible(actor, slot)) {
+            continue;
+        }
+        int value = skillGetValue(actor, skill);
+        if (value > bestValue) {
+            bestValue = value;
+        }
+    }
+
+    return bestValue;
+}
+
+// SOLO scope: companions + ONE player. A trade is between a merchant and the player who
+// opened it; the others are not at the table, so their Barter does not set the price.
+int partyGetBestSkillValueFor(int skill, Object* actor)
+{
+    int bestValue = 0;
+
+    // Companions only — index 0 is the HOST BODY, and for an extra's solo act the host
+    // is another player, not a companion helping out.
+    for (int index = 1; index < gPartyMembersLength; index++) {
+        Object* object = gPartyMembers[index].object;
+        if ((object->flags & OBJECT_HIDDEN) == 0 && PID_TYPE(object->pid) == OBJ_TYPE_CRITTER) {
+            int value = skillGetValue(object, skill);
+            if (value > bestValue) {
+                bestValue = value;
+            }
+        }
+    }
+
+    if (actor != nullptr && (actor->flags & OBJECT_HIDDEN) == 0
+        && PID_TYPE(actor->pid) == OBJ_TYPE_CRITTER) {
+        int value = skillGetValue(actor, skill);
+        if (value > bestValue) {
+            bestValue = value;
+        }
+    }
+
+    return bestValue;
+}
+
+// Who in the group actually holds the best `skill` — so a group roll can be CREDITED to
+// the player who carried it instead of to whoever happens to be slot 0.
+Object* partyGetBestSkillPlayerActor(int skill)
+{
+    int bestValue = -1;
+    Object* best = nullptr;
+
+    int count = playerActorCount();
+    for (int slot = 0; slot < count; slot++) {
+        Object* actor = playerActorAt(slot);
+        if (!partySkillPlayerEligible(actor, slot)) {
+            continue;
+        }
+        int value = skillGetValue(actor, skill);
+        if (value > bestValue) {
+            bestValue = value;
+            best = actor;
+        }
+    }
+
+    return best;
 }
 
 // 0x495620

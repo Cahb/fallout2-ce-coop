@@ -17,9 +17,12 @@
 #include "map.h"
 #include "memory.h"
 #include "message.h"
+#include "msg_channel.h"
 #include "object.h"
 #include "party_member.h"
 #include "platform_compat.h"
+#include "player_sheet.h" // the DUDE_STATE_* flags ride the actor's sheet row
+#include "pres_record.h" // record the stand-up so viewers see it
 #include "presenter.h"
 #include "proto.h"
 #include "queue.h"
@@ -246,7 +249,17 @@ int critterPlayerActorNameRowRead(File* stream, int slot)
 }
 
 // 0x56D77C
-static int _sneak_working;
+//
+// PER ACTOR: whether that player's most recent sneak roll SUCCEEDED (the flag
+// dudeIsSneaking gates on, re-rolled by sneakEventProcess every 100-600 ticks).
+// Vanilla is one int because vanilla has one player; with two players sneaking, a
+// single flag meant one player's failed roll un-hid the other.
+//
+// Index 0 is the host's and is the ONE the savegame carries (critterLoad/Save keep
+// the vanilla field, so the format does not move). An extra's roll result is
+// transient by nature — it expires on its own timer within ten seconds of a load —
+// while its sneak STATE bit persists properly in the actor's sheet row.
+static int _sneak_working[kMaxPlayerActors];
 
 // 0x56D780
 static int gKillsByType[KILL_TYPE_COUNT];
@@ -302,7 +315,7 @@ void critterExit()
 // 0x42D01C
 int critterLoad(File* stream)
 {
-    if (fileReadInt32(stream, &_sneak_working) == -1) {
+    if (fileReadInt32(stream, &_sneak_working[0]) == -1) {
         return -1;
     }
 
@@ -315,7 +328,7 @@ int critterLoad(File* stream)
 // 0x42D058
 int critterSave(File* stream)
 {
-    if (fileWriteInt32(stream, _sneak_working) == -1) {
+    if (fileWriteInt32(stream, _sneak_working[0]) == -1) {
         return -1;
     }
 
@@ -499,7 +512,7 @@ int poisonEventProcess(Object* obj, void* data)
     // You take damage from poison.
     messageListItem.num = 3001;
     if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-        presenter()->consoleMessage(messageListItem.text);
+        presenter()->consoleMessageFor(obj->netId, messageListItem.text);
     }
 
     // NOTE: Uninline.
@@ -565,7 +578,7 @@ int critterAdjustRadiation(Object* obj, int amount)
                 }
 
                 if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-                    presenter()->consoleMessage(messageListItem.text);
+                    presenter()->consoleMessageFor(obj->netId, messageListItem.text);
                 }
             }
         }
@@ -576,7 +589,7 @@ int critterAdjustRadiation(Object* obj, int amount)
         messageListItem.num = 1007;
 
         if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-            presenter()->consoleMessage(messageListItem.text);
+            presenter()->consoleMessageFor(obj->netId, messageListItem.text);
         }
     }
 
@@ -683,7 +696,11 @@ void _process_rads(Object* obj, int radiationLevel, bool isHealing)
     int radiationLevelIndex = radiationLevel - 1;
     int modifier = isHealing ? -1 : 1;
 
-    if (obj == gDude) {
+    // The sickness report goes to the actor who is sick — it is written in the
+    // second person ("You feel a bit nauseous"), so a broadcast copy would tell
+    // every player that THEY are the one vomiting. Per-actor since the radiation
+    // DAMAGE became per-actor; this warning was the half left on the host.
+    if (playerActorIs(obj)) {
         // Radiation level message, higher is worse.
         messageListItem.num = 1000 + radiationLevelIndex;
 
@@ -694,7 +711,7 @@ void _process_rads(Object* obj, int radiationLevel, bool isHealing)
         }
 
         if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-            presenter()->consoleMessage(messageListItem.text);
+            presenter()->consoleMessageFor(obj->netId, messageListItem.text);
         }
     }
 
@@ -721,12 +738,28 @@ void _process_rads(Object* obj, int radiationLevel, bool isHealing)
     }
 
     if ((obj->data.critter.combat.results & DAM_DEAD) != 0) {
-        if (obj == gDude) {
+        if (playerActorIs(obj)) {
             // You have died from radiation sickness.
             messageListItem.num = 1006;
             if (messageListGetItem(&gMiscMessageList, &messageListItem)) {
-                // SFALL: Display a pop-up message box about death from radiation.
-                gameShowDeathDialog(messageListItem.text);
+                // ►► THIS KILLED THE WHOLE SERVER. gameShowDeathDialog is a full-screen
+                // modal message box, so on the core-only server it resolves to the
+                // aborting client stub — and radiation death is not an edge case, it is
+                // ordinary Fallout 2 (Toxic Caves goo, the Gecko reactor, Broken Hills).
+                // One player letting their rad counter run out took every other player's
+                // session down with the process.
+                //
+                // The dedicated server has no screen to put a modal on, so the news is
+                // delivered the way every other piece of per-actor news is: addressed to
+                // the actor it happened to. Death itself is already handled and already
+                // survivable — critterKill routes a player death through playerActorDied
+                // instead of the endgame, and a teammate can revive the body.
+                if (serverDedicatedActive()) {
+                    presenter()->consoleMessageStyled(obj->netId, kMsgChannelSystem, messageListItem.text);
+                } else {
+                    // SFALL: Display a pop-up message box about death from radiation.
+                    gameShowDeathDialog(messageListItem.text);
+                }
             }
         }
     }
@@ -1322,64 +1355,115 @@ int protoCritterDataWrite(File* stream, CritterProtoData* critterData)
     return 0;
 }
 
-// 0x42E220
-void dudeDisableState(int state)
+// The sheet row a DUDE_STATE_* flag belongs to, or nullptr if this subject has no
+// row of its own.
+//
+// ⚠ NOT "any critter's proto". These flags live in PROTO data, and an ordinary
+// critter's proto is SHARED by every critter of that pid — writing "sneaking" onto
+// a Klamath dog would mark every dog in the game. Only player actors have private
+// rows (PLAYER_SHEET_DESIGN.md §2), so a non-player subject is refused here rather
+// than at each of the callers.
+static Proto* dudeStateProto(Object* subject)
 {
-    Proto* proto;
-    protoGetProto(gDude->pid, &proto);
+    Object* actor = subject != nullptr ? subject : gDude;
+    if (!playerActorIs(actor)) {
+        return nullptr;
+    }
+
+    Proto* proto = nullptr;
+    if (protoGetProto(actor->pid, &proto) == -1) {
+        return nullptr;
+    }
+
+    return proto;
+}
+
+// 0x42E220
+void dudeDisableState(int state, Object* subject)
+{
+    Object* actor = subject != nullptr ? subject : gDude;
+
+    Proto* proto = dudeStateProto(actor);
+    if (proto == nullptr) {
+        return;
+    }
 
     proto->critter.data.flags &= ~(1 << state);
 
     if (state == DUDE_STATE_SNEAKING) {
-        queueRemoveEventsByType(gDude, EVENT_TYPE_SNEAK);
+        queueRemoveEventsByType(actor, EVENT_TYPE_SNEAK);
     }
+
+    // The flag word rides the actor's sheet row, so this is what puts the change on
+    // that player's own indicator bar. Host-local play ignores it (no deltas).
+    playerSheetMarkDirty(actor);
 
     presenter()->hudIndicatorBar();
 }
 
 // 0x42E26C
-void dudeEnableState(int state)
+void dudeEnableState(int state, Object* subject)
 {
-    Proto* proto;
-    protoGetProto(gDude->pid, &proto);
+    Object* actor = subject != nullptr ? subject : gDude;
+
+    Proto* proto = dudeStateProto(actor);
+    if (proto == nullptr) {
+        return;
+    }
 
     proto->critter.data.flags |= (1 << state);
 
     if (state == DUDE_STATE_SNEAKING) {
-        sneakEventProcess(nullptr, nullptr);
+        sneakEventProcess(actor, nullptr);
     }
+
+    playerSheetMarkDirty(actor);
 
     presenter()->hudIndicatorBar();
 }
 
 // 0x42E2B0
-void dudeToggleState(int state)
+void dudeToggleState(int state, Object* subject)
 {
     // NOTE: Uninline.
-    if (dudeHasState(state)) {
-        dudeDisableState(state);
+    if (dudeHasState(state, subject)) {
+        dudeDisableState(state, subject);
     } else {
-        dudeEnableState(state);
+        dudeEnableState(state, subject);
     }
 }
 
 // 0x42E2F8
-bool dudeHasState(int state)
+bool dudeHasState(int state, Object* subject)
 {
-    Proto* proto;
-    protoGetProto(gDude->pid, &proto);
+    Proto* proto = dudeStateProto(subject);
+    if (proto == nullptr) {
+        return false;
+    }
+
     return (proto->critter.data.flags & (1 << state)) != 0;
 }
 
 // 0x42E32C
+//
+// `obj` is the SNEAKING ACTOR (the queue event's owner), not decoration: vanilla
+// passes nullptr from dudeEnableState and reads gDude throughout, which is the same
+// object for one player and the wrong one for two. The roll, the skill it reads and
+// the timer it re-arms all belong to whoever is sneaking.
 int sneakEventProcess(Object* obj, void* data)
 {
     int time;
 
-    int sneak = skillGetValue(gDude, SKILL_SNEAK);
-    if (skillRoll(gDude, SKILL_SNEAK, 0, nullptr) < ROLL_SUCCESS) {
+    Object* actor = obj != nullptr ? obj : gDude;
+    int slot = playerActorSlotOf(actor);
+    if (slot < 0) {
+        return 0;
+    }
+
+    int sneak = skillGetValue(actor, SKILL_SNEAK);
+    if (skillRoll(actor, SKILL_SNEAK, 0, nullptr) < ROLL_SUCCESS) {
         time = 600;
-        _sneak_working = false;
+        _sneak_working[slot] = false;
 
         if (sneak > 250)
             time = 100;
@@ -1395,10 +1479,10 @@ int sneakEventProcess(Object* obj, void* data)
             time = 400;
     } else {
         time = 600;
-        _sneak_working = true;
+        _sneak_working[slot] = true;
     }
 
-    queueAddEvent(time, gDude, nullptr, EVENT_TYPE_SNEAK);
+    queueAddEvent(time, actor, nullptr, EVENT_TYPE_SNEAK);
 
     return 0;
 }
@@ -1406,18 +1490,21 @@ int sneakEventProcess(Object* obj, void* data)
 // 0x42E3E4
 int _critter_sneak_clear(Object* obj, void* data)
 {
-    dudeDisableState(DUDE_STATE_SNEAKING);
+    // The event's owner stops sneaking — before this took a subject, ANY player's
+    // sneak timer expiring cleared the HOST's flag.
+    dudeDisableState(DUDE_STATE_SNEAKING, obj);
     return 1;
 }
 
 // Returns true if dude is really sneaking.
 //
 // 0x42E3F4
-bool dudeIsSneaking()
+bool dudeIsSneaking(Object* subject)
 {
     // NOTE: Uninline.
-    if (dudeHasState(DUDE_STATE_SNEAKING)) {
-        return _sneak_working;
+    if (dudeHasState(DUDE_STATE_SNEAKING, subject)) {
+        int slot = playerActorSlotOf(subject != nullptr ? subject : gDude);
+        return slot >= 0 ? _sneak_working[slot] != 0 : false;
     }
 
     return false;
@@ -1691,6 +1778,25 @@ void _dude_stand(Object* obj, int rotation, int fid)
 // 0x418574
 void _dude_standup(Object* a1)
 {
+    // ►► RECORD THE STAND-UP, or nobody sees it. This registers a real animation
+    // (ANIM_BACK_TO_STANDING / ANIM_PRONE_TO_STANDING), but on the dedicated server the
+    // reg_anim bracket is applied SYNCHRONOUSLY by the server's applier and, unrecorded,
+    // the only thing that reaches a client is the resulting fid on the object delta. So a
+    // knocked-down critter lies there and then simply IS standing on its next turn —
+    // owner-reported for both NPCs and the player ("no standup anim... i just pressed
+    // somewhere and immediately ran off"). Getting up is a discrete action, exactly the
+    // kind the record channel exists for.
+    //
+    // Gate matches the other recorded families (combatAttackRecorded / combatMoveRecorded):
+    // record backend + env only, so SP and the null presenter are untouched.
+    // !presRecordActive() refuses to nest inside a section already open — a knockback that
+    // stands its victim up mid-attack keeps today's behaviour rather than corrupting the
+    // enclosing stream.
+    bool recording = serverLoopActive() && presRecordEnabled() && !presRecordActive();
+    if (recording) {
+        presRecordSectionBegin();
+    }
+
     reg_anim_begin(ANIMATION_REQUEST_RESERVED);
 
     int anim;
@@ -1702,6 +1808,12 @@ void _dude_standup(Object* a1)
 
     animationRegisterAnimate(a1, anim, 0);
     reg_anim_end();
+
+    if (recording) {
+        presRecordSectionEnd();
+        presenter()->presSeq(presRecordData(), presRecordSize(), presRecordOpCount(), a1->netId);
+    }
+
     a1->data.critter.combat.results &= ~DAM_KNOCKED_DOWN;
 }
 

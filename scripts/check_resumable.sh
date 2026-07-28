@@ -4,6 +4,12 @@
 # fight over the wire + debug CMD port, and asserts the four properties that are
 # impossible without the beat-spanning session machine (see tools/resumable_probe.py).
 set -u
+# ►► RUNS THE DEFAULT SERVER CONFIG — features ON, nothing disabled. It asserts that a
+# mid-fight cattack resolves as a dude attack, and the probe accepts EITHER channel that can
+# carry one: EVENT_ATTACK_RESULT, or EVENT_PRES_SEQ when the record channel is presenting it
+# (combat.cc:6019 suppresses the former for a recorded attack ON PURPOSE, to stop the viewer
+# double-presenting). Asserting only on ATTACK_RESULT is what made this gate look red whenever
+# recording was on — see tools/resumable_probe.py.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GAME="$ROOT/FO2"

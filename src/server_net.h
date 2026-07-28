@@ -88,6 +88,13 @@ public:
     // (server_control.cc); sessionIds are never reused, so a stale id reads false.
     bool hasSession(int sessionId) const;
 
+    // Disconnect ONE client (a kick). Returns true if a client with that id was
+    // connected and has now been closed and forgotten; sessionIds are never reused, so
+    // the id is dead afterwards. Used to refuse a duplicate login: leaving the loser
+    // connected-but-unbound is the confusing state — it receives the whole world and
+    // can drive nothing, which reads to the player as "the game is broken".
+    bool closeSession(int sessionId);
+
     // ByteSink: enqueue `size` bytes to every connected client's outbound queue
     // (zero-cost meta) and pump. Fallback for any direct-bytes caller; the frame
     // path goes through writeFrame. A failed send drops only that client.

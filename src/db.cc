@@ -153,6 +153,21 @@ File* fileOpenMemory(const void* data, size_t size)
     return xfileOpenMemory(data, size);
 }
 
+File* fileOpenMemoryWrite()
+{
+    return xfileOpenMemoryWrite();
+}
+
+const unsigned char* fileMemoryData(File* stream)
+{
+    return xfileMemoryData(stream);
+}
+
+long fileMemorySize(File* stream)
+{
+    return xfileMemorySize(stream);
+}
+
 // 0x4C5ED0
 int filePrintFormatted(File* stream, const char* format, ...)
 {

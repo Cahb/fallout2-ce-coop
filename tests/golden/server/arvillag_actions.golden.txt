@@ -67,7 +67,7 @@ dude_stat 29 100
 dude_stat 30 0
 dude_stat 31 20
 dude_stat 32 50
-dude_pcstat 0 20
+dude_pcstat 0 40
 dude_pcstat 1 3
 dude_pcstat 2 5100
 dude_pcstat 3 0

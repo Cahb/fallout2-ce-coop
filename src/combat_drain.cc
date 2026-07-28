@@ -351,9 +351,42 @@ CombatPumpOutcome combatServerPumpIntents(int actorSlot)
         // never silent (owner request: "explicit msg — intent denied, invalid:
         // <reason>; no more skip turn").
         const char* denyReason = nullptr;
+        // Must start empty: the two branches below are the ONLY writers, so every other
+        // denial reason (bad shot, generic failure) reaches the `denyDetail[0]` test with
+        // whatever the stack held — printing garbage through %s past the buffer.
+        char denyDetail[192] = "";
         int badShot = COMBAT_BAD_SHOT_OK;
         if (target == nullptr) {
-            denyReason = "no valid target (not a critter or door)";
+            // ►► THREE DIFFERENT BUGS USED TO PRINT THIS ONE SENTENCE, and only one of
+            // them is what it says. "not a critter or door" assumed the netId resolved
+            // and was the wrong KIND of thing — but the same branch is taken when the
+            // netId resolves to NOTHING, which is a completely different failure with a
+            // completely different owner: the client aimed at an object this server does
+            // not have. That is the mirror-divergence class (a retired object the mirror
+            // kept, or a netId the server re-minted onto something else), and it is
+            // invisible from a message blaming the target's type. Owner-reported as
+            // "couldn't shoot one of the deathclaws, no clue why" — with the other
+            // deathclaw in the same volley working.
+            //
+            // So: re-walk WITHOUT the type filter and say which case it is, naming what
+            // the server sees. `audit` is the follow-up when it says NOT FOUND — that is
+            // the oracle for a client holding an object the server retired.
+            Object* any = intent.arg >= 0 ? objectFindByNetId(intent.arg) : nullptr;
+            if (any != nullptr) {
+                denyReason = "that is not a critter or a door";
+                snprintf(denyDetail, sizeof(denyDetail),
+                    "netId=%d resolves to pid=0x%08x type=%d name='%s' tile=%d elev=%d — WRONG KIND",
+                    intent.arg, any->pid, PID_TYPE(any->pid),
+                    objectGetName(any) != nullptr ? objectGetName(any) : "?",
+                    any->tile, any->elevation);
+            } else {
+                denyReason = "that target is not here any more";
+                snprintf(denyDetail, sizeof(denyDetail),
+                    "netId=%d NOT FOUND in the world at all — the client is aiming at an "
+                    "object this server does not have (stale mirror or re-minted netId); "
+                    "run `audit` to diff",
+                    intent.arg);
+            }
         } else if ((badShot = _combat_check_bad_shot(actor, target, hitMode, aiming))
             != COMBAT_BAD_SHOT_OK) {
             denyReason = combatBadShotReason(badShot);
@@ -369,6 +402,9 @@ CombatPumpOutcome combatServerPumpIntents(int actorSlot)
             fprintf(stderr,
                 "f2_server: control cattack DENIED slot=%d target=%d reason=%s (turn kept)\n",
                 actorSlot, intent.arg, denyReason);
+            if (denyDetail[0] != '\0') {
+                fprintf(stderr, "f2_server: control cattack DENIED detail: %s\n", denyDetail);
+            }
             combatIntentPopForSlot(actorSlot); // spent one-shot — do NOT end the turn
             continue;
         }
@@ -444,7 +480,7 @@ void _combat_display(Attack* attack)
                 // You are not strong enough to use this weapon properly.
                 messageListItem.num = 107;
                 if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
-                    presenter()->consoleMessage(messageListItem.text);
+                    presenter()->consoleNarration(messageListItem.text);
                 }
             }
         }
@@ -543,7 +579,7 @@ void _combat_display(Attack* attack)
 
         strcat(text, ".");
 
-        presenter()->consoleMessage(text);
+        presenter()->consoleNarration(text);
     }
 
     if ((attack->attackerFlags & DAM_HIT) != 0) {
@@ -640,7 +676,7 @@ void _combat_display(Attack* attack)
 
                     if ((attack->defenderFlags & DAM_DEAD) != 0) {
                         strcat(text, ".");
-                        presenter()->consoleMessage(text);
+                        presenter()->consoleNarration(text);
 
                         if (attack->defender == gDude) {
                             if (critterGetStat(attack->defender, STAT_GENDER) == GENDER_MALE) {
@@ -670,7 +706,23 @@ void _combat_display(Attack* attack)
 
                 strcat(text, ".");
 
-                presenter()->consoleMessage(text);
+                // F2_TRACE_DAMAGE=1 — what the NARRATION believes, alongside what the calc
+                // produced ([dmg] TOTAL= in combat.cc). Damage has now been verified correct at
+                // compute time and wrong at print time, so the loss is between the two; printing
+                // both ends names the step instead of inferring it. Watch for defDmg=0 here with
+                // a nonzero TOTAL there (the value is being reset or a different struct is being
+                // narrated), and for the same line appearing once per reader with different
+                // values. fprintf: f2_server DROPS every debugPrint.
+                if (getenv("F2_TRACE_DAMAGE") != nullptr) {
+                    fprintf(stderr,
+                        "[dmg-say] ctd=%p defDmg=%d atkDmg=%d defFlags=0x%x atkFlags=0x%x def=%s -> \"%s\"\n",
+                        (void*)attack, attack->defenderDamage, attack->attackerDamage,
+                        attack->defenderFlags, attack->attackerFlags,
+                        attack->defender != nullptr ? objectGetName(attack->defender) : "(none)",
+                        text);
+                }
+
+                presenter()->consoleNarration(text);
             }
         }
     }
@@ -710,7 +762,7 @@ void _combat_display(Attack* attack)
 
             strcat(text, ".");
 
-            presenter()->consoleMessage(text);
+            presenter()->consoleNarration(text);
         }
 
         if ((attack->attackerFlags & DAM_HIT) != 0 || (attack->attackerFlags & DAM_CRITICAL) == 0) {
@@ -718,7 +770,7 @@ void _combat_display(Attack* attack)
                 combatCopyDamageAmountDescription(text, sizeof(text), attack->attacker, attack->attackerDamage);
                 combatAddDamageFlagsDescription(text, attack->attackerFlags, attack->attacker);
                 strcat(text, ".");
-                presenter()->consoleMessage(text);
+                presenter()->consoleNarration(text);
             }
         }
     }
@@ -744,8 +796,136 @@ void _combat_display(Attack* attack)
             combatAddDamageFlagsDescription(text, attack->extrasFlags[index], critter);
             strcat(text, ".");
 
-            presenter()->consoleMessage(text);
+            presenter()->consoleNarration(text);
         }
+    }
+}
+
+// ►► WHO DID WHAT TO WHOM, WITH WHAT — a co-op addition, and a DELIBERATE DIVERGENCE
+// from vanilla, which never names the attacker or the weapon at all: on a hit its
+// narrator phrases everything around the DEFENDER ("%s was hit for %d hit points"),
+// because in single-player the attacker is either you or the one thing on screen
+// swinging at you. With N player bodies in a firefight that stops being enough — "who
+// hit me, with what" is information the vanilla log structurally cannot carry.
+//
+// Emitted as a HEADER line before vanilla's own damage lines, so a hit reads:
+//     Sulik throws the Spear at you.
+//     You were hit in the left arm for 12 hit points.
+// and a miss still says who tried. On kMsgChannelCombat, which (a) is what the channel
+// was defined for and (b) tints these amber, so the new lines are easy to tell from
+// vanilla's while the wording is still being tuned.
+//
+// The pronoun comes from the message list (the same "You" vanilla uses), but the verbs
+// and sentence shapes are composed HERE, in English — there is nowhere in combat.msg to
+// put them. That is the cost of the divergence; a localized build would need its own
+// strings. Kill switch: F2_NO_ATTACK_HEADER=1.
+//
+// Runs INSIDE the per-recipient pass (see combatNarrateAttack), so gDude is the reader:
+// second person for the reader's own actor, names for everybody else.
+static void combatNarrateAttackHeader(Attack* attack)
+{
+    if (attack->attacker == nullptr || attack->defender == nullptr) {
+        return;
+    }
+    if (getenv("F2_NO_ATTACK_HEADER") != nullptr) {
+        return;
+    }
+
+    MessageListItem messageListItem;
+    char you[20];
+    you[0] = '\0';
+    messageListItem.num = critterGetStat(gDude, STAT_GENDER) == GENDER_MALE ? 506 : 556;
+    if (messageListGetItem(&gCombatMessageList, &messageListItem)) {
+        strcpy(you, messageListItem.text);
+    }
+
+    bool attackerIsReader = attack->attacker == gDude;
+    bool defenderIsReader = attack->defender == gDude;
+    const char* attackerName = attackerIsReader ? you : objectGetName(attack->attacker);
+    // Lowercase "you" as a sentence OBJECT. Deliberately a literal: the message list's
+    // 506/556 is capitalized for use as a subject, and there is no object form in it.
+    const char* defenderName = defenderIsReader ? "you" : objectGetName(attack->defender);
+
+    Object* weapon = critterGetWeaponForHitMode(attack->attacker, attack->hitMode);
+    const char* weaponName = weapon != nullptr ? objectGetName(weapon) : nullptr;
+    int anim = critterGetAnimationForHitMode(attack->attacker, attack->hitMode);
+
+    char text[280];
+    switch (anim) {
+    case ANIM_THROW_ANIM:
+        snprintf(text, sizeof(text), "%s %s the %s at %s.", attackerName,
+            attackerIsReader ? "throw" : "throws", weaponName != nullptr ? weaponName : "weapon",
+            defenderName);
+        break;
+    case ANIM_FIRE_SINGLE:
+    case ANIM_FIRE_BURST:
+    case ANIM_FIRE_CONTINUOUS:
+        snprintf(text, sizeof(text), "%s %s the %s at %s.", attackerName,
+            attackerIsReader ? "fire" : "fires", weaponName != nullptr ? weaponName : "weapon",
+            defenderName);
+        break;
+    case ANIM_SWING_ANIM:
+    case ANIM_THRUST_ANIM:
+        if (weaponName != nullptr) {
+            snprintf(text, sizeof(text), "%s %s %s with the %s.", attackerName,
+                attackerIsReader ? "attack" : "attacks", defenderName, weaponName);
+            break;
+        }
+        // fallthrough: a swing with nothing in hand reads as unarmed
+    default:
+        // Unarmed (punch/kick) and anything else that resolves as an attack.
+        snprintf(text, sizeof(text), "%s %s %s.", attackerName,
+            attackerIsReader ? "attack" : "attacks", defenderName);
+        break;
+    }
+
+    presenter()->consoleMessageStyled(presenterNarrationAddress(), kMsgChannelCombat, text);
+}
+
+// ►► NARRATE ONE ATTACK TO EVERY PLAYER, IN THE RIGHT PERSON.
+//
+// vanilla's _combat_display bakes "you" into its text against gDude, so shipping one
+// broadcast copy of it told EVERY viewer that they were the one hit (and told the
+// player who really was hit that some third party with their own name had been). The
+// fix is not to stop sharing the narration — shared narration is most of what makes a
+// co-op fight readable — but to render it once per reader:
+//   ServerActorScope  rebinds gDude, so vanilla's own "you"/gender/name/pronoun
+//                     choices come out right for that reader, with no reimplementation;
+//   PresenterNarrationScope  addresses that pass's lines, so the client drops the
+//                     copies meant for other players (client_net.cc onConsole).
+//
+// _combat_display is pure narration (message list + presenter calls, no sim state), so
+// running it N times is safe; that is exactly why it can be replayed per reader.
+//
+// SINGLE-PLAYER AND EVERY GOLDEN take the else branch — one unaddressed pass, the same
+// call vanilla made, byte-identical on the wire. serverDedicatedActive() (NOT
+// serverLoopActive, which is also true for the headless golden probe) is the gate.
+void combatNarrateAttack(Attack* attack)
+{
+    int players = serverDedicatedActive() ? playerActorCount() : 0;
+    if (players <= 1) {
+        // One reader (or none): "you" can only mean them, so vanilla's own single pass
+        // is already correct — and stays byte-for-byte what it always was.
+        //
+        // players == 0 is SINGLE-PLAYER or the headless golden probe. It gets no header
+        // either: the header is a co-op divergence that buys nothing when there is only
+        // one body in the world, and withholding it here is what makes this whole change
+        // golden-inert BY CONSTRUCTION rather than by hoping no dump captures console text.
+        if (players == 1) {
+            combatNarrateAttackHeader(attack);
+        }
+        _combat_display(attack);
+        return;
+    }
+    for (int slot = 0; slot < players; slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor == nullptr || actor->netId == 0) {
+            continue; // unfilled slot, or an actor with no wire identity to address
+        }
+        ServerActorScope actorScope(actor);
+        PresenterNarrationScope narration(actor->netId);
+        combatNarrateAttackHeader(attack);
+        _combat_display(attack);
     }
 }
 

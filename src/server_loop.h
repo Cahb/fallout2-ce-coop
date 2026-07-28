@@ -38,6 +38,29 @@ bool serverLoopActive();
 // the UI is skipped. Set once at probe entry (main.cc); always false in the
 // real client, so the client is unaffected.
 bool headlessProbeActive();
+
+// ►► IS A CO-OP FEATURE ENABLED? Features are ON BY DEFAULT — a normal dedicated-server
+// launch should need no env vars to get combat presentation, recorded animation, smooth
+// walking, live dialogue, travel or cutscenes. Those are BASIC BEHAVIOUR, not experiments,
+// and requiring six opt-ins to reach a playable server was backwards (owner ruling
+// 2026-07-25: "goldens should be forcing feature disabling, not server typical launch").
+//
+// Resolution order:
+//   `F2_X=0`            -> OFF. The explicit kill switch, matching the numeric form
+//                          serverActionGateEnabled() already used.
+//   `F2_X=<anything>`    -> ON, explicitly.
+//   unset, on a SERVER   -> ON. The point of this function.
+//   unset, under the
+//   HEADLESS PROBE       -> OFF. The probe is the vanilla-baseline oracle: it exists to
+//                          reproduce single-player deterministically, so anything that
+//                          changes sim or presentation behaviour must be opt-IN there.
+//                          This is how the goldens "force disabling" — once, here, rather
+//                          than as six env vars repeated across forty harness invocations.
+//                          A golden that WANTS a feature still sets it explicitly.
+//
+// Read the result through a `static` initializer at each call site as the existing gates
+// do: these are launch-time switches, never live inputs.
+bool serverFeatureEnabled(const char* name);
 void headlessProbeSetActive(bool active);
 
 // True only inside a REAL dedicated-server run (f2_server), i.e. the server loop
@@ -94,6 +117,14 @@ bool serverClaimantConnected();
 // barrier (MP_PROPOSAL.md Ch 6.1/8.3).
 void serverSetSlotSessionQuery(int (*query)(int slot));
 int serverSessionForSlot(int slot);
+
+// ►► Install the server-authored HOLODISK announcer, called from serverEmitBaseline so
+// custom disks re-announce on join / rebaseline / map change (which is what lets them
+// skip persistence — see pipboy.h). A HOOK rather than a direct call because the builder
+// needs f2_server-only state (the display name, the platform, the crew) and this TU is
+// f2_core: core must not name an f2_server symbol at link time (the P5 stub rule).
+// Unset on single-player and every golden, so the emit does not exist there.
+void serverSetHolodiskAnnouncer(std::function<void()> announcer);
 
 // Install the in-combat interaction executor (server_control.cc's
 // serverControlRunCombatInteract). Same bridge idiom as the queries above, and

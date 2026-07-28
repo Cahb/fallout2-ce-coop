@@ -64,8 +64,18 @@ namespace fallout {
 //   Locomotion        animationRegister{Move,Run}To*        (NONE — STATE lane, MOVE events w/      KEEP: the ONE soft/non-authoritative  [KEEP]
 //    FREE-ROAM        server_anim.cc:526/590 (glide branch)  durMs); recorder emits SYNC_MOVE only   presentation; real-time/concurrent
 //   Ambient / fidget  _object_fidget animation.cc:2595       (NONE — client-ticker-local)            KEEP: never on the wire               [KEEP]
-//   Bucket C (script  raw op_reg_anim_* opcodes             ALL of Table A, by construction         the reason for a stream vs replicas   [ ]
+//   Bucket C (script  raw op_reg_anim_* opcodes             ALL of Table A, by construction         the reason for a stream vs replicas   [x]
 //    cutscenes/mods)  (no composite — records by running)                                           (IDEAS.md modding; not Temple demo)
+// ►► Bucket C landed WITHOUT a dedicated opcode stream, and the reason generalises: the record
+//    hooks sit on the animationRegister* LEAVES in server_anim.cc (e.g. :1048 presRecordAnimate
+//    inside animationRegisterAnimate), not on the opcodes. A script opcode is just another caller
+//    of the same leaf, so it records by RUNNING — op_reg_anim_animate/_reverse/_forever/_play_sfx
+//    and op_animate_stand[_reverse] (reg_anim_begin + leaf + reg_anim_end) are covered with no
+//    per-opcode work.
+//    ⚠ DO NOT audit presentation coverage by reading opcode BODIES — they look untapped; the
+//    wiring is one call down. Of the 24 PURE-UI opcodes in docs/SCRIPT_OPCODE_MAP.md the only
+//    genuinely unwired one is op_game_ui_disable/_enable (0x8133/0x8134), which is not an anim and
+//    so wants a presenter() virtual mirroring screenFadeOut, not this channel.
 //
 // ---------------------------------------------------------------------------
 // TARGET ARCHITECTURE — the recorder is the SINGLE presentation engine for every

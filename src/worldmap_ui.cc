@@ -30,6 +30,7 @@
 #include "interface.h"
 #include "item.h"
 #include "kb.h"
+#include "map.h" // mapGetCurrentMap/mapGetName/gElevation — naming the map the ESC prompt returns to
 #include "memory.h"
 #include "mouse.h"
 #include "object.h"
@@ -115,7 +116,8 @@ static int wmInterfaceDrawCircleOverlay(CityInfo* cityInfo, CitySizeDescription*
 static void wmInterfaceDrawSubTileRectFogged(unsigned char* dest, int width, int height, int pitch);
 static int wmInterfaceDrawSubTileList(TileInfo* tileInfo, int column, int row, int x, int y, int a6);
 static int wmDrawCursorStopped();
-static int wmTownMapFunc(int* mapIdxPtr);
+static int wmTownMapFunc(int* mapIdxPtr, int* entranceIdxPtr = nullptr);
+static bool wmViewerEnterCurrentArea();
 static int wmTownMapInit();
 static int wmTownMapRefresh();
 static int wmTownMapExit();
@@ -127,6 +129,48 @@ static int wmTabsCompareNames(const void* a1, const void* a2);
 static int wmFreeTabsLabelList(int** quickDestinationsListPtr, int* quickDestinationsLengthPtr);
 static void wmRefreshInterfaceDial(bool shouldRefreshWindow);
 
+// ►►►► ESC ON THE STREAMED WORLDMAP ASKS BEFORE IT ACTS.
+// Vanilla's wmWorldMapFunc has no KEY_ESCAPE branch at all — its worldmap has exactly
+// one exit, enter a location — so nothing here is being changed for local play, and
+// there is no vanilla behaviour a prompt could get in the way of.
+//
+// What our ESC does is send an INTENT that makes the authority cancel the whole travel
+// session and put the party back into the map they walked out of, rewinding the world
+// position with it (server_worldmap.cc, WM_INTENT_ESCAPE). That is a state change made
+// on everyone's behalf — in co-op this is not "my screen", it is the screen the entire
+// server is parked on — and it is not what a player pressing the universal get-me-out-of
+// -this-screen key expects. Naming the destination map is the whole point of the prompt:
+// it is the only thing that says ESC means "go back where we came from", not "leave the
+// worldmap from here".
+//
+// Returns true if the player confirmed. Callers gate on gWorldmapStreaming, so local
+// play never reaches this.
+static bool wmConfirmReturnToMap()
+{
+    // The same map name the automap titles itself with (automap.cc). map.msg carries a
+    // real description for EVERY map index, random-encounter terrain included
+    // ("Desert"), so this reads sensibly whether the party walked out of Vault City or
+    // out of a spore plant ambush. nullptr only for an out-of-range index.
+    char prompt[128];
+    const char* mapName = mapGetName(mapGetCurrentMap(), gElevation);
+    if (mapName != nullptr && mapName[0] != '\0') {
+        snprintf(prompt, sizeof(prompt), "Return to %s?", mapName);
+    } else {
+        snprintf(prompt, sizeof(prompt), "Leave the world map?");
+    }
+
+    int rc = showDialogBox(prompt, nullptr, 0, 169, 117,
+        _colorTable[32328], nullptr, _colorTable[32328], DIALOG_BOX_YES_NO);
+
+    // Repaint what the box covered. It destroys its own window (never a neighbour's),
+    // but the worldmap is cheap to redraw and this also picks up any state the wire
+    // delivered while the box owned input — showDialogBox's nested loop keeps running
+    // tickersExecute, so the connection is still being serviced underneath it.
+    wmInterfaceRefresh();
+
+    return rc != 0;
+}
+
 // 0x4BFE0C
 void wmWorldMap()
 {
@@ -137,6 +181,16 @@ void wmWorldMap()
 static int wmWorldMapFunc(int a1)
 {
     ScopedGameMode gm(GameMode::kWorldmap);
+
+    // ►► SNAPSHOT BEFORE ANYTHING THAT PUMPS THE WIRE, not after. This used to be read
+    // further down, past two fades and wmInterfaceInit — all of which reach
+    // tickersExecute, and ScopedGameMode has already put us in kWorldmap, which is
+    // exactly the mask the viewer's service ticker gates itself to. So a worldmapEnd
+    // decoded during init cleared gWorldmapStreaming BEFORE it was captured, leaving
+    // streamingEntered false and the exit test below dead for the whole session — on a
+    // screen whose only other way out is the `wmesc` INTENT, which a server with no
+    // worldmap session discards. Reading it here cannot race the wire.
+    bool streamingEntered = gWorldmapStreaming;
 
     wmFadeOut();
 
@@ -157,8 +211,6 @@ static int wmWorldMapFunc(int a1)
     unsigned int partyHealTime = 0;
     int map = -1;
     int rc = 0;
-
-    bool streamingEntered = gWorldmapStreaming;
 
     while (true) {
         sharedFpsLimiter.mark();
@@ -265,13 +317,13 @@ static int wmWorldMapFunc(int a1)
 
                 if (abs(wmGenData.worldPosX - worldX) < 5 && abs(wmGenData.worldPosY - worldY) < 5) {
                     if (gWorldmapStreaming) {
-                        // Send UNCONDITIONALLY — the server resolves the
-                        // destination (a city's first valid map, or map 0 for
-                        // open wasteland). Gating this on currentAreaId != -1
-                        // would make clicking your own position anywhere but a
-                        // known town do nothing at all: the local `map = 0`
-                        // below is inert here, since only the server may load.
-                        clientViewerWmEnter();
+                        // The server resolves the destination (a chosen entrance, a
+                        // city's first valid map, or map 0 for open wasteland). NOT
+                        // gated on currentAreaId != -1: clicking your own position on
+                        // open wasteland must still drop you into the world, and the
+                        // local `map = 0` below is inert here since only the server
+                        // may load.
+                        wmViewerEnterCurrentArea();
                     } else if (wmGenData.currentAreaId != -1) {
                         CityInfo* city = &(wmAreaInfoList[wmGenData.currentAreaId]);
                         if (city->visitedState == 2 && city->mapFid != -1) {
@@ -325,7 +377,7 @@ static int wmWorldMapFunc(int a1)
         if (keyCode == KEY_UPPERCASE_T || keyCode == KEY_LOWERCASE_T) {
             if (!wmGenData.isWalking && wmGenData.currentAreaId != -1) {
                 if (gWorldmapStreaming) {
-                    clientViewerWmEnter();
+                    wmViewerEnterCurrentArea();
                 } else {
                     CityInfo* city = &(wmAreaInfoList[wmGenData.currentAreaId]);
                     if (city->visitedState == 2 && city->mapFid != -1) {
@@ -346,8 +398,19 @@ static int wmWorldMapFunc(int a1)
                 }
             }
         } else if (keyCode == KEY_ESCAPE) {
-            if (gWorldmapStreaming) {
-                clientViewerWmEscape();
+            if (gWorldmapStreaming && wmConfirmReturnToMap()) {
+                // ►► RE-CHECK STREAMING AFTER THE PROMPT. showDialogBox runs a nested
+                // input loop that keeps pumping the wire (tickersExecute → the viewer
+                // service ticker), so the server can have ended the session while the
+                // box was open — a random encounter fired, a pump bail, or the deferred
+                // -blob branch in client_net.cc cleared the flag for us. Sending into
+                // that gap is mostly harmless, because server_control.cc refuses the
+                // verb outright when no session is active; what it must not do is land
+                // on the NEXT session, which the answer to a stale prompt would cancel
+                // before the player had even seen it.
+                if (gWorldmapStreaming) {
+                    clientViewerWmEscape();
+                }
             }
         } else if (keyCode == KEY_HOME) {
             wmInterfaceCenterOnParty();
@@ -1441,9 +1504,52 @@ void wmTownMap()
 }
 
 // 0x4C485C
-static int wmTownMapFunc(int* mapIdxPtr)
+// `entranceIdxPtr` (optional) reports WHICH entrance was picked, not just where it
+// leads. A viewer needs the index rather than the map: it sends the index upstream and
+// the server resolves the destination from its own table.
+// ►► THE TOWN MAP, FOR A VIEWER. Streaming used to send an unconditional "enter", so a
+// co-op player always landed on a city's FIRST map — no districts, no named gates,
+// anywhere in the game. The picker is city ART plus buttons, which is ours to draw and
+// the server has none of, so we run vanilla's own screen and send back the ENTRANCE
+// INDEX; the server resolves what that means (never a map index off the wire).
+//
+// Returns true if something was sent upstream. Escaping the picker sends NOTHING — the
+// player changed their mind, exactly as cancelling an elevator never rides it. A city
+// whose layout we have not seen has nothing to pick from, so it falls back to the plain
+// enter, which is what the server answers with its front door.
+static bool wmViewerEnterCurrentArea()
+{
+    if (wmGenData.currentAreaId == -1) {
+        clientViewerWmEnter();
+        return true;
+    }
+
+    CityInfo* city = &(wmAreaInfoList[wmGenData.currentAreaId]);
+    if (city->visitedState != 2 || city->mapFid == -1) {
+        clientViewerWmEnter();
+        return true;
+    }
+
+    int townMap = -1;
+    int entranceIndex = -1;
+    if (wmTownMapFunc(&townMap, &entranceIndex) == -1) {
+        return false; // the screen itself failed; do not guess a destination
+    }
+
+    if (entranceIndex < 0) {
+        return false; // escaped — no travel, no message
+    }
+
+    clientViewerWmEnterEntrance(entranceIndex);
+    return true;
+}
+
+static int wmTownMapFunc(int* mapIdxPtr, int* entranceIdxPtr)
 {
     *mapIdxPtr = -1;
+    if (entranceIdxPtr != nullptr) {
+        *entranceIdxPtr = -1;
+    }
 
     if (wmTownMapInit() == -1) {
         wmTownMapExit();
@@ -1485,6 +1591,9 @@ static int wmTownMapFunc(int* mapIdxPtr)
                 }
 
                 *mapIdxPtr = entrance->map;
+                if (entranceIdxPtr != nullptr) {
+                    *entranceIdxPtr = keyCode - KEY_1;
+                }
 
                 mapSetEnteringLocation(entrance->elevation, entrance->tile, entrance->rotation);
 

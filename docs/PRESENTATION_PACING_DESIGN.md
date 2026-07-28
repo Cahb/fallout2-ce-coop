@@ -319,3 +319,170 @@ the item out of the world tile list). Was a silent drop. Golden-safe (dedicated-
 no-op on null presenter); check.sh green, no gate moved.
 Owner steer: co-op players are an SP-style party ([[coop-group-effects-like-party]]); this is presentation
 consistency for the N parallel peers, NOT server integrity (authoritative FIFO, solved).
+
+---
+
+## 12. Projectiles & throwables — ONE fix for all of them (Fable pass, 2026-07-25)
+
+**Owner ask:** an all-in-one fix covering thrown rocks/knives/spears, thrown explosives, and
+launcher projectiles, for players AND NPCs. Owner's discriminator that cracked it: *player
+rockets and grenades look fine; NPC spears and rocks do not.*
+
+### 12.1 Root cause — TWO CLOCKS, not a ref-encoding bug
+The wire is totally ordered (seq → CONNECT → DISCONNECT), but the client applies it on **two
+independent clocks**: state events at DECODE time (`onDisconnect`, client_net.cc:1637), record
+sequences at PUMP-DRAIN time (`presentationPump`). "Variable-speed but never-lossy player" must
+mean variable speed of **the stream as a whole** — per-lane speed (state instant, record
+deferred) **is a reorder**, which §the north-star invariant forbids.
+
+A non-explosive throw's flight transient ADOPTS the real ground-item netId (actions.cc, search
+`presRecordSetAdoptNetId`) — so it is the first object whose **lifetime** is written by BOTH
+lanes, and the tear shows up as lifetime corruption: its DESTROY (the pickup DISCONNECT) is a
+LATER-wire-order event applied BEFORE the EARLIER-wire-order OBJ_CREATE commits. Explosive
+throws and launcher projectiles never adopt, so nothing destroys their transient early — exactly
+the owner's split.
+
+►► **THE SEESAW EXISTS ONLY BECAUSE CREATION AND DESTRUCTION SIT ON DIFFERENT CLOCKS.**
+Decode-minting fixed the phantom spear by moving creation to the fast clock, which re-exposed
+destruction outrunning the flight. Any fix that keeps two clocks just shifts the weight. §6.5
+already names the cure ("DESTROY rides the FIFO too"); this is that bullet, built.
+
+### 12.2 The design — deferred lifecycle entries + mint at EXECUTE
+One rule: **any state-lane event addressing a presentation-entangled netId rides `_presQueue`
+in wire order instead of applying at decode.** Client-only, ZERO wire change, ZERO server change.
+
+1. **`_pendingAdopts`** (netId → count of not-yet-executed OBJ_CREATEs adopting it). The DRY pass
+   **stops minting**; it only increments. The EXECUTE pass mints, registers `_net`/
+   `_adoptTransients`, decrements. Every transient now mints on ONE clock — the decode→execute
+   existence window ceases to exist.
+2. **`PresKind::kDeferredEvent`** `{evType, payload, netId, capDeadline}` — raw event bytes
+   re-parsed at drain by the same handlers.
+3. **Entangled predicate** at the top of `onConnect`/`onDisconnect`/`onDestroy`/`onObjectDelta`/
+   `onMove`: `_pendingAdopts.count(netId) || _adoptTransients.count(netId)`. Ordering is airtight
+   by construction: once one event for netId X defers, every later event for X defers, so
+   per-netId wire order is preserved end to end.
+4. **Pump gate**: hold while `animationIsBusy(lookup(netId))` — the pickup DISCONNECT waits out
+   the SPEAR's own flight/landing anim (not the thrower's) — plus a wall-clock cap (~4s, sibling
+   of `kMoveReplayCapMs`) that FORCE-APPLIES. Failure direction stays "play/snap, never freeze",
+   and never "drop".
+
+**Seesaw resolved, not traded:** early-destroy becomes structurally impossible (the DISCONNECT
+sits behind the seq in ONE FIFO; execute mints the object the DISCONNECT will find); phantom
+becomes structurally impossible (deferral is never a drop — the DISCONNECT always drains,
+cap-bounded). Client lifetime == wire-order lifetime, shifted uniformly by pump latency.
+
+**Case matrix:** rock/knife/spear = the fixed path; grenade/dynamite and bullet/rocket are
+unchanged but now UNIFORM (all transients mint at execute); local player / remote player / NPC
+are indistinguishable because the mechanism keys on **netId entanglement, never on who acted**.
+Miss, victim-dies-mid-flight, thrower-freed-before-execute and version-dropped-seq all covered
+(the last degrades to exact state with no flight visual via the CONNECT item self-heal).
+
+### 12.3 Why it is safe
+Never-lossy (defers WHEN, never WHAT; the cap is a sanctioned snap, not a drop) · sim never
+blocks · no new client authority (pure receive-side flow control) · no vanilla rewrite
+(`_action_ranged`, reg_anim, `_obj_pickup`, `actionThrowConsumeHeadless` untouched) · NO_SAVE
+/blob purity intact · **GOLDEN-INERT: `onPresSeq` returns before the dry pass when
+`!clientViewerActive()`, so headless never feeds `_pendingAdopts` and every lifecycle event
+applies inline exactly as today; no wire change → no gate moves, NO re-bless anywhere.**
+
+►► It is the first concrete installment of Pillar 1's deferred-commit model, and `kDeferredEvent`
+is the SAME vehicle §11 B (pickup-sync) needs — this bug feeds it from a client-derived key
+(adopt), §11 B later feeds it from an owner-gated wire tag. **One mechanism, two feeders.**
+
+### 12.4 Rejected alternatives
+1. **Tombstone the adopt entry** (keep decode-minting, mark "destroy after execute") — patches only
+   the decode→execute window; a DISCONNECT arriving after execute while the pump is backlogged
+   still vanishes the spear, and throw→pickup→re-throw in one burst leaves the dry pass skipping
+   the second mint. The seesaw with a third state bolted on.
+2. **Server-side deferral / wire tag now** — §11 B's own analysis kills the outbox variant four
+   ways, and the client would STILL apply at decode unless it defers, so you build the FIFO entry
+   anyway and add a design-class protocol change the adopt key makes unnecessary.
+3. **Promote projectiles to real replicated objects** — flight position would ride immediate
+   deltas (the exact disease Pillar 1 cures), violates NO_SAVE/blob purity, burns the
+   process-lifetime id budget per shot, and rewrites vanilla lifetime handling.
+
+### 12.5 Build order (no step re-blesses a golden)
+1. ✅ **BUILT** — `kDeferredEvent` plumbing, **no feeder** (enum arm, pump gate + cap, drain
+   dispatch, teardown clears at applyBlob/onMapTransition, overflow exemption). Dead path → suite
+   byte-identical, confirmed.
+2. ✅ **BUILT + MECHANISM MEASURED; the EYEBALL arm still owed.** Execute-time minting + the
+   entangled feeder. ►► **`scripts/throw_smoke.sh` reproduces the whole thing on demand** (real
+   dedicated server + real dummy-video viewer, spear on artemple — the throw path CANNOT be
+   exercised headlessly, see step 2's note in §12.3). Measured A/B on the same netId, same op
+   counts, one commit apart:
+
+   | throw seq (ops=15) | `[disc]` order | |
+   |---|---|---|
+   | `refsOk=6 refsDROPPED=5 transientsMinted=0` | **before** the seq plays | step 1 — spear never flies |
+   | `refsOk=11 refsDROPPED=0 transientsMinted=1` | after the flight, `found=1` | step 2 |
+
+   Every other `[preplay]` line was identical across the two runs (blast radius confirmed
+   empirically, not just by argument). The fixture also lands the tightest possible version of the
+   race: `PARK type=5 net=381 ... live=0` — the pickup DISCONNECT arrives before the transient
+   even exists. **Still owed, and only the owner can call it:** does the flight LOOK right, does
+   the AI re-pickup remove it as the AI arrives, are grenade + rocket unchanged.
+3. Re-throw + stacked-throwable soak under induced pump backlog — extend `throw_smoke.sh`. ►► The
+   `[adopt]` trace shipped with step 2 (`PARK` at the feeder, `MINT` at execute, both under
+   `F2_TRACE_EVENTS`), so trap 4's netId-identity assertion is now a read, not a build: compare
+   `MINT net=` against `PARK net=`.
+   ►► **BANKED, PRE-EXISTING (identical in both A/B runs, so NOT from this work):** a 4-op
+   sequence right after the pickup reports `refsOk=1 refsDROPPED=1` — one unresolvable ref in a
+   post-pickup sequence. Under the never-lossy bar that is a real (cosmetic) tail worth chasing;
+   do not attribute it to §12.
+4. Backstop: force-wedge a flight anim → cap force-applies; map transition mid-flight → clean
+   rebaseline (walks the applyBlob seam → run the ASAN build).
+5. *(Later, owner-gated)* §11 B pickup-sync rides the same path via the wire tag.
+
+### 12.6 Traps (Fable, codebase-specific)
+1. ►►►► **`enqueue()` DROPS THE OLDEST DROPPABLE ENTRY ON BACKLOG** (client_net.cc:753-776).
+   Fine for captions, **fatal for a deferred DISCONNECT — a permanent phantom, i.e. the exact bug
+   this design exists to fix.** `kDeferredEvent` must be overflow-EXEMPT *and* apply-inline-now on
+   overflow (merely skipping starves the cap).
+2. `onBlobEnd`'s in-combat branch preserves only `kExit` — clear `_pendingAdopts` in the SAME
+   block, or later events defer against a count that never decrements and force-apply 4s late
+   forever.
+3. Order the guards: `onDestroy`'s gDude protection and the loot-modal deferred-free branch must
+   run BEFORE the entangled check.
+4. Stacked throwables: `itemRemove` peels a fresh object per unit ([[drop-count-divergence]]);
+   adopt captures `weapon->netId` at record time while `actionThrowConsumeHeadless` connects
+   `weapon` itself. Trace-assert netId identity before trusting it.
+5. Gate the deferred DISCONNECT on the TRANSIENT's `animationIsBusy`, not the thrower's. A null
+   `lookup(netId)` at the gate can only mean "already gone" under FIFO order → apply, don't hold.
+6. Keep `reserveSeqRef` / move-hold arming at DECODE — only OBJ_CREATE minting moves to execute,
+   or the same-beat corpse-fid leak regresses for every attack.
+7. Never bind the in-world flight transient into the dude's inventory mirror (single-membership is
+   a teardown double-free invariant).
+8. If a transient still lingers in testing, the answer is a missing deferred event draining — NOT
+   a client-side cleanup timer. The cap is the only sanctioned unilateral client action, and it
+   APPLIES the server's event, never invents one.
+
+### 12.7 Where the build differs from §12.2, and what it costs (Opus, step 2)
+Three deltas from the sketch. Each is load-bearing — do not "simplify" them back.
+1. **The feeder lives at the `event()` DISPATCHER, not inside the five handlers.** All five
+   deferrable events carry `netId` as their FIRST wire field, so one peek covers them; five
+   in-handler checks would also have to re-serialize a payload each handler had already consumed.
+   Trap 3 is satisfied differently than written but fully: the handler guards are not *ordered
+   before* the entangled check, they are *postponed with it* — the drain re-dispatches through
+   `event()`, so `onDestroy`'s gDude/loot-modal branches run unchanged, just later. (Neither can
+   fire on an adopt netId anyway: adopts are items, those guards protect critters/containers.)
+2. **A dropped `kRecordedSeq` must RELEASE the mints it promised.** §12.2 has the dry pass promise
+   and the execute pass fulfil, but `enqueue()` can drop the sequence *between* the two — then the
+   netId is entangled forever with nothing left to un-entangle it, which is trap 2 reached by a
+   second route. The queued entry therefore carries its own `seqAdopts` list and the drop path
+   decrements it. State still converges (the CONNECT self-heal materializes the real item); only
+   the flight visual is lost, which is what dropping a sequence has always meant.
+3. **The drain needs a re-entry guard** (`_applyingDeferredEvent`). Re-dispatching through
+   `event()` lands back on the feeder, and the netId is *still* entangled at that instant —
+   draining the event is precisely what un-entangles it — so without the guard a parked event
+   re-parks itself forever. Saved/restored, not blind-cleared: an overflow inline-apply can nest
+   inside a drain.
+
+**Known cost, accepted:** the cap is stamped when an event reaches the FRONT, so N events parked
+behind one genuinely wedged animation serialize their caps (N × 4 s) rather than sharing one. Real
+throws park ~2–3 events per item, and the first force-apply is the DISCONNECT — after which
+`lookup` returns null and the rest apply immediately. Revisit only if a live wedge shows it.
+
+**Blast radius, measured:** `presRecordSetAdoptNetId` has exactly ONE caller (`actions.cc:1013`,
+non-explosive `ANIM_THROW_ANIM`), so `presEntangled` can only ever be true for a thrown weapon's
+netId during its flight. Bullets, rockets, grenades, dynamite and every non-throw event decode
+byte-identically to before.

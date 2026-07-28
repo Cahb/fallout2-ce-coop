@@ -63,6 +63,12 @@ run_case klatoxcv_combat  klatoxcv.map  42    4000   trace_endturn.txt  3   > "$
 # Coverage case for Batch-1 converted paths: XP/level-up (stat.cc),
 # radiation+poison (critter.cc), stimpak drug effect (item.cc, pid 40).
 # H-43: pcLevelUpApply awards SP for the levels gained from the xp grant.
+# ►► dude_pcstat 0 is 40, i.e. the award TWICE over, and that is the point of the
+# case: the xp:4500 grant awards 20 through the funnel (which is where the award
+# lives now — stat.cc, on the level, per actor), and levelup:1 then drives
+# pcLevelUpApply DIRECTLY over the same range for isolated H-43 coverage. The probe
+# verb is a raw unit driver, not the editor's reconcile, so it does not consult
+# gCharacterEditorLastLevel and deliberately double-awards here.
 run_case arvillag_actions arvillag.map  42    2500   ""                 ""  "300:xp:4500,600:rad:150,900:poison:45,1200:drug:40,1500:levelup:1" > "$RESULTS/5.log" 2>&1 &
 # Batch-2 coverage: skillUse paths (hurt -> first aid/doctor time-skips+fades,
 # sneak toggle) and proto_instance door use (sfx+frame+msg).
@@ -86,7 +92,12 @@ run_case arvillag_invmenu arvillag.map  42    2500   ""                 ""  "300
 run_case arvillag_wmtravel arvillag.map 42    1200   ""                 ""  "300:hurt:30,400:wmtravel:2800230" > "$RESULTS/9.log" 2>&1 &
 # H-44/H-47/H-48 coverage: perk-dialog commits extracted to core. xp grant
 # reaches level 13 (>= perk min levels); mentats (+2 IN) qualify the dude for
-# Educated. perk:18 Educated (+2 unspent SP -> dude_pcstat 0), perk:28
+# Educated. dude_pcstat 0 is 101: the 12 levels the grant crosses now award skill
+# points in the XP funnel (saturating at pcLevelUpApply's per-level 99 clamp) and
+# Educated adds its 2 on top — a level-13 character HOLDING unspent points is the
+# fix, not the drift; it used to read 2 because nothing awarded points until a
+# character screen was opened, and a dedicated server has none.
+# perk:18 Educated (+2 unspent SP -> dude_pcstat 0), perk:28
 # Lifegiver (+4 max HP and heal -> dude_stat 7 / dude hp), perk:51 Tag! +
 # tag4:12 (science as 4th tag -> dude_tags), perk:52 Mutate! + mutate:2
 # (drop Heavy Handed, gain Small Frame -> dude_traits, +1 AG in dude_stat 5).

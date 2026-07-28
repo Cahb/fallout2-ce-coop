@@ -53,7 +53,7 @@ run_case() {
     (cd "$GAME_DIR" && env \
         SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         F2_FAKE_CLOCK=1 F2_HEADLESS_PROBE=1 F2_SERVER_LOOP=1 \
-        F2_NETSTREAM="$stream" F2_JOIN_TMP="$stream.blobtmp" \
+        F2_NETSTREAM="$stream" \
         F2_PROBE_MAP="$map" F2_PROBE_SEED="$seed" F2_PROBE_TICKS="$ticks" \
         F2_PROBE_DUMP="$dump" \
         ${actions:+F2_PROBE_ACTIONS="$actions"} \

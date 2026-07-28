@@ -252,6 +252,14 @@ void wmWorldMap_exit();
 void wmTransitionSaveMap();
 void wmTransitionSuspendScripts();
 void wmEncounterStagingClear();
+// Emit the "You have encountered…" line that mapLoad's emission-suppression window
+// swallowed on its way to the viewers. Call AFTER the encounter map has loaded; a
+// no-op if no encounter was staged.
+void wmEncounterDescriptionFlush();
+// TEST HOOK (admin `encnext`): make the next random-encounter check fire AND be
+// detected, so the accept/decline prompt can be reached without waiting on two dice.
+// One-shot — the check it arms consumes it.
+void worldmapForceNextEncounter();
 void wmTransitionResumeScripts();
 void worldmapTravelStep(int worldX, int worldY);
 bool worldmapTravelRestHeal(unsigned int now, unsigned int partyHealTime);
@@ -279,6 +287,10 @@ int wmSetupRandomEncounter();
 bool wmEvalTileNumForPlacement(int tile);
 int wmSubTileMarkRadiusVisited(int x, int y, int radius);
 int wmSubTileGetVisitedState(int x, int y, int* statePtr);
+// How many worldmap AREAS exist (bound for any areaIdx). Exported so callers can
+// validate an index without duplicating worldmap.cc's file-static cityIsValid.
+int wmAreaCount();
+
 int wmGetAreaIdxName(int areaIdx, char* name);
 bool wmAreaIsKnown(int areaIdx);
 int wmAreaVisitedState(int areaIdx);

@@ -32,7 +32,8 @@
 #include "debug.h" // TEMP DIAGNOSTIC (revert): _debug_register_env
 #include "game.h"
 #include "game_dialog.h" // gameDialogSetServerPump — A2 dialog block-and-pump seam
-#include "inventory.h" // barterSetServerPump — the barter block-and-pump seam
+#include "inventory.h" // barterSetServerPump / stealSetServerPump — modal block-and-pump seams
+#include "server_players.h" // playerActorOnline — the steal barrier bails when its thief drops
 #include "server_worldmap.h" // worldmapSetServerPump — worldmap block-and-pump seam
 #include "worldmap.h" // worldmapEncounterSetServerPump — random-encounter prompt barrier
 #include "object.h"
@@ -64,6 +65,12 @@ int main(int argc, char** argv)
     _debug_register_env();
 
     fprintf(stderr, "f2_server: platform %s\n", serverPlatformName());
+
+    // Install the server-authored holodisk announcer (server_loop.h): serverEmitBaseline
+    // calls it on every join / rebaseline / map change, which is what lets custom disks
+    // skip persistence entirely. A hook because the builder lives here in f2_server and
+    // serverEmitBaseline is f2_core.
+    serverSetHolodiskAnnouncer([]() { serverEmitHolodisks(); });
 
     const char* mapName = getenv("F2_SERVER_MAP");
 
@@ -290,7 +297,7 @@ int main(int argc, char** argv)
         // runs it 3x — empirically "super fast" walking on a live viewer). Unset =
         // full speed (the default; goldens and the tick-cap sweeps are unaffected).
         const char* paceValue = getenv("F2_SERVER_PACE_MS");
-        int paceMs = paceValue != nullptr ? atoi(paceValue) : 0;
+        int paceMs = paceValue != nullptr ? atoi(paceValue) : 100;
 
         // F2_SERVER_NET=<port>: stream the binary wire over TCP (STEP 3 "MAKE IT
         // ACCEPT"). Connect-at-start: bind, block until a viewer connects, then
@@ -320,6 +327,10 @@ int main(int argc, char** argv)
                 netSink.setTeeFile(teePath);
             }
             presenterSetServerSink(&netSink);
+            // The control plane does not own the sink, so hand it the KICK primitive it
+            // needs to refuse a duplicate login (server_control.h). netSink outlives the
+            // serve loop below, and the lambda is cleared with the process.
+            serverControlSetKicker([&netSink](int sid) { return netSink.closeSession(sid); });
             haveNet = true;
         }
 
@@ -373,7 +384,7 @@ int main(int argc, char** argv)
         // world — the reviewed body should gate serverControlLine to dsay/dend while
         // a dialog is active; (b) hazard 5 — gGameDialogSpeaker can dangle across a
         // rebaseline, so we deliberately skip acceptPending() here (joins wait).
-        if (getenv("F2_DIALOG_STREAM") != nullptr) {
+        if (serverFeatureEnabled("F2_DIALOG_STREAM")) {
             fprintf(stderr, "f2_server: F2_DIALOG_STREAM set — dialog block-and-pump ACTIVE (unreviewed first cut)\n");
             gameDialogSetServerPump([&]() -> bool {
                 // Always-bail conditions — never wedge the tick on a vanished viewer,
@@ -482,6 +493,56 @@ int main(int argc, char** argv)
             });
         }
 
+        // STEAL BARRIER (inventory.h). A steal session parks the tick the way a
+        // trade does, and for a stronger reason: the roll is authoritative, so
+        // the thief's every move has to come back here to be decided.
+        //
+        // ►► NOT gated on the dialog env like barter is. A trade is only
+        // reachable through a conversation; a steal is reachable from the
+        // skilldex on any critter, so gating it on the dialog feature would make
+        // a steal HANG on a server that had conversations turned off — the
+        // session would open with no pump and close on the first empty queue,
+        // before the thief could touch anything.
+        //
+        // ►► THE BAIL IS THE THIEF, not "anyone is connected". The session belongs
+        // to one player; if they drop, waiting for the rest of the party to press
+        // a key they cannot see would freeze the world forever. The teardown
+        // returns the victim's own gear, so a bail costs nobody anything.
+        stealSetServerPump([&]() -> bool {
+            if (gameTerminalQuitRequested()) {
+                fprintf(stderr, "f2_server: [steal] PUMP BAIL — terminal quit requested\n");
+                return false;
+            }
+            if (haveNet && netSink.clientCount() == 0) {
+                fprintf(stderr, "f2_server: [steal] PUMP BAIL — no wire clients left\n");
+                return false;
+            }
+
+            if (haveNet) {
+                serverControlBeginDrain([&](int sid) { return netSink.hasSession(sid); });
+                netSink.pollInbound([&](int sessionId, const char* line) {
+                    serverControlLine(sessionId, line);
+                });
+            }
+            if (haveCmd) {
+                cmdListener.pollCommands([&](const char* line, const CommandListener::ReplyFn& reply) { dispatchControlLine(0, line, reply); });
+            }
+
+            Object* thief = stealSessionThief();
+            bool thiefPresent = false;
+            if (thief != nullptr) {
+                int slot = playerActorSlotOf(thief);
+                thiefPresent = slot >= 0 && playerActorOnline(slot);
+            }
+            if (!(thiefPresent || haveCmd)) {
+                fprintf(stderr, "f2_server: [steal] PUMP BAIL — the thief is gone\n");
+                return false;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(paceMs > 0 ? paceMs : 10));
+            return true;
+        });
+
         // MOVIE BARRIER (game_movie.h). Unlike the two pumps around it this needs no
         // env gate, because its first bail condition makes it inert everywhere a gate
         // runs: with no WIRE CLIENT attached there is nobody to watch a movie and
@@ -513,7 +574,7 @@ int main(int argc, char** argv)
             return true;
         });
 
-        if (getenv("F2_WORLDMAP_STREAM") != nullptr) {
+        if (serverFeatureEnabled("F2_WORLDMAP_STREAM")) {
             fprintf(stderr, "f2_server: F2_WORLDMAP_STREAM set — worldmap block-and-pump ACTIVE\n");
             worldmapSetServerPump([&]() -> bool {
                 if (gameTerminalQuitRequested()) {
@@ -537,8 +598,33 @@ int main(int argc, char** argv)
                 if (haveCmd) {
                     cmdListener.pollCommands([&](const char* line, const CommandListener::ReplyFn& reply) { dispatchControlLine(0, line, reply); });
                 }
+                // ►►►► BOTH BAILS ABOVE AND HERE MEAN "THE LAST PLAYER IS GONE", AND THEY
+                // MUST KEEP MEANING THAT. Bailing cancels the trip for EVERYONE and now
+                // rewinds the party to where the transition started (server_worldmap.cc,
+                // the map == -1 tail), so a bail on one player's exit would drag the
+                // people still travelling back with them. P2 quitting while P1 is online
+                // must be a non-event for the trip, and it is: P2's release happens in
+                // the beginDrain above, which only clears P2's binding and QUEUES the
+                // body despawn (drained in the main phase, never in a pump), and the
+                // leave path requests no rebaseline — one would defer on P1's viewer and
+                // close its worldmap through viewerServiceTicker's blobDeferred branch.
+                //
+                // ►► THE TRAP IS THE NAME: serverControlHasClaimant() does NOT ask
+                // "is the driving player still here". It is serverControlAnyBound() —
+                // ANY slot bound to ANY session (server_control.cc). Authority replaced
+                // the single global claimant with per-slot bindings long ago and this
+                // predicate never got renamed. Narrowing it to the acting/driving player
+                // would compile fine and quietly ship exactly the bug above.
+                //
+                // The residual true case is real and worth keeping: connections that are
+                // present but bound to nothing (a viewer that never sent `login`) cannot
+                // drive the worldmap at all — the wm verbs are claim-gated — so the
+                // session would hang forever. That is a cancel, not a wedge.
                 if (!((haveNet && serverControlHasClaimant()) || haveCmd)) {
-                    fprintf(stderr, "f2_server: wm-pump bail: no claimant (haveNet=%d hasClaimant=%d haveCmd=%d)\n",
+                    // Prefix kept verbatim (stderr lines are a grep contract); the
+                    // clarification is appended, since "no claimant" reads as one player
+                    // having left when it means NOBODY IS BOUND AT ALL.
+                    fprintf(stderr, "f2_server: wm-pump bail: no claimant — nobody bound at all (haveNet=%d anyBound=%d haveCmd=%d)\n",
                         haveNet, serverControlHasClaimant() ? 1 : 0, haveCmd ? 1 : 0);
                     return false;
                 }

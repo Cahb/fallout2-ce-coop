@@ -28,6 +28,14 @@ E_COMBAT_ENTER = 12
 E_COMBAT_EXIT = 13
 E_TURN_START = 14
 E_ATTACK_RESULT = 15
+# ►► THE RECORD CHANNEL IS THE ATTACK PRESENTER. With F2_SERVER_PRES_RECORD on — which is now
+# the DEFAULT for a server — combat.cc:6019 DELIBERATELY suppresses EVENT_ATTACK_RESULT for a
+# recorded attack ("record channel = sole attack presenter ... else the viewer double-presents
+# it"), and the attack ships as EVENT_PRES_SEQ instead. Asserting only on ATTACK_RESULT
+# therefore reported "no dude attack" for an attack that resolved perfectly — which is what
+# made this gate look red whenever recording was enabled. Accept EITHER channel: both carry
+# the acting netId as their first i32.
+E_PRES_SEQ = 31
 
 
 def connect_retry(host, port, deadline):
@@ -142,11 +150,11 @@ def main():
                             if not cattack_sent:
                                 cattack_sent = True
                                 print("injected cattack mid-fight")
-                elif etype == E_ATTACK_RESULT and len(body) >= 8:
+                elif etype in (E_ATTACK_RESULT, E_PRES_SEQ) and len(body) >= 4:
                     attacker_net = struct.unpack_from("<i", body, 0)[0]
                     if cattack_sent and dude_net is not None and attacker_net == dude_net:
                         if not dude_attack:
-                            print("saw dude ATTACK_RESULT attacker_net=%d" % attacker_net)
+                            print("saw dude attack (ATTACK_RESULT or PRES_SEQ) attacker_net=%d" % attacker_net)
                         dude_attack = True
                 elif etype == E_COMBAT_EXIT and enter_seq is not None and exit_seq is None:
                     exit_seq = seq
@@ -168,7 +176,7 @@ def main():
     if dude_deadline <= 0:
         print("FAIL — no dude TURN_START with nonzero deadlineMs"); ok = False
     if not dude_attack:
-        print("FAIL — no dude ATTACK_RESULT after mid-fight cattack"); ok = False
+        print("FAIL — no dude attack (ATTACK_RESULT or PRES_SEQ) after mid-fight cattack"); ok = False
 
     if ok:
         print("RESUMABLE PROBE PASS — enter_seq=%d exit_seq=%d deadlineMs=%d dude_attack=1"

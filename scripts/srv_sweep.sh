@@ -27,7 +27,9 @@ tail -1 "$ROOT/scratch/build.log"
 pass=0; fail=0
 for m in "${MAPS[@]}"; do
     log="$ROOT/scratch/sweep_${m%%.*}.log"
-    (cd "$GAME_DIR" && env F2_SERVER_MAP="$m" F2_SERVER_TICKS="$TICKS" \
+    # F2_SERVER_PACE_MS=0: the pacing default is for live play; a sweep over every map
+    # would spend all its time asleep. Server defaults are ON, so the harness opts out.
+    (cd "$GAME_DIR" && env F2_SERVER_MAP="$m" F2_SERVER_TICKS="$TICKS" F2_SERVER_PACE_MS=0 \
         timeout -k 5 120 "$ROOT/build/f2_server" >"$log" 2>&1)
     rc=$?
     if [ $rc -eq 0 ]; then

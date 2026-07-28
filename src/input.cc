@@ -1,5 +1,6 @@
 #include "input.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include <SDL.h>
@@ -7,6 +8,7 @@
 #include "audio_engine.h"
 #include "client_net.h"
 #include "color.h"
+#include "dbox.h" // TEMP [wmenc]: dialogBoxTraceActiveTag — name the ESC producer
 #include "delay.h"
 #include "dinput.h"
 #include "draw.h"
@@ -188,12 +190,24 @@ void _process_bk()
 
     v1 = _win_check_all_buttons();
     if (v1 != -1) {
+        // TEMP DIAGNOSTIC [wmenc]: the two producers of input, named. The encounter
+        // prompt is closed by a KEY_ESCAPE one frame after it opens, and these two
+        // lines plus the injection sites in client_net.cc are ALL the ways an ESC can
+        // reach it — so exactly one of them prints, and that is the answer.
+        if (v1 == KEY_ESCAPE && dialogBoxTraceActiveTag() != nullptr) {
+            fprintf(stderr, "[%s] ESC produced by _win_check_all_buttons (a window BUTTON or menu bar)\n",
+                dialogBoxTraceActiveTag());
+        }
         enqueueInputEvent(v1);
         return;
     }
 
     v1 = _kb_getch();
     if (v1 != -1) {
+        if (v1 == KEY_ESCAPE && dialogBoxTraceActiveTag() != nullptr) {
+            fprintf(stderr, "[%s] ESC produced by _kb_getch (a REAL keystroke out of the SDL queue)\n",
+                dialogBoxTraceActiveTag());
+        }
         enqueueInputEvent(v1);
         return;
     }

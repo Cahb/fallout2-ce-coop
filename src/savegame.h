@@ -8,6 +8,19 @@ namespace fallout {
 #define LOAD_SAVE_DESCRIPTION_LENGTH 30
 #define LOAD_SAVE_HANDLER_COUNT 27
 
+// Slot INDEX SPACE — how many slots the engine can address, NOT how many the
+// player sees. 0..9 (directories SLOT01..SLOT10) are the ten the vanilla load and
+// save screens enumerate; 10.. are the dedicated server's AUTOSAVE ROTATION
+// window (server_admin.cc kAutosaveSlot / kAutosaveKeep), deliberately past the
+// end of that enumeration so an unattended save can never clobber a real one.
+//
+// This used to be a bare `11` — one autosave slot, overwritten in place forever.
+// Every map change fires an autosave, so entering a random encounter replaced the
+// only checkpoint you had with a mid-encounter transient map and there was nothing
+// older to fall back to. The window is the fix; growing this constant is how you
+// widen it (nothing derives a loop bound from the array, it is indexed by slot).
+constexpr int kSaveSlotSpace = 15;
+
 typedef struct LoadSaveSlotData {
     char signature[24];
     short versionMinor;

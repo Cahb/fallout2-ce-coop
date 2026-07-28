@@ -35,6 +35,7 @@ namespace fallout {
 static bool gClientDialogActive = false;      // server says a conversation is live
 static bool gClientDialogSessionBuilt = false; // background/head windows are up
 static bool gClientDialogNodeBuilt = false;    // reply/option subwindows are up
+static bool gClientDialogOptionsHidden = false; // the options list is hidden for a trade
 static bool gClientDialogNodePending = false;  // node content needs (re)applying
 static bool gClientDialogLipsPending = false;  // a FRESH node wants lipsync played
 static int gClientDialogDriverNetId = 0;
@@ -48,6 +49,9 @@ static int gPendingReaction = 0;
 static int gPendingHeadFid = -1;
 static std::string gPendingReply;
 static std::vector<std::string> gPendingOptions;
+// Parallel to gPendingOptions: how the listener takes each line. Feeds the vanilla
+// renderer's Empathy branch, which colours the list green/grey/red.
+static std::vector<int> gPendingOptionReactions;
 static std::string gPendingAudio;
 
 // EVENT_DIALOG_NODE handler. LATCHES the node — no window calls (I6). The first
@@ -55,16 +59,19 @@ static std::string gPendingAudio;
 // the next frame and clientDialogRenderPendingNode() applies this content into them.
 void clientDialogOnNode(int speakerNetId, int driverNetId, int reaction,
     const char* reply, const char* const* options, int optionCount,
-    const char* audioFileName, int headFid)
+    const char* audioFileName, int headFid, const int* optionReactions)
 {
     gPendingSpeakerNetId = speakerNetId;
     gPendingReaction = reaction;
     gPendingHeadFid = headFid;
     gPendingReply = reply != nullptr ? reply : "";
     gPendingOptions.clear();
+    gPendingOptionReactions.clear();
     if (optionCount > 0 && options != nullptr) {
         for (int i = 0; i < optionCount; i++) {
             gPendingOptions.emplace_back(options[i] != nullptr ? options[i] : "");
+            gPendingOptionReactions.push_back(
+                optionReactions != nullptr ? optionReactions[i] : GAME_DIALOG_REACTION_NEUTRAL);
         }
     }
     gPendingAudio = audioFileName != nullptr ? audioFileName : "";
@@ -96,7 +103,13 @@ void clientDialogOnEnd()
 void clientModalWindowsSync()
 {
     bool sessionWanted = gClientDialogActive;
-    bool nodeWanted = gClientDialogActive && !clientBarterActive();
+    // ►► THE NODE WINDOWS SURVIVE A TRADE, as they do in vanilla (_gdProcessExit
+    // runs at the END of the conversation, never at the barter boundary). Only the
+    // OPTIONS list conflicts with the trade window, and it is hidden below rather
+    // than destroyed. Tearing the pair down for a trade is what made an item
+    // description unrenderable during barter — the handler's target window was
+    // gone, which is the fault that got it routed to a no-op sink.
+    bool nodeWanted = gClientDialogActive;
 
     // Build order: session (background/head) before node subwindows, because the
     // node windows draw into the session window's frame.
@@ -129,6 +142,20 @@ void clientModalWindowsSync()
     } else if (!nodeWanted && gClientDialogNodeBuilt) {
         gameDialogExitNodeWindows();
         gClientDialogNodeBuilt = false;
+        gClientDialogOptionsHidden = false;
+    }
+
+    // The options list is where the trade window goes, and it is WINDOW_MOVE_ON_TOP,
+    // so it must be HIDDEN for a trade rather than merely covered — that leftover
+    // list drawing over the barter background was the reported "dialog leftovers
+    // blended". Toggled on CHANGE only: windowShow/windowHide every frame would
+    // dirty the region for nothing.
+    if (gClientDialogNodeBuilt) {
+        bool wantHidden = clientBarterActive();
+        if (wantHidden != gClientDialogOptionsHidden) {
+            gameDialogSetOptionsWindowVisible(!wantHidden);
+            gClientDialogOptionsHidden = wantHidden;
+        }
     }
 
     // Teardown order: node subwindows come down (above) before the session window.
@@ -152,8 +179,16 @@ void clientDialogRenderPendingNode()
 
     gameDialogClearOptions();
     gameDialogSetReplyText(gPendingReply.c_str());
-    for (const std::string& option : gPendingOptions) {
-        gameDialogAddTextOptionWithProc(-1, option.c_str(), 0, 50);
+    for (size_t i = 0; i < gPendingOptions.size(); i++) {
+        // ►► THE REACTION IS THE AUTHORITY'S, NOT A CONSTANT. This used to pass a
+        // hardcoded 50 (NEUTRAL) for every option, which meant the Empathy perk — whose
+        // whole visible effect is colouring this list — did nothing on a viewer. The
+        // renderer's Empathy branch (game_dialog.cc) was always there, reading exactly
+        // this field; it was being fed a lie.
+        int optionReaction = i < gPendingOptionReactions.size()
+            ? gPendingOptionReactions[i]
+            : GAME_DIALOG_REACTION_NEUTRAL;
+        gameDialogAddTextOptionWithProc(-1, gPendingOptions[i].c_str(), 0, optionReaction);
     }
 
     // Trigger the vanilla render pipeline now that reply/option globals are seeded.
@@ -249,8 +284,28 @@ bool clientDialogHandleKey(int keyCode)
         return true;
     }
 
-    if (keyCode >= '1' && keyCode <= '9') {
-        int index = keyCode - '1';
+    // OPTION SCROLLING (the panel is fixed-size and the renderer drops what does not fit).
+    // Both the page keys and the arrows/wheel, since a viewer does not run the reply's own
+    // paging state and so has nothing to compete with.
+    if (keyCode == KEY_PAGE_DOWN || keyCode == KEY_ARROW_DOWN) {
+        gameDialogScrollOptions(1);
+        return true;
+    }
+    if (keyCode == KEY_PAGE_UP || keyCode == KEY_ARROW_UP) {
+        gameDialogScrollOptions(-1);
+        return true;
+    }
+
+    // ►► THE WHOLE OPTION RANGE, not just '1'-'9'. Vanilla's option buttons post
+    // `49 + index`, so with ten or more options — which crowded co-op dialogs reach, and
+    // which is exactly when scrolling matters — clicking the tenth did nothing at all on a
+    // viewer: the keycode fell outside the digit range and was dropped. Bounded by the
+    // real option count so a stray key cannot index past the list. (Past 16 options the
+    // codes reach the letter keys; that overlap is vanilla's own numbering scheme, and 'T'
+    // — barter — is claimed above this.)
+    int optionCount = (int)gPendingOptions.size();
+    if (optionCount > 0 && keyCode >= 49 && keyCode < 49 + optionCount) {
+        int index = keyCode - 49;
         clientViewerDialogSay(index);
         gClientDialogWaitingForResponse = true;
         return true;

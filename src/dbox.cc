@@ -148,8 +148,27 @@ static int gSaveFileDialogFrmIds[FILE_DIALOG_FRM_COUNT] = {
 };
 
 // 0x41CF20
+// TEMP DIAGNOSTIC [wmenc] — see dbox.h. One-shot, consumed by the next box.
+static const char* gDialogBoxTraceTag = nullptr;
+static const char* gDialogBoxTraceOpenTag = nullptr;
+
+void dialogBoxTraceNext(const char* tag)
+{
+    gDialogBoxTraceTag = tag;
+}
+
+const char* dialogBoxTraceActiveTag()
+{
+    return gDialogBoxTraceOpenTag;
+}
+
 int showDialogBox(const char* title, const char** body, int bodyLength, int x, int y, int titleColor, const char* a8, int bodyColor, int flags)
 {
+    // TEMP [wmenc]: take the arming here, before any early return, so a box that
+    // fails to open cannot leave it armed for someone else's dialog.
+    const char* traceTag = gDialogBoxTraceTag;
+    gDialogBoxTraceTag = nullptr;
+
     MessageList messageList;
     MessageListItem messageListItem;
     int savedFont = fontGetCurrent();
@@ -523,11 +542,23 @@ int showDialogBox(const char* title, const char** body, int bodyLength, int x, i
 
     windowRefresh(win);
 
+    // TEMP [wmenc]: armed only for the duration of the input loop, so the producer
+    // prints cannot fire against an unrelated frame.
+    gDialogBoxTraceOpenTag = traceTag;
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
 
         int keyCode = inputGetInput();
+
+        // TEMP DIAGNOSTIC [wmenc]: every code this box sees, in order. -1 is "nothing
+        // happened this frame" and is the overwhelming majority, so it is skipped; -2
+        // is a raw mouse event the box ignores. Anything else either closes the box or
+        // is discarded by the branches below, and which it was is the whole question.
+        if (traceTag != nullptr && keyCode != -1) {
+            fprintf(stderr, "[%s] dbox input keyCode=%d\n", traceTag, keyCode);
+        }
 
         if (keyCode == 500) {
             rc = 1;
@@ -553,6 +584,8 @@ int showDialogBox(const char* title, const char** body, int bodyLength, int x, i
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    gDialogBoxTraceOpenTag = nullptr; // TEMP [wmenc]
 
     windowDestroy(win);
     fontSetCurrent(savedFont);

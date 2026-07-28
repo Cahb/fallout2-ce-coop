@@ -8,9 +8,12 @@ namespace fallout {
 // the conversation live — it does NOT touch windows (see clientModalWindowsSync).
 // driverNetId gates editability: the controlling viewer (its gDude->netId ==
 // driverNetId) has editable options; other viewers are read-only spectators.
+// `optionReactions` is parallel to `options` (GAME_DIALOG_REACTION_*) and drives the
+// Empathy colour-coding; nullptr reads as all-neutral.
 void clientDialogOnNode(int speakerNetId, int driverNetId, int reaction,
     const char* reply, const char* const* options, int optionCount,
-    const char* audioFileName = nullptr, int headFid = -1);
+    const char* audioFileName = nullptr, int headFid = -1,
+    const int* optionReactions = nullptr);
 
 // Called from the EVENT_DIALOG_END handler (and the local ESC bail). LATCHES the
 // conversation as over — clientModalWindowsSync() tears the windows down.

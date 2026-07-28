@@ -593,8 +593,10 @@ static void opUsingSkill(Program* program)
     // SKILL_SNEAK as arguments.
     int result = 0;
 
-    if (skill == SKILL_SNEAK && object == gDude) {
-        result = dudeHasState(DUDE_STATE_SNEAKING);
+    // Asks about the OBJECT the script named, so a script checking whether the
+    // player creeping past it is sneaking gets that player's answer, not slot 0's.
+    if (skill == SKILL_SNEAK && playerActorIs(object)) {
+        result = dudeHasState(DUDE_STATE_SNEAKING, object);
     }
 
     programStackPushInteger(program, result);
@@ -806,6 +808,43 @@ static void opRollDice(Program* program)
     programStackPushInteger(program, 0);
 }
 
+// ►► CO-OP: a script that relocates a player relocates EVERY player.
+//
+// In single-player the ENGINE, not the script, kept the group together — a map change
+// ran _partyMemberSyncPosition and on-map followers walked after the dude. Co-op player
+// actors are deliberately NOT in gPartyMembers (they are first-class actors, not
+// companions), so nothing drags them: a scripted teleport used to strand everyone but
+// the initiator, which for a plot relocation means missing the sequence entirely.
+//
+// Unconditional ON PURPOSE — no per-script override table. The risk is asymmetric:
+// fanning out when we should not leaves an extra body standing somewhere odd, while
+// failing to fan out puts a player outside the game. When one direction is cosmetic and
+// the other is crippling, the default absorbs the ambiguity. Verified against all 123
+// `move_to(dude_obj` call sites in the shipped scripts; the only sites where the fan-out
+// looks silly are the New Reno boxing ring (NCPRZFTR/NCSTULIT/NCANOUNC) and the Bishop
+// party-hide scenes (NCLABISH/NCANGBIS), and both are cosmetic. They are documented
+// rather than special-cased: a conditional nobody can test is worse than either outcome.
+//
+// SP is byte-identical — playerActorCount() == 1, so the loop body never runs.
+static void scriptRelocateOtherPlayerActors(Object* mover, int tile, int elevation)
+{
+    if (mover == nullptr || !playerActorIs(mover)) {
+        return;
+    }
+
+    for (int slot = 0; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor == nullptr || actor == mover || !playerActorOnline(slot)) {
+            continue;
+        }
+        // Placement, NOT a teleport onto the same hex: _objPMAttemptPlacement is what
+        // _partyMemberSyncPosition already uses — it finds a free tile near the target
+        // and leaves the actor where it was if it cannot, so a cramped destination
+        // degrades to "did not move" instead of stacking bodies.
+        _objPMAttemptPlacement(actor, tile, elevation);
+    }
+}
+
 // move_to
 // 0x454E28
 static void opMoveTo(Program* program)
@@ -856,6 +895,9 @@ static void opMoveTo(Program* program)
                 rectUnion(&before, &after, &before);
                 presenter()->worldInvalidateRect(&before, gElevation);
             }
+        }
+        if (newTile != -1) {
+            scriptRelocateOtherPlayerActors(object, tile, elevation);
         }
     } else {
         scriptPredefinedError(program, "move_to", SCRIPT_ERROR_OBJECT_IS_NULL);
@@ -2896,6 +2938,13 @@ static void opCritterAttemptPlacement(Program* program)
     objectSetLocation(critter, 0, elevation, nullptr);
 
     int rc = _obj_attempt_placement(critter, tile, elevation, 1);
+
+    // Same reasoning as move_to above. Not gated on rc: the placement return convention
+    // here is the script's business, and if the initiator only half-landed, the others
+    // standing near the target is still closer to the script's intent than being left
+    // on the far side of the map.
+    scriptRelocateOtherPlayerActors(critter, tile, elevation);
+
     programStackPushInteger(program, rc);
 }
 
@@ -4225,14 +4274,20 @@ static void opObjectClose(Program* program)
 // 0x45B3D0
 static void opGameUiDisable(Program* program)
 {
-    gameUiDisable(0);
+    // The cutscene lock belongs to the player the script is acting on, matching the
+    // gfade_out/gfade_in pair right below — a script issues them together and they
+    // must aim at the same person. Routed through the presenter so a dedicated
+    // server, whose own gameUiDisable is a no-op stub, still tells the viewers.
+    Object* actor = scriptContextDude(program);
+    presenter()->screenInputLock(true, actor != nullptr ? actor->netId : 0);
 }
 
 // game_ui_enable
 // 0x45B3D8
 static void opGameUiEnable(Program* program)
 {
-    gameUiEnable();
+    Object* actor = scriptContextDude(program);
+    presenter()->screenInputLock(false, actor != nullptr ? actor->netId : 0);
 }
 
 // game_ui_is_disabled
@@ -4249,7 +4304,11 @@ static void opGameFadeOut(Program* program)
     int data = programStackPopInteger(program);
 
     if (data != 0) {
-        presenter()->screenFadeOut();
+        // The fade belongs to the player the script is acting on — grave digging is the
+        // canonical case. Broadcasting it would black out the whole party for one
+        // person's shovel work.
+        Object* actor = scriptContextDude(program);
+        presenter()->screenFadeOut(actor != nullptr ? actor->netId : 0);
     } else {
         scriptPredefinedError(program, "gfade_out", SCRIPT_ERROR_OBJECT_IS_NULL);
     }
@@ -4262,7 +4321,8 @@ static void opGameFadeIn(Program* program)
     int data = programStackPopInteger(program);
 
     if (data != 0) {
-        presenter()->screenFadeIn();
+        Object* actor = scriptContextDude(program);
+        presenter()->screenFadeIn(actor != nullptr ? actor->netId : 0);
     } else {
         scriptPredefinedError(program, "gfade_in", SCRIPT_ERROR_OBJECT_IS_NULL);
     }

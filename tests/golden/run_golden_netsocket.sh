@@ -61,7 +61,12 @@ run_case() {
     # ONE run: stream over TCP (SocketByteSink) while teeing the identical bytes to
     # a file. The server blocks on accept() until the capture client connects, then
     # streams and closes at the tick cap.
+    # ►► PIN THE PACING. F2_SERVER_PACE_MS is a per-tick wall-clock sleep whose default
+    # serves live play; at the shipped value this run's ticks outlast the timeout below and
+    # the gate fails for a reason that has nothing to do with transport. A golden opts out
+    # of every server default it cannot afford (same rule as run_record_purity.sh).
     (cd "$GAME_DIR" && env F2_SERVER_MAP="$map" F2_SERVER_TICKS="$ticks" \
+        F2_SERVER_PACE_MS=0 \
         F2_SERVER_NET="$port" F2_SERVER_NET_TEE="$tee_bin" \
         timeout -k 5 180 "$BIN" >/dev/null 2>&1) &
     local srv_pid=$!

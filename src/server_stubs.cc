@@ -46,6 +46,7 @@
 #include <cstring>
 
 #include "animation.h"
+#include "server_loop.h" // serverFeatureEnabled — features default ON for a server
 #include "pres_record.h"
 #include "art.h"
 #include "automap.h"
@@ -126,6 +127,49 @@ namespace fallout {
         symbol);
     abort();
 }
+
+// ►►►► HEADLESS-SAFE, NOT FATAL — the SCRIPT-REACHABLE surface.
+//
+// The stubs below this helper are different in kind from the rest of the file.
+// Everything else here aborts because only ENGINE code could call it, so a call
+// means we mis-routed something and want it loud. But `sfall_opcodes.cc` and
+// `sfall_metarules.cc` are compiled into f2_core, i.e. into f2_server — so a
+// MOD SCRIPT can reach a dozen of these by writing `get_screen_width` in a .ssl,
+// and abort() there kills the whole server for every connected player because
+// one script asked a cosmetic question. That trade is never right: a script
+// asking the screen width on a headless server should get an answer, not a
+// funeral. Same failure family as the v0.2 Sulik-recruitment crash
+// (_gdialogUpdatePartyStatus -> screenGetWidth -> SIGABRT).
+//
+// So each one answers as the honest headless truth (no screen, no mouse, no
+// keyboard, no window) and logs ONCE so it stays diagnosable. Adding a real
+// implementation later is strictly better; aborting is strictly worse.
+// ►► RULE: any stub a script opcode/metarule can reach belongs here, never in
+// the aborting set above.
+// Fixed table + strcmp rather than a std::set: this is a diagnostic path that can be
+// reached from inside script execution, so it allocates nothing and needs no new include.
+static void serverStubHeadlessOnce(const char* symbol)
+{
+    static const char* reported[24];
+    static int reportedCount = 0;
+    for (int index = 0; index < reportedCount; index++) {
+        if (strcmp(reported[index], symbol) == 0) {
+            return;
+        }
+    }
+    if (reportedCount < (int)(sizeof(reported) / sizeof(reported[0]))) {
+        reported[reportedCount++] = symbol;
+    }
+    fprintf(stderr, "f2_server: '%s' answered headless (no screen/mouse/keyboard). "
+                    "A script or engine path asked for client-only state.\n",
+        symbol);
+}
+
+// Vanilla's native resolution. There is no engine-wide constant for it (the real
+// screenGetWidth measures the SDL window, and ORIGINAL_ISO_WINDOW_* is the iso
+// viewport, not the screen), so name it once here.
+static constexpr int kHeadlessScreenWidth = 640;
+static constexpr int kHeadlessScreenHeight = 480;
 
 // ---- data placeholders (globals the core names; never meaningfully read on
 // the aborting server — storage only, so the link resolves) ----
@@ -258,8 +302,9 @@ bool _windowRefreshRegions() { serverStubAbort("_windowRefreshRegions"); }
 bool _windowSetButtonFlag(const char* buttonName, int value) { serverStubAbort("_windowSetButtonFlag"); }
 bool _windowSetMovieFlags(int flags) { serverStubAbort("_windowSetMovieFlags"); }
 bool _windowSetRegionFlag(const char* regionName, int value) { serverStubAbort("_windowSetRegionFlag"); }
-bool _windowShow() { serverStubAbort("_windowShow"); }
-bool _windowShowNamed(const char* name) { serverStubAbort("_windowShowNamed"); }
+// HEADLESS-SAFE (sfall metarule `show_window`): there is no window to show.
+bool _windowShow() { serverStubHeadlessOnce("_windowShow"); return false; }
+bool _windowShowNamed(const char* name) { (void)name; serverStubHeadlessOnce("_windowShowNamed"); return false; }
 bool _windowStartRegion(int initialCapacity) { serverStubAbort("_windowStartRegion"); }
 void _windowStopMovie() { serverStubAbort("_windowStopMovie"); }
 int _windowWidth() { serverStubAbort("_windowWidth"); }
@@ -306,7 +351,26 @@ int dialogSetOptionWindow(int a1, int a2, int a3, int a4, char* a5) { (void)a1; 
 int dialogSetReplyColor(float a1, float a2, float a3) { (void)a1; (void)a2; (void)a3; /* Benign (A0 flip): dialog reply/option window chrome; the headless _gdialogInitFromScript/ExitFromScript path calls these, no rendering server-side. */ return 0; }
 int dialogSetReplyTitle(const char* a1) { (void)a1; /* Benign (A0 flip): dialog reply/option window chrome; the headless _gdialogInitFromScript/ExitFromScript path calls these, no rendering server-side. */ return 0; }
 int dialogSetReplyWindow(int a1, int a2, int a3, int a4, char* a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; /* Benign (A0 flip): dialog reply/option window chrome; the headless _gdialogInitFromScript/ExitFromScript path calls these, no rendering server-side. */ return 0; }
-void endgamePlayMovie() { serverStubAbort("endgamePlayMovie"); }
+// HEADLESS-SAFE, and it USED TO ABORT — reached from `op_endgame_movie` (opcode
+// 0x8148), i.e. AT VICTORY. Winning the game killed the server for everyone, which
+// is the single worst moment to abort.
+//
+// The body mirrors the guarded branch the f2_client copy already takes when
+// serverLoopActive() (endgame.cc:246-259): the "movie" is a background-sound +
+// rolling-credits sequence built entirely out of blocking wall-clock machinery, and
+// its ONE sim-visible effect is the terminal transition — endgameEndingHandleContinuePlaying
+// setting _game_user_wants_to_quit = 2 on "no, do not keep playing". A dedicated
+// server has nobody to ask, so it replicates that answer, and serverRun deliberately
+// ignores the flag (the all-players-dead soft-lock policy owns it).
+//
+// ►► This makes victory SURVIVABLE, not WATCHABLE. Streaming the slideshow + credits
+// is a separate feature (docs/COOP_COVERAGE.md action list); until it exists the
+// campaign ends silently rather than fatally.
+void endgamePlayMovie()
+{
+    serverStubHeadlessOnce("endgamePlayMovie");
+    _game_user_wants_to_quit = 2;
+}
 // Benign: selects which death-ending narration/slideshow to show — presentation
 // the server hands to clients, and it picks from gEndgameDeathEndings, which is
 // empty here anyway (endgameDeathEndingInit is dropped from serverBoot), so the
@@ -317,7 +381,8 @@ void endgameSetupDeathEnding(int reason) { (void)reason; }
 // Benign: no hardware cursor headless. Any non-WAIT_PLANET value is fine (the sim
 // only compares it and round-trips it through the no-op presenter cursorSet).
 int gameMouseGetCursor() { return MOUSE_CURSOR_NONE; }
-int gameMouseGetMode() { serverStubAbort("gameMouseGetMode"); }
+// HEADLESS-SAFE (sfall metarule `get_cursor_mode`): no cursor, report mode 0.
+int gameMouseGetMode() { serverStubHeadlessOnce("gameMouseGetMode"); return 0; }
 // Benign: nothing is shown headless.
 bool gameMouseObjectsIsVisible() { return false; }
 // Benign: _map_init registers this as a ticker (fires every _process_bk beat).
@@ -326,7 +391,8 @@ bool gameMouseObjectsIsVisible() { return false; }
 void gameMouseRefresh() { }
 void gameMouseRefreshImmediately() { /* Benign: fileRead's load-progress cursor spin; no mouse headless. */ }
 int gameMouseReset() { serverStubAbort("gameMouseReset"); }
-void gameMouseSetMode(int a1) { serverStubAbort("gameMouseSetMode"); }
+// HEADLESS-SAFE (sfall metarule `set_cursor_mode`): nothing to set.
+void gameMouseSetMode(int a1) { (void)a1; serverStubHeadlessOnce("gameMouseSetMode"); }
 // Benign: movies never play headless, so none are "seen" on a fresh boot — which
 // is the correct answer for the one sim-affecting caller (_proto_dude_update_gender
 // gates the dude's native-look FID on MOVIE_VSUIT). NOTE: gGameMovieFlags is saved
@@ -356,16 +422,17 @@ int gameMoviePlay(int movie, int flags)
     // cost game time. A movie is not.
     gameMovieMarkSeen(movie);
 
-    // ►► ENV-GATED, DEFAULT OFF (F2_MOVIES=1 to project). Unset, this function is
-    // byte-for-byte the old mark-seen-and-continue stub, which is the behaviour
-    // every gate and every demo before this feature relied on.
+    // ►► ENV-GATED, DEFAULT ON — F2_MOVIES=0 is a KILL SWITCH (the standing rule:
+    // every feature ships on, the goldens opt out; serverFeatureEnabled answers OFF
+    // under the headless probe, so gates and demos still get the old
+    // mark-seen-and-continue stub byte-for-byte).
     //
-    // The gate exists because the projection has a failure mode with no runtime
-    // escape: a viewer that shows a black screen instead of a movie leaves the
+    // The switch is worth keeping because the projection has a failure mode with no
+    // runtime escape: a viewer that shows a black screen instead of a movie leaves the
     // server parked in the barrier, and `movdone` is a CONTROL-plane verb, so the
     // operator's command channel cannot release it. A feature whose failure needs a
     // server restart must be switchable off without one.
-    if (getenv("F2_MOVIES") == nullptr) {
+    if (!serverFeatureEnabled("F2_MOVIES")) {
         return 0;
     }
 
@@ -379,14 +446,30 @@ int gameMoviePlay(int movie, int flags)
     presenter()->movieStop();
     return 0;
 }
-int gameShowDeathDialog(const char* message) { serverStubAbort("gameShowDeathDialog"); }
+// HEADLESS-SAFE, and it USED TO ABORT. The sole caller is radiation death
+// (critter.cc _process_rads), which now routes the news to the dying actor's own
+// console on a dedicated server — but "abort if anything ever reaches this again"
+// is the wrong bet for a path ordinary play walks down: a headless probe or any
+// future non-dedicated server mode would take one player's rad poisoning and turn
+// it into a process death for everybody. There is no screen to put a modal on, so
+// the honest headless answer is "no dialog shown", logged once and diagnosable.
+// Returns 0 = the dialog's OK/dismissed answer.
+int gameShowDeathDialog(const char* message)
+{
+    if (message != nullptr) {
+        fprintf(stderr, "f2_server: death notice (no screen to show it on): %s\n", message);
+    }
+    serverStubHeadlessOnce("gameShowDeathDialog");
+    return 0;
+}
 // Benign: a dedicated server has no interactive UI to gate — it is never
 // "UI-disabled" (matches gameUiIsDisabled()==false above), so both are no-ops.
 void gameUiDisable(int a1) { }
 void gameUiEnable() { }
 // Benign: the headless server has no blocking UI, so the game UI is never disabled.
 bool gameUiIsDisabled() { return false; }
-Object* gmouse_get_outlined_object() { serverStubAbort("gmouse_get_outlined_object"); }
+// HEADLESS-SAFE (sfall metarule `outlined_object`): nothing is under a cursor.
+Object* gmouse_get_outlined_object() { serverStubHeadlessOnce("gmouse_get_outlined_object"); return nullptr; }
 // Benign, and faithful for the same reason as interfaceReset: the whole body is
 // guarded on gInterfaceBarWindow != -1 (there is no bar window headless), and
 // the one unguarded call, indicatorBarRefresh, is itself an established no-op
@@ -421,22 +504,57 @@ int interfaceGetItemActions(int* leftItemAction, int* rightItemAction)
 // this stub has to zero it — see the interfaceGetCurrentHitMode note in the
 // cut-list. Reached through isoReset, on the load path's gameResetSim.
 void interfaceReset() { }
-bool interface_get_current_attack_mode(int* hit_mode) { serverStubAbort("interface_get_current_attack_mode"); }
+// HEADLESS-SAFE (sfall `get_attack_type`): the server has no interface-bar hand, so
+// report "no current attack mode" and let the caller take its failure branch. This
+// was the latent server crash flagged in the cut-list.
+bool interface_get_current_attack_mode(int* hit_mode) { (void)hit_mode; serverStubHeadlessOnce("interface_get_current_attack_mode"); return false; }
 void isoWindowRefreshRectGame(Rect* rect) { serverStubAbort("isoWindowRefreshRectGame"); }
 void isoWindowRefreshRectMapper(Rect* rect) { serverStubAbort("isoWindowRefreshRectMapper"); }
 void keyboardReset() { /* Benign: no keyboard headless. */ }
-void mouseGetPosition(int* out_x, int* out_y) { serverStubAbort("mouseGetPosition"); }
+// HEADLESS-SAFE (sfall `get_mouse_x`/`get_mouse_y`/`tile_under_cursor`): origin.
+void mouseGetPosition(int* out_x, int* out_y)
+{
+    serverStubHeadlessOnce("mouseGetPosition");
+    if (out_x != nullptr) *out_x = 0;
+    if (out_y != nullptr) *out_y = 0;
+}
 void mouseHideCursor() { /* Benign: no hardware cursor headless (reached via _gdProcessChoice on the server dialog path). */ }
 bool mouseManagerSetMouseShape(char* fileName, int a2, int a3) { serverStubAbort("mouseManagerSetMouseShape"); }
 void mouseShowCursor() { /* Benign: no hardware cursor headless (paired with mouseHideCursor on the server dialog path). */ }
-int mouse_get_last_buttons() { serverStubAbort("mouse_get_last_buttons"); }
+// HEADLESS-SAFE (sfall `get_mouse_buttons`): no buttons are down.
+int mouse_get_last_buttons() { serverStubHeadlessOnce("mouse_get_last_buttons"); return 0; }
 unsigned char* pcxRead(const char* path, int* widthPtr, int* heightPtr, unsigned char* palette) { serverStubAbort("pcxRead"); }
-bool pipboyRestHeadless(int hours, int minutes, int kind) { serverStubAbort("pipboyRestHeadless"); }
+// pipboyRestHeadless is GONE, and with it one of the six live abort landmines: the
+// rest loop moved to f2_core (rest.cc), so the server drives the real simulation
+// instead of calling a client symbol that aborted the process.
 void renderPresent() { serverStubAbort("renderPresent"); }
-int screenGetHeight() { serverStubAbort("screenGetHeight"); }
-int screenGetWidth() { serverStubAbort("screenGetWidth"); }
-int showDialogBox(const char* title, const char** body, int bodyLength, int x, int y, int titleColor, const char* a8, int bodyColor, int flags) { serverStubAbort("showDialogBox"); }
-bool showMesageBox(const char* str) { serverStubAbort("showMesageBox"); }
+// HEADLESS-SAFE (sfall `get_screen_height`): vanilla's native resolution.
+int screenGetHeight() { serverStubHeadlessOnce("screenGetHeight"); return kHeadlessScreenHeight; }
+// HEADLESS-SAFE (sfall `get_screen_width`): vanilla's native resolution.
+int screenGetWidth() { serverStubHeadlessOnce("screenGetWidth"); return kHeadlessScreenWidth; }
+// HEADLESS-SAFE (sfall `create_message_window`, and any engine yes/no prompt that
+// slips through): there is nobody at this machine to answer, so answer NO / 0 —
+// the same choice the streamed encounter prompt makes when no viewer replies.
+// ►► A prompt a PLAYER should answer must be streamed (see wmEncounterPromptBarrier),
+// not routed here; this is the backstop that keeps an unstreamed one from being fatal.
+int showDialogBox(const char* title, const char** body, int bodyLength, int x, int y, int titleColor, const char* a8, int bodyColor, int flags)
+{
+    (void)title; (void)body; (void)bodyLength; (void)x; (void)y;
+    (void)titleColor; (void)a8; (void)bodyColor; (void)flags;
+    serverStubHeadlessOnce("showDialogBox");
+    return 0;
+}
+// HEADLESS-SAFE, and it USED TO ABORT on the most common first-run mistake there is:
+// gameDbInit reports "Could not find the master datafile" through this, so an operator
+// with the wrong working directory got `FATAL - client symbol 'showMesageBox' called`
+// instead of being told which file is missing. Print it where a headless operator
+// actually looks. Returns false = "not acknowledged"; every caller ignores it and
+// returns -1 anyway.
+bool showMesageBox(const char* str)
+{
+    fprintf(stderr, "f2_server: %s\n", str != nullptr ? str : "(no message)");
+    return false;
+}
 Sound* soundAllocate(int type, int soundFlags) { serverStubAbort("soundAllocate"); }
 void soundContinueAll() { /* Benign: no audio pump headless. */ }
 int soundDelete(Sound* sound) { serverStubAbort("soundDelete"); }
@@ -456,7 +574,16 @@ int sub_4B7E7C(const char* windowName, int x, int y, int width, int height) { se
 void textObjectsFree() { serverStubAbort("textObjectsFree"); }
 int textObjectsGetCount() { return 0; /* Benign: no floating text headless. */ }
 int textObjectsInit(unsigned char* windowBuffer, int width, int height) { return 0; /* Benign: floating text is presenter-driven; skip the render buffer AND the client-side textObjectsTicker registration. */ }
-void textObjectsRemoveByOwner(Object* object) { serverStubAbort("textObjectsRemoveByOwner"); }
+// Benign no-op, and it USED TO ABORT: this is `float_msg(obj, "", type)` — vanilla's
+// idiom for CLEARING a floating message — and float_msg is one of the most-used opcodes
+// in the game. The server owns no text objects (floating text is projected to viewers
+// through presenter()->floatText), so there is nothing here to remove and removing
+// nothing is the whole correct operation.
+//
+// Cosmetic residue, deliberately accepted: a script that clears a float message early
+// leaves it on the viewers until it times out on its own. Vanilla float messages expire
+// by themselves, so the visible difference is a caption lingering a second or two.
+void textObjectsRemoveByOwner(Object* object) { (void)object; }
 // Benign: floating text objects are presentation. This MIRRORS the real body
 // rather than guessing — textObjectsInit is dropped from serverBoot, so
 // gTextObjectsInitialized is false and the real function returns -1 without
@@ -754,6 +881,16 @@ void clientBarterApplyPending() { serverStubAbort("clientBarterApplyPending"); }
 int clientBarterOfferValue() { serverStubAbort("clientBarterOfferValue"); }
 int clientBarterAskingValue() { serverStubAbort("clientBarterAskingValue"); }
 void clientViewerBarterVerb(const char* verb, int pid, int quantity) { serverStubAbort("clientViewerBarterVerb"); }
+// The viewer steal screen's deps, same rule as the trade window's: the server
+// RUNS the steal session (stealSessionRun), it never watches one. Every call
+// site in inventory_ui.cc sits behind clientViewerActive(), which is false here,
+// so reaching one of these means a gate was lost — say so loudly.
+bool clientStealActive() { serverStubAbort("clientStealActive"); }
+bool clientStealEndPending() { serverStubAbort("clientStealEndPending"); }
+bool clientStealIsDriver() { serverStubAbort("clientStealIsDriver"); }
+bool clientStealConsumeDirty() { serverStubAbort("clientStealConsumeDirty"); }
+bool clientStealConsumeCloseRequest() { serverStubAbort("clientStealConsumeCloseRequest"); }
+void clientViewerStealVerb(const char* verb, int pid, int quantity) { serverStubAbort("clientViewerStealVerb"); }
 void clientModalWindowsSync() { serverStubAbort("clientModalWindowsSync"); }
 void clientDialogRenderPendingNode() { serverStubAbort("clientDialogRenderPendingNode"); }
 
@@ -763,5 +900,7 @@ void clientDialogRenderPendingNode() { serverStubAbort("clientDialogRenderPendin
 // delay_ms: dialog ticker throttle (game_dialog gameDialogTicker); render-only, unreachable headless.
 void delay_ms(int ms) { (void)ms; fallout::serverStubAbort("delay_ms"); }
 // ---- sfall keyboard helpers live in the GLOBAL namespace ----
-bool sfall_kb_is_key_pressed(int key) { fallout::serverStubAbort("sfall_kb_is_key_pressed"); }
-void sfall_kb_press_key(int key) { fallout::serverStubAbort("sfall_kb_press_key"); }
+// HEADLESS-SAFE (sfall `key_pressed`): no keyboard attached to a server.
+bool sfall_kb_is_key_pressed(int key) { (void)key; fallout::serverStubHeadlessOnce("sfall_kb_is_key_pressed"); return false; }
+// HEADLESS-SAFE (sfall `tap_key`): nothing to type into.
+void sfall_kb_press_key(int key) { (void)key; fallout::serverStubHeadlessOnce("sfall_kb_press_key"); }

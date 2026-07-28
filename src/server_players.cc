@@ -99,6 +99,47 @@ static int gActorActiveHand[kMaxPlayerActors] = {
     HAND_RIGHT, HAND_RIGHT, HAND_RIGHT, HAND_RIGHT,
 };
 
+// Armed critical for a seat's next attack roll (kForceCrit*, server_players.h). Zero-init
+// IS kForceCritNone, so every slot starts unarmed and nothing moves until a verb arms one.
+static int gActorForceCrit[kMaxPlayerActors];
+
+// Pinned critical-failure severity per slot, -1 = let the dice pick. NOT zero-init-safe
+// (0 is a valid severity, the mildest column), so it is initialised to -1 explicitly.
+static_assert(kMaxPlayerActors == 8, "gActorForceCritSeverity lists one value per slot");
+static int gActorForceCritSeverity[kMaxPlayerActors] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+
+int serverActorTakeForceCrit(int slot)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return kForceCritNone;
+    }
+    // Read AND clear: one attack per arming. Out-of-range (a non-player attacker, slot -1)
+    // returns early WITHOUT clearing, so an NPC swinging in between does not eat the arming
+    // the operator set for a seat.
+    int mode = gActorForceCrit[slot];
+    gActorForceCrit[slot] = kForceCritNone;
+    return mode;
+}
+
+int serverActorTakeForceCritSeverity(int slot)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return -1;
+    }
+    int severity = gActorForceCritSeverity[slot];
+    gActorForceCritSeverity[slot] = -1;
+    return severity;
+}
+
+void serverActorSetForceCrit(int slot, int mode, int severity)
+{
+    if (slot < 0 || slot >= kMaxPlayerActors) {
+        return;
+    }
+    gActorForceCrit[slot] = mode;
+    gActorForceCritSeverity[slot] = severity;
+}
+
 void serverActorBusyMark(int slot, int durMs, const char* what)
 {
     if (slot < 0 || slot >= kMaxPlayerActors || durMs <= 0) {

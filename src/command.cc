@@ -9,6 +9,7 @@
 #include "actions.h"
 #include "animation.h"
 #include "barter_intent.h"
+#include "steal_intent.h"
 #include "character_transaction.h"
 #include "combat.h"
 #include "combat_intent.h"
@@ -28,10 +29,12 @@
 #include "proto.h"
 #include "proto_instance.h"
 #include "savegame.h"
+#include "rest.h" // restPerform — the shared rest simulation
 #include "scripts.h"
 #include "server_loop.h"
 #include "sim_clock.h"
 #include "skill.h"
+#include "state_audit.h" // stateAuditEmit — the `audit` probe command
 #include "state_dump.h"
 #include "stat.h"
 #include "trait.h"
@@ -478,10 +481,9 @@ void commandDispatch(const Command& command)
         debugPrint("headless-probe: wmtravel steps=%d heals=%d pos=%d,%d area=%d encounter=%d gas=%d time=%u\n",
             steps, heals, wmX, wmY, areaIdx, encounter ? 1 : 0, wmCarGasAmount(), gameTimeGetTime());
     } else if (strcmp(command.name, "rest") == 0 || strcmp(command.name, "restopt") == 0) {
-        // H-40/H-42: drive the REAL pipboy rest loop headlessly via
-        // the server driver (pipboyRestHeadless -> pipboyRest with
-        // UI/real-time pacing guarded out under serverLoopActive()),
-        // instead of reimplementing its control flow here. rest:N
+        // H-40/H-42: drive the REAL rest loop (restPerform, rest.cc — the
+        // simulation the pipboy screen also drives) instead of
+        // reimplementing its control flow here. rest:N
         // rests for N game minutes (decoded to hours:minutes, kind 0);
         // restopt:N picks rest-menu option N via the extracted intent
         // decoder (until-hour wall-clock math + the until-healed
@@ -506,7 +508,9 @@ void commandDispatch(const Command& command)
                 restOptionDecode(command.arg, &hours, &minutes, &kind);
             }
 
-            bool interrupted = pipboyRestHeadless(hours, minutes, kind);
+            // The shared rest simulation, with no frame proc — same loop the pipboy
+            // screen drives, minus the screen (rest.h).
+            bool interrupted = restPerform(hours, minutes, kind, nullptr) != kRestCompleted;
 
             debugPrint("headless-probe: rest %d:%02d kind=%d interrupted=%d hp=%d time=%u\n",
                 hours, minutes, kind, interrupted ? 1 : 0,
@@ -707,6 +711,60 @@ void commandDispatch(const Command& command)
         // Queue the ESC/cancel — leave barter without a table sweep.
         barterIntentPush(BARTER_INTENT_CANCEL, 0, 0);
         debugPrint("headless-probe: bcancel\n");
+    } else if (strcmp(command.name, "stealon") == 0) {
+        // Use Steal on the nearest LIVING critter (excluding the dude) on the
+        // dude's elevation — the headless entry to a steal session. Goes through
+        // actionUseSkill exactly as a viewer's click does, so it exercises the
+        // real chain: skillUse -> scriptsRequestStealing -> the request drain ->
+        // the server's stealing() handler -> stealSessionRun.
+        Object* best = nullptr;
+        int bestDistance = INT_MAX;
+        Object* candidate = objectFindFirst();
+        while (candidate != nullptr) {
+            if (candidate != gDude
+                && PID_TYPE(candidate->pid) == OBJ_TYPE_CRITTER
+                && candidate->elevation == gDude->elevation
+                && (candidate->flags & (OBJECT_HIDDEN | OBJECT_NO_BLOCK)) == 0
+                && critterIsActive(candidate)) {
+                int distance = objectGetDistanceBetween(gDude, candidate);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = candidate;
+                }
+            }
+            candidate = objectFindNext();
+        }
+        if (best != nullptr) {
+            debugPrint("headless-probe: stealon id=%d pid=0x%08X dist=%d items=%d\n",
+                best->id, best->pid, bestDistance, best->data.inventory.length);
+            actionUseSkill(gDude, best, SKILL_STEAL);
+        } else {
+            debugPrint("headless-probe: no living critter found for stealon\n");
+        }
+    } else if (strcmp(command.name, "stake") == 0) {
+        // Queue "lift arg (a proto id) out of the victim's pockets". Drained by
+        // the server's steal session, which rolls the Steal skill for it.
+        stealIntentPush(STEAL_INTENT_TAKE, command.arg, command.arg2);
+        debugPrint("headless-probe: stake pid=%d qty=%d\n", command.arg, command.arg2);
+    } else if (strcmp(command.name, "splant") == 0) {
+        // Queue "plant arg (a proto id) from the thief onto the victim".
+        stealIntentPush(STEAL_INTENT_PLANT, command.arg, command.arg2);
+        debugPrint("headless-probe: splant pid=%d qty=%d\n", command.arg, command.arg2);
+    } else if (strcmp(command.name, "sdone") == 0) {
+        // Queue the ESC — close the steal screen. Arg-less.
+        stealIntentPush(STEAL_INTENT_DONE, 0, 0);
+        debugPrint("headless-probe: sdone\n");
+    } else if (strcmp(command.name, "audit") == 0) {
+        // ►► THE MIRROR DIVERGENCE ORACLE, from the debug port, so a GATE can ask for
+        // it without a client process. Ships every syncable object's full field set
+        // to whoever is listening; a viewer diffs it against its own world, and
+        // tools/replay.py diffs it against what the STREAM alone was able to
+        // reconstruct — which is the sharper question, because it measures whether
+        // the live protocol carries enough to rebuild the server's state at all.
+        // See state_audit.h for why this is derived from Object and not from the
+        // delta tracker's field list.
+        stateAuditEmit();
+        debugPrint("headless-probe: audit emitted\n");
     } else if (strcmp(command.name, "charsnap") == 0) {
         // H-49: begin the character-editor transaction — snapshot
         // the committed dude sim state via the extracted core

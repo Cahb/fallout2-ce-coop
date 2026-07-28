@@ -88,12 +88,6 @@ typedef enum GameDialogReviewWindowButtonFrm {
     GAME_DIALOG_REVIEW_WINDOW_BUTTON_FRM_COUNT,
 } GameDialogReviewWindowButtonFrm;
 
-typedef enum GameDialogReaction {
-    GAME_DIALOG_REACTION_GOOD = 49,
-    GAME_DIALOG_REACTION_NEUTRAL = 50,
-    GAME_DIALOG_REACTION_BAD = 51,
-} GameDialogReaction;
-
 typedef struct GameDialogReviewEntry {
     int replyMessageListId;
     int replyMessageId;
@@ -1103,7 +1097,13 @@ void gameDialogSetBackground(int a1)
 // 0x445448
 void gameDialogRenderSupplementaryMessage(char* msg)
 {
-    if (_gd_replyWin == -1) {
+    // ►► GUARD THE HANDLE THIS FUNCTION ACTUALLY WRITES TO. `_gd_replyWin` is a
+    // CACHED COPY, refreshed by _demo_copy_title below; every blit here goes to
+    // gGameDialogReplyWindow. In vanilla they are always in step, so the original
+    // guard was enough — but a cached handle outliving its window is precisely how
+    // this function faulted twice on a viewer whose reply window had been torn
+    // down under it. Test both; a stale cache is then a no-op, not a crash.
+    if (_gd_replyWin == -1 || gGameDialogReplyWindow == -1) {
         debugPrint("\nError: Reply window doesn't exist!");
         return;
     }
@@ -1578,6 +1578,28 @@ int gameDialogShowReview()
 // NOTE: Uncollapsed 0x445CA0 with different signature.
 void gameDialogReviewButtonOnMouseUp(int btn, int keyCode)
 {
+    // ►► NOTHING RECORDED → PRESENT NOTHING. The review window is a history of this
+    // conversation, and on a co-op VIEWER that history is always empty: the entries are
+    // only ever appended by gameDialogSetMessageReply / gameDialogSetTextReply, i.e. by
+    // the SCRIPT executing the dialog — which happens on the server. The streamed node
+    // path seeds the reply through gameDialogSetReplyText (a pure text setter,
+    // client_dialog.cc), so no entry is ever recorded here and the button opened a blank
+    // box.
+    //
+    // Not merely cosmetic, which is why this is a hard NOOP rather than an empty list:
+    // gameDialogShowReview runs its OWN blocking while(true)/inputGetInput loop, so it
+    // becomes a fourth window owner that does not pump the wire — the exact shape
+    // [[viewer-modal-design]] identifies as the cause of the dialog whack-a-mole. Opening
+    // it stalls the decode and backpressures the server for as long as it is up.
+    //
+    // Gated on the ENTRY COUNT, not on clientViewerActive(): the rule "don't open an
+    // empty history" is true everywhere, single-player included, and if the dialog
+    // history is ever streamed to viewers the button starts working again with no change
+    // here. Vanilla is unaffected — a script-driven conversation has recorded its first
+    // reply before the player can click anything.
+    if (gGameDialogReviewEntriesLength == 0) {
+        return;
+    }
     gameDialogShowReview();
 }
 
@@ -1955,6 +1977,7 @@ static void dialogEmitNode()
 {
     static char optionText[DIALOG_OPTION_ENTRIES_CAPACITY][900];
     const char* optionPtrs[DIALOG_OPTION_ENTRIES_CAPACITY];
+    int optionReactions[DIALOG_OPTION_ENTRIES_CAPACITY];
 
     int count = gGameDialogOptionEntriesLength;
     if (count < 0) count = 0;
@@ -1964,12 +1987,16 @@ static void dialogEmitNode()
         optionText[i][0] = '\0';
         gameDialogGetOptionText(i, optionText[i], sizeof(optionText[i]));
         optionPtrs[i] = optionText[i];
+        // The EMPATHY input. The script set this per option when it added the option
+        // (gameDialogAddTextOption/AddMessageOption's `reaction` argument); the viewer
+        // cannot derive it from the text, which is why Empathy showed nothing.
+        optionReactions[i] = gDialogOptionEntries[i].reaction;
     }
 
     presenter()->dialogNode(gGameDialogSpeaker, gDude, gGameDialogFidget,
         gDialogReplyText, optionPtrs, count,
         gDialogPendingAudio[0] != '\0' ? gDialogPendingAudio : nullptr,
-        gGameDialogHeadFid);
+        gGameDialogHeadFid, optionReactions);
 }
 
 // 0x4465C0
@@ -2292,6 +2319,19 @@ int _gdProcess()
                         gameDialogRenderReply();
                     }
                 }
+            }
+        }
+
+        // OPTION SCROLLING. Page keys always; the arrows (and therefore the MOUSE WHEEL,
+        // which convertMouseWheelToArrowKey turns into them) only when the reply is not
+        // paging itself, so the reply keeps first claim on them exactly as before.
+        if (keyCode == KEY_PAGE_DOWN || (keyCode == KEY_ARROW_DOWN && !_gdReplyTooBig)) {
+            if (gameDialogScrollOptions(1)) {
+                keyCode = -1;
+            }
+        } else if (keyCode == KEY_PAGE_UP || (keyCode == KEY_ARROW_UP && !_gdReplyTooBig)) {
+            if (gameDialogScrollOptions(-1)) {
+                keyCode = -1;
             }
         }
 
@@ -2656,9 +2696,68 @@ void gameDialogSetReplyText(const char* text)
     snprintf(gDialogReplyText, sizeof(gDialogReplyText), "%s", text != nullptr ? text : "");
 }
 
+// ►► OPTION-LIST SCROLLING. The options panel is a fixed 393x117 and the renderer drops
+// every option that does not fit — vanilla even logs "couldn't make button because it
+// went below the window". Vanilla never cared because its own dialogs are written to fit;
+// co-op crowds them (more speakers, longer lines), and a dropped option has no button and
+// no hotkey, so it is simply UNREACHABLE. The reply window has had scroll arrows since
+// 1998; the options window never got them.
+//
+// `gDialogOptionScroll` is the first option rendered. `gDialogOptionsClipped` records
+// whether the last render ran out of room, which is what stops us scrolling into a void:
+// the renderer is the only thing that knows how many lines each option wraps to.
+static int gDialogOptionScroll = 0;
+static bool gDialogOptionsClipped = false;
+
 void gameDialogClearOptions()
 {
     gGameDialogOptionEntriesLength = 0;
+    // A new node starts at the top. Without this, picking an option while scrolled down
+    // would open the next node already scrolled, hiding its first replies.
+    gDialogOptionScroll = 0;
+    gDialogOptionsClipped = false;
+}
+
+bool gameDialogOptionsScrolled()
+{
+    return gDialogOptionScroll > 0;
+}
+
+bool gameDialogOptionsClipped()
+{
+    return gDialogOptionsClipped;
+}
+
+bool gameDialogScrollOptions(int delta)
+{
+    if (gGameDialogOptionsWindow == -1 || _gdialog_state != 1 || delta == 0) {
+        return false;
+    }
+
+    // Down is refused unless the last render actually hid something — otherwise a held
+    // key would walk the list off its own end and blank the panel.
+    if (delta > 0 && !gDialogOptionsClipped) {
+        return false;
+    }
+
+    int want = gDialogOptionScroll + delta;
+    if (want < 0) {
+        want = 0;
+    }
+    if (want >= gGameDialogOptionEntriesLength) {
+        return false;
+    }
+    if (want == gDialogOptionScroll) {
+        return false;
+    }
+
+    gDialogOptionScroll = want;
+
+    // The old buttons belong to the old positions. _gdProcessChoice tears them down the
+    // same way before it re-renders; skipping it stacks dead buttons over live text.
+    _gdProcessCleanup();
+    _gdProcessUpdate();
+    return true;
 }
 
 void gameDialogRenderNode()
@@ -2677,6 +2776,32 @@ int gameDialogInitNodeWindows()
 void gameDialogExitNodeWindows()
 {
     _gdProcessExit();
+}
+
+// Show/hide JUST the options list, leaving the reply window up.
+//
+// ►► THIS EXISTS BECAUSE VANILLA KEEPS BOTH NODE WINDOWS ALIVE THROUGH A TRADE.
+// _gdProcessExit runs once, at the END of the conversation (_gdProcess:2395) —
+// never at the barter boundary. The trade window is simply built over where the
+// OPTIONS list sits (options y335..452, trade y290..470), while the REPLY window
+// (y225..283) stays visible above it, which is where vanilla renders an item
+// description you moused over mid-trade.
+//
+// The viewer used to tear BOTH down for a trade, and that is what made barter
+// inspect impossible: the renderer's target no longer existed. Only the options
+// list actually conflicts — and it is WINDOW_MOVE_ON_TOP, so it must go away
+// rather than merely be covered. Hide it, keep the handle, let _gdProcessExit
+// destroy both at the end exactly as it always has.
+void gameDialogSetOptionsWindowVisible(bool visible)
+{
+    if (gGameDialogOptionsWindow == -1) {
+        return;
+    }
+    if (visible) {
+        windowShow(gGameDialogOptionsWindow);
+    } else {
+        windowHide(gGameDialogOptionsWindow);
+    }
 }
 
 // Viewer-side barter window lifecycle, the barter twin of the two above and for
@@ -2790,7 +2915,14 @@ void _gdProcessUpdate()
 
     int v21 = 0;
 
-    for (int index = 0; index < gGameDialogOptionEntriesLength; index++) {
+    // Clamp a stale offset (a shorter node than the one we were scrolled through) so the
+    // panel can never come up empty.
+    if (gDialogOptionScroll >= gGameDialogOptionEntriesLength) {
+        gDialogOptionScroll = 0;
+    }
+    gDialogOptionsClipped = false;
+
+    for (int index = gDialogOptionScroll; index < gGameDialogOptionEntriesLength; index++) {
         GameDialogOptionEntry* dialogOptionEntry = &(gDialogOptionEntries[index]);
 
         if (hasEmpathy) {
@@ -2844,10 +2976,13 @@ void _gdProcessUpdate()
                 debugPrint("\nError: Can't create button!");
             }
         } else {
+            // Out of room. NOT an error any more — it is what scrolling exists for; the
+            // options from here down are reachable by scrolling instead of lost.
+            gDialogOptionsClipped = true;
             if (!v21) {
                 v21 = 1;
             } else {
-                debugPrint("Error: couldn't make button because it went below the window.\n");
+                debugPrint("dialog: option %d does not fit; scroll to reach it\n", index);
             }
         }
     }

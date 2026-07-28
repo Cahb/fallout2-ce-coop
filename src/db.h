@@ -20,6 +20,16 @@ int fileClose(File* stream);
 File* fileOpen(const char* filename, const char* mode);
 // Open a READ-ONLY File over an in-memory copy of [data] — no disk, no path.
 File* fileOpenMemory(const void* data, size_t size);
+
+// Open a WRITABLE, growable RAM File — the write half of the same idea (xfile.h). Use it
+// instead of a scratch file when you only need to serialize something and read the bytes
+// back: no path to collide over, nothing left in /tmp.
+File* fileOpenMemoryWrite();
+
+// The bytes written to a memory File, and their logical length. Valid until the next write
+// or fileClose.
+const unsigned char* fileMemoryData(File* stream);
+long fileMemorySize(File* stream);
 int filePrintFormatted(File* stream, const char* format, ...);
 int fileReadChar(File* stream);
 char* fileReadString(char* str, size_t size, File* stream);

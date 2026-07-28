@@ -34,13 +34,42 @@ static int _idist(int a1, int a2, int a3, int a4);
 static int _tile_idistance(int tile1, int tile2);
 
 // 0x542FD4
-static PathNode gClosedPathNodeList[2000];
+// ►► TWO A* EXPLORATION BUDGETS, and the difference is the whole point.
+//
+// pathfinderFindPath returns 0 — "no route" — the moment it has expanded this many tiles.
+// Vanilla's 2000 is small: a walk across a big map, or any route that has to feel its way
+// around scenery, exhausts it while the destination is plainly walkable, and the caller
+// then registers nothing. That is the "the game refuses to walk somewhere completely
+// reachable, and the cursor says invalid move" report — it is not a distance check
+// anywhere, it is the search giving up.
+//
+// A PLAYER'S OWN WALK gets the wide budget (kPathMaxNodesWide): they clicked a tile, they
+// can see it, and refusing is the worst possible answer. EVERYTHING ELSE keeps vanilla's
+// 2000 — AI reachability tests, script movement, party followers — because widening those
+// changes what the AI decides, which is a simulation change: measured, it moves NPC routes
+// on denbus1 and diverges six server goldens. Same reasoning as any other "fix the
+// player's experience without editing the sim" seam.
+static const int kPathMaxNodes = 2000;
+static const int kPathMaxNodesWide = 12000;
+
+// Max steps the reconstructed path may emit — VANILLA'S VALUE, deliberately unchanged.
+//
+// ⚠ It is not a clean bound: the reconstruction walks BACKWARDS from the destination, so
+// hitting this cap yields the route's TAIL, i.e. a "path" that starts at a tile the actor
+// is not standing on. I tried raising it to the callers' real buffer size (3200) and
+// refusing a truncated path outright; MEASURED RESULT: an NPC that walks in vanilla
+// stopped walking, six server goldens diverged. Something depends on getting that tail
+// back, so tightening it is a divergence with a cost and no demonstrated benefit. Left
+// alone, written down.
+static const int kPathMaxSteps = 800;
+
+static PathNode gClosedPathNodeList[kPathMaxNodesWide];
 
 // 0x561814
 static unsigned char gPathfinderProcessedTiles[5000];
 
 // 0x562B9C
-static PathNode gOpenPathNodeList[2000];
+static PathNode gOpenPathNodeList[kPathMaxNodesWide];
 
 // 0x415E24
 bool canUseDoor(Object* critter, Object* door)
@@ -90,10 +119,27 @@ int _make_path(Object* object, int from, int to, unsigned char* rotations, int a
     return pathfinderFindPath(object, from, to, rotations, a5, _obj_blocking_at);
 }
 
+// A PLAYER-REQUESTED walk: same pathfinder, wide search budget. Use this only where a
+// player asked to go somewhere — see the budget comment for why the AI must not have it.
+int _make_path_wide(Object* object, int from, int to, unsigned char* rotations, int a5)
+{
+    return pathfinderFindPathBudget(object, from, to, rotations, a5, _obj_blocking_at,
+        kPathMaxNodesWide);
+}
+
 // TODO: move pathfinding into another unit
 // 0x415EFC
 int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback)
 {
+    return pathfinderFindPathBudget(object, from, to, rotations, a5, callback, kPathMaxNodes);
+}
+
+int pathfinderFindPathBudget(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback, int maxNodes)
+{
+    if (maxNodes < 2 || maxNodes > kPathMaxNodesWide) {
+        maxNodes = kPathMaxNodes;
+    }
+
     if (a5) {
         if (callback(object, to, object->elevation) != nullptr) {
             return 0;
@@ -119,7 +165,7 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
     gOpenPathNodeList[0].estimate = _tile_idistance(from, to);
     gOpenPathNodeList[0].cost = 0;
 
-    for (int index = 1; index < 2000; index += 1) {
+    for (int index = 1; index < maxNodes; index += 1) {
         gOpenPathNodeList[index].tile = -1;
     }
 
@@ -167,7 +213,7 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
 
         closedPathNodeListLength += 1;
 
-        if (closedPathNodeListLength == 2000) {
+        if (closedPathNodeListLength == maxNodes) {
             return 0;
         }
 
@@ -188,7 +234,7 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
             }
 
             int v25 = 0;
-            for (; v25 < 2000; v25++) {
+            for (; v25 < maxNodes; v25++) {
                 if (gOpenPathNodeList[v25].tile == -1) {
                     break;
                 }
@@ -196,7 +242,7 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
 
             openPathNodeListLength += 1;
 
-            if (openPathNodeListLength == 2000) {
+            if (openPathNodeListLength == maxNodes) {
                 return 0;
             }
 
@@ -245,7 +291,7 @@ int pathfinderFindPath(Object* object, int from, int to, unsigned char* rotation
     if (openPathNodeListLength != 0) {
         unsigned char* v39 = rotations;
         int index = 0;
-        for (; index < 800; index++) {
+        for (; index < kPathMaxSteps; index++) {
             if (temp.tile == from) {
                 break;
             }

@@ -65,6 +65,9 @@ void wmFadeReset();
 // ---------------------------------------------------------------------------
 int wmMatchWorldPosToArea(int x, int y, int* areaIdxPtr);
 int wmAreaFindFirstValidMap(int* mapIdxPtr);
+// Resolve a town-map ENTRANCE INDEX (chosen on a viewer) to a map, server-side, and set
+// the arrival spot. Refuses an out-of-range or undiscovered entrance. See the body.
+int wmAreaResolveEntrance(int entranceIndex, int* mapIdxPtr);
 int wmGetAreaName(CityInfo* city, char* name);
 
 } // namespace fallout

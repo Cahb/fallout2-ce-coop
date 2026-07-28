@@ -115,6 +115,11 @@ int _determine_to_hit_from_tile(Object* attacker, int tile, Object* defender, in
 void attackComputeDeathFlags(Attack* attack);
 void _apply_damage(Attack* attack, bool animated);
 void _combat_display(Attack* attack);
+// Narrate an attack to EVERY player in the right person (and name who did it with
+// what) — call this, not _combat_display, from anywhere that reports an attack's
+// outcome. Reduces to exactly one vanilla _combat_display pass outside a co-op
+// session. See combat_drain.cc.
+void combatNarrateAttack(Attack* attack);
 void _combat_anim_begin();
 void _combat_anim_finished();
 int _combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool aiming);

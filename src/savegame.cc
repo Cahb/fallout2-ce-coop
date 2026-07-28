@@ -148,11 +148,12 @@ static int _slot_cursor = 0;
 static int _map_backup_count = -1;
 static bool _automap_db_flag = false;
 static bool _loadingGame = false;
-// 11, not 10: index 10 (directory SLOT11) is the dedicated-server AUTOSAVE
-// slot (server_admin.cc). It sits past everything the vanilla client's save/
-// load screens enumerate (SLOT01..10), which is precisely what makes a
-// periodic unattended save unable to clobber a real one.
-static LoadSaveSlotData _LSData[11];
+// kSaveSlotSpace, not 10: indices 10.. (directories SLOT11..) are the
+// dedicated-server AUTOSAVE ROTATION window (server_admin.cc). They sit past
+// everything the vanilla client's save/load screens enumerate (SLOT01..10),
+// which is precisely what makes a periodic unattended save unable to clobber a
+// real one. See savegame.h for why it is a window and not a single slot.
+static LoadSaveSlotData _LSData[kSaveSlotSpace];
 static unsigned char* _snapshotBuf = nullptr;
 static char _gmpath[COMPAT_MAX_PATH];
 static char _str[COMPAT_MAX_PATH];
@@ -403,6 +404,11 @@ int lsgLoadGameInSlot(int slot)
     long pos = fileTell(_flptr);
     if (lsgLoadHeaderInSlot(_flptr, slot) == -1) {
         debugPrint("\nLOADSAVE: ** Error reading save  game header! **\n");
+        // ►► ALSO stderr: on the dedicated server debugPrint goes nowhere, so a failed
+        // load reported ONE line ("boot failed for slot N") and named neither the
+        // section nor the file. Which of these three branches fired is the entire
+        // diagnosis, and it costs nothing to say on a path that is already fatal.
+        fprintf(stderr, "LOADSAVE: slot %d FAILED reading the HEADER of '%s'\n", slot + 1, _gmpath);
         fileClose(_flptr);
         gameReset();
         _loadingGame = false;
@@ -416,6 +422,8 @@ int lsgLoadGameInSlot(int slot)
         LoadGameHandler* handler = _master_load_list[index];
         if (handler(_flptr) == -1) {
             debugPrint("\nLOADSAVE: ** Error reading load function #%d data! **\n", index);
+            fprintf(stderr, "LOADSAVE: slot %d FAILED in load handler #%d at byte %ld of '%s'\n",
+                slot + 1, index, pos, _gmpath);
             int v12 = fileTell(_flptr);
             debugPrint("LOADSAVE: Load function #%d data size read: %d bytes.\n", index, fileTell(_flptr) - pos);
             fileClose(_flptr);
@@ -436,6 +444,8 @@ int lsgLoadGameInSlot(int slot)
     // vanilla/single-player save, which ends right here at EOF.
     if (playerActorAppendixLoad(_flptr) == -1) {
         debugPrint("\nLOADSAVE: ** Error reading co-op actor appendix! **\n");
+        fprintf(stderr, "LOADSAVE: slot %d FAILED in the co-op actor APPENDIX at byte %ld of '%s'\n",
+            slot + 1, fileTell(_flptr), _gmpath);
         fileClose(_flptr);
         gameReset();
         _loadingGame = false;

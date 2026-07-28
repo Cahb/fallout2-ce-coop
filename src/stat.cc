@@ -5,6 +5,7 @@
 #include <algorithm>
 
 #include "art.h"
+#include "character_editor.h" // gCharacterEditorLastLevel — stamped so a screen never re-awards
 #include "combat.h"
 #include "critter.h"
 #include "display_monitor.h"
@@ -14,6 +15,7 @@
 #include "item.h"
 #include "memory.h"
 #include "message.h"
+#include "msg_channel.h" // kMsgChannelReward — a level-up is good news, addressed to its actor
 #include "object.h"
 #include "party_member.h"
 #include "perk.h"
@@ -730,17 +732,24 @@ int pcSetStat(int pcStat, int value, Object* subject)
 // + 5 if Skilled, -5 if Gifted (floored at 0), capped at 99 unspent; plus a
 // free perk every 3rd (4th with Skilled) level while under the 37-perk cap.
 // Returns true when a free perk was earned.
-bool pcLevelUpApply(int fromLevel, int toLevel)
+//
+// EVERY read is the SUBJECT's — INT, Educated, the traits and the unspent-point
+// row. It used to read gDude for all of them while the caller was the host's
+// character screen, which is the same thing only for slot 0: an extra levelling
+// up would have been awarded points computed from the HOST's INT and Skilled/
+// Gifted, into the HOST's row.
+bool pcLevelUpApply(int fromLevel, int toLevel, Object* subject)
 {
+    Object* earner = subject != nullptr ? subject : gDude;
     bool freePerk = false;
 
     for (int nextLevel = fromLevel + 1; nextLevel <= toLevel; nextLevel++) {
-        int sp = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS);
+        int sp = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS, earner);
         sp += 5;
-        sp += critterGetBaseStatWithTraitModifier(gDude, STAT_INTELLIGENCE) * 2;
-        sp += perkGetRank(gDude, PERK_EDUCATED) * 2;
-        sp += traitIsSelected(TRAIT_SKILLED) * 5;
-        if (traitIsSelected(TRAIT_GIFTED)) {
+        sp += critterGetBaseStatWithTraitModifier(earner, STAT_INTELLIGENCE) * 2;
+        sp += perkGetRank(earner, PERK_EDUCATED) * 2;
+        sp += traitIsSelected(TRAIT_SKILLED, earner) * 5;
+        if (traitIsSelected(TRAIT_GIFTED, earner)) {
             sp -= 5;
             if (sp < 0) {
                 sp = 0;
@@ -750,11 +759,11 @@ bool pcLevelUpApply(int fromLevel, int toLevel)
             sp = 99;
         }
 
-        pcSetStat(PC_STAT_UNSPENT_SKILL_POINTS, sp);
+        pcSetStat(PC_STAT_UNSPENT_SKILL_POINTS, sp, earner);
 
         int selectedPerksCount = 0;
         for (int perk = 0; perk < PERK_COUNT; perk++) {
-            if (perkGetRank(gDude, perk) != 0) {
+            if (perkGetRank(earner, perk) != 0) {
                 selectedPerksCount += 1;
                 if (selectedPerksCount >= 37) {
                     break;
@@ -764,7 +773,7 @@ bool pcLevelUpApply(int fromLevel, int toLevel)
 
         if (selectedPerksCount < 37) {
             int progression = 3;
-            if (traitIsSelected(TRAIT_SKILLED)) {
+            if (traitIsSelected(TRAIT_SKILLED, earner)) {
                 progression += 1;
             }
 
@@ -793,6 +802,20 @@ void pcStatsReset()
         for (int pcStat = 0; pcStat < PC_STAT_COUNT; pcStat++) {
             gPlayerActorPcStats[slot][pcStat] = gPcStatDescriptions[pcStat].defaultValue;
         }
+    }
+}
+
+void pcLevelUpBadgeRefresh(Object* subject)
+{
+    Object* actor = subject != nullptr ? subject : gDude;
+
+    bool owed = pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS, actor) > 0
+        || perkOwedPickGet(actor);
+
+    if (owed) {
+        dudeEnableState(DUDE_STATE_LEVEL_UP_AVAILABLE, actor);
+    } else {
+        dudeDisableState(DUDE_STATE_LEVEL_UP_AVAILABLE, actor);
     }
 }
 
@@ -982,24 +1005,56 @@ int pcAddExperienceWithOptions(int xp, bool a2, int* xpGained, Object* subject)
             break;
         }
 
+        int levelBefore = row[PC_STAT_LEVEL];
         if (pcSetStat(PC_STAT_LEVEL, row[PC_STAT_LEVEL] + 1, earner) == 0) {
             int maxHpBefore = critterGetStat(earner, STAT_MAXIMUM_HIT_POINTS);
 
-            // Presentation is the HOST's screen only, until per-client HUD
-            // routing exists: a console line, a levelup sting and a HUD repaint
-            // fired for an extra would appear on P1's display, attributed to the
-            // wrong character. The award below is NOT gated — an extra levels
-            // silently but really.
+            // ►► THE SKILL POINTS AND THE FREE PERK ARE AWARDED HERE, on the level
+            // itself, for the actor that earned it.
+            //
+            // They used to be awarded by characterEditorUpdateLevel — that is, LAZILY,
+            // the next time somebody opened the character screen (vanilla awards HP in
+            // this funnel but points on the screen). In co-op that is not a quirk, it is
+            // a hole: the dedicated server has no character screen at all, and every
+            // player's screen is server-owned, so NOBODY was ever awarded a point. The
+            // owed perk was worse than missing — it was one shared PC-global, so the
+            // first player to open their sheet consumed the pick and everyone else's
+            // vanished (PLAYER_SHEET_DESIGN.md §8).
+            //
+            // Awarding at the funnel makes the earner the subject and needs no screen.
+            // For single-player the totals are identical, only earlier: the points are
+            // already in the row when the screen opens instead of appearing as it does.
+            if (pcLevelUpApply(levelBefore, levelBefore + 1, earner)) {
+                perkOwedPickAdd(earner, 1); // may be the 2nd or 3rd of one XP award
+            }
             if (isHost) {
-                // You have gone up a level.
+                // This process's screen has nothing left to reconcile — without the
+                // stamp, characterEditorUpdateLevel would award the same level again.
+                gCharacterEditorLastLevel = row[PC_STAT_LEVEL];
+            }
+
+            // ►► "YOU HAVE GONE UP A LEVEL" NOW REACHES THE ACTOR WHO LEVELLED, not just
+            // the host. This block used to be host-only with the note "until per-client HUD
+            // routing exists" — it exists now (consoleMessageStyled addresses one actor), and
+            // the gap was worse than cosmetic: an extra levelled "silently but really", so a
+            // player gained a level, HP and skill points with NOTHING on their screen to say
+            // so. Addressed, so it lands on the right screen and nobody else's.
+            //
+            // The interface repaints below stay HOST-ONLY on purpose: they act on THIS
+            // process's single interface bar, so firing them for an extra would repaint
+            // the host's bar with another character's numbers. The level-up FLAG is no
+            // longer in that group — dudeEnableState takes a subject now, so it marks the
+            // earner's own sheet row and streams to the earner's own indicator bar.
+            {
                 MessageListItem messageListItem;
-                messageListItem.num = 600;
+                messageListItem.num = 600; // You have gone up a level.
                 if (messageListGetItem(&gStatsMessageList, &messageListItem)) {
-                    presenter()->consoleMessage(messageListItem.text);
+                    presenter()->consoleMessageStyled(earner != nullptr ? earner->netId : 0,
+                        kMsgChannelReward, messageListItem.text);
                 }
-
-                dudeEnableState(DUDE_STATE_LEVEL_UP_AVAILABLE);
-
+            }
+            pcLevelUpBadgeRefresh(earner);
+            if (isHost) {
                 presenter()->sfxPlay("levelup");
             }
 
@@ -1068,11 +1123,10 @@ int pcSetExperience(int xp, Object* subject)
 
     // The DEMOTION path (XP set backwards). Mirror of the award in
     // pcAddExperienceWithOptions, and gated the same way: the HP is taken off the
-    // earner whoever it is, the screen only reacts for the host.
+    // earner whoever it is, and the badge clears on the earner's own row; only the
+    // interface repaint is the host's.
     bool isHost = earner == gDude;
-    if (isHost) {
-        dudeDisableState(DUDE_STATE_LEVEL_UP_AVAILABLE);
-    }
+    dudeDisableState(DUDE_STATE_LEVEL_UP_AVAILABLE, earner);
 
     // NOTE: Uninline.
     int endurance = critterGetBaseStatWithTraitModifier(earner, STAT_ENDURANCE);

@@ -4,8 +4,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <string>
+#include <vector>
+
 #include "art.h"
 #include "automap.h"
+#include "client_net.h" // clientViewerActive — a viewer does not own the clock
 #include "color.h"
 #include "combat.h"
 #include "config.h"
@@ -32,6 +36,7 @@
 #include "platform_compat.h"
 #include "queue.h"
 #include "random.h"
+#include "rest.h" // restPerform — the shared rest simulation
 #include "scripts.h"
 #include "server_loop.h"
 #include "settings.h"
@@ -157,6 +162,37 @@ typedef struct HolodiskDescription {
     int description;
 } HolodiskDescription;
 
+// ─── SERVER-AUTHORED HOLODISKS (see pipboy.h for the model + why it is cheap) ──
+
+struct ServerHolodisk {
+    std::string name;
+    std::vector<std::string> lines;
+};
+
+// Whole set, replaced on each announcement so a rebaseline cannot duplicate it.
+static std::vector<ServerHolodisk> gServerHolodisks;
+
+void pipboyServerHolodiskClear()
+{
+    gServerHolodisks.clear();
+}
+
+void pipboyServerHolodiskAdd(const char* name, const char* const* lines, int lineCount)
+{
+    ServerHolodisk disk;
+    disk.name = name != nullptr ? name : "";
+    for (int i = 0; i < lineCount; i++) {
+        disk.lines.push_back(lines[i] != nullptr ? lines[i] : "");
+    }
+    gServerHolodisks.push_back(std::move(disk));
+}
+
+int pipboyServerHolodiskCount()
+{
+    return (int)gServerHolodisks.size();
+}
+
+
 typedef struct HolidayDescription {
     short month;
     short day;
@@ -281,6 +317,63 @@ MessageListItem gPipboyMessageListItem;
 //
 // 0x664348
 MessageList gPipboyMessageList;
+
+// Selection indices run [0, gHolodisksCount) for vanilla disks and continue past it
+// for server disks, so ONE int keeps identifying the selected disk (`_holodisk`).
+static bool holodiskIsServer(int disk)
+{
+    return disk >= gHolodisksCount;
+}
+
+static const ServerHolodisk* holodiskServerAt(int disk)
+{
+    int index = disk - gHolodisksCount;
+    if (index < 0 || index >= (int)gServerHolodisks.size()) {
+        return nullptr;
+    }
+    return &gServerHolodisks[index];
+}
+
+// ►► ONE LINE ACCESSOR FOR BOTH KINDS, which is the whole trick. Vanilla walks
+// consecutive message ids and stops at a "**END-DISK**" entry; a server disk stops at
+// the end of its array. Returning nullptr for "past the end" unifies them, so the
+// render loops below need no idea which kind they are drawing.
+//
+// `line` is 0-based within the disk. The 500 bound is vanilla's own sanity limit.
+static const char* holodiskLine(int disk, int line)
+{
+    if (line < 0) {
+        return nullptr;
+    }
+    if (holodiskIsServer(disk)) {
+        const ServerHolodisk* serverDisk = holodiskServerAt(disk);
+        if (serverDisk == nullptr || line >= (int)serverDisk->lines.size()) {
+            return nullptr;
+        }
+        return serverDisk->lines[line].c_str();
+    }
+    if (disk < 0 || disk >= gHolodisksCount || line >= 500) {
+        return nullptr;
+    }
+    const char* text = getmsg(&gPipboyMessageList, &gPipboyMessageListItem,
+        gHolodiskDescriptions[disk].description + line);
+    if (text == nullptr || strcmp(text, "**END-DISK**") == 0) {
+        return nullptr;
+    }
+    return text;
+}
+
+static const char* holodiskName(int disk)
+{
+    if (holodiskIsServer(disk)) {
+        const ServerHolodisk* serverDisk = holodiskServerAt(disk);
+        return serverDisk != nullptr ? serverDisk->name.c_str() : "";
+    }
+    if (disk < 0 || disk >= gHolodisksCount) {
+        return "";
+    }
+    return getmsg(&gPipboyMessageList, &gPipboyMessageListItem, gHolodiskDescriptions[disk].name);
+}
 
 // 0x664350
 STRUCT_664350 _sortlist[24];
@@ -479,7 +572,9 @@ static int pipboyWindowInit(int intent)
 
     gPipboyRestOptionsCount = PIPBOY_REST_DURATION_COUNT_WITHOUT_PARTY;
 
-    if (_getPartyMemberCount() > 1 && partyIsAnyoneCanBeHealedByRest()) {
+    // Offering, not gating: with another player present the rest-until-everyone-is-
+    // healed durations are the useful ones.
+    if (partyGroupSize() > 1 && partyIsAnyoneCanBeHealedByRest()) {
         gPipboyRestOptionsCount = PIPBOY_REST_DURATION_COUNT;
     }
 
@@ -914,6 +1009,9 @@ static void pipboyWindowHandleStatus(int a1)
                 soundPlayFile("ib1p1xx1");
                 _holodisk = 0;
 
+                // Walk the VISIBLE disks counting matches against the clicked row, then
+                // keep walking into the server disks — one index space, vanilla first
+                // (see holodiskIsServer). `_holodisk` ends as the absolute disk index.
                 int index = 0;
                 for (; index < gHolodisksCount; index += 1) {
                     HolodiskDescription* holodiskDescription = &(gHolodiskDescriptions[index]);
@@ -922,6 +1020,15 @@ static void pipboyWindowHandleStatus(int a1)
                             break;
                         }
                         _holodisk += 1;
+                    }
+                }
+                if (index >= gHolodisksCount) {
+                    // Not one of the vanilla disks — it is the (a1-1 - visibleVanilla)-th
+                    // server disk. Every server disk is visible, so the remainder indexes
+                    // them directly.
+                    int serverIndex = (a1 - 1) - _holodisk;
+                    if (serverIndex >= 0 && serverIndex < (int)gServerHolodisks.size()) {
+                        index = gHolodisksCount + serverIndex;
                     }
                 }
                 _holodisk = index;
@@ -1257,19 +1364,17 @@ static void pipboyRenderHolodiskText()
         gPipboyCurrentLine = 0;
     }
 
-    HolodiskDescription* holodisk = &(gHolodiskDescriptions[_holodisk]);
-
-    int holodiskTextId;
+    // ►► LINE INDEX, not a message id. holodiskLine() serves the selected disk's lines
+    // from EITHER pipboy.msg (vanilla: consecutive ids ending at "**END-DISK**") or a
+    // streamed server disk, returning nullptr past the end — so these three walks no
+    // longer care which kind is open. `line` replaces vanilla's holodiskTextId; the
+    // arithmetic is otherwise unchanged.
+    int line = 0;
     int linesCount = 0;
 
     gPipboyHolodiskLastPage = 0;
 
-    for (holodiskTextId = holodisk->description; holodiskTextId < holodisk->description + 500; holodiskTextId += 1) {
-        const char* text = getmsg(&gPipboyMessageList, &gPipboyMessageListItem, holodiskTextId);
-        if (strcmp(text, "**END-DISK**") == 0) {
-            break;
-        }
-
+    for (line = 0; holodiskLine(_holodisk, line) != nullptr; line += 1) {
         linesCount += 1;
         if (linesCount >= PIPBOY_HOLODISK_LINES_MAX) {
             linesCount = 0;
@@ -1277,18 +1382,21 @@ static void pipboyRenderHolodiskText()
         }
     }
 
-    if (holodiskTextId >= holodisk->description + 500) {
+    if (line >= 500) {
         debugPrint("\nPIPBOY: #1 Holodisk text end not found!\n");
     }
 
-    holodiskTextId = holodisk->description;
+    line = 0;
 
     if (_view_page != 0) {
         int page = 0;
         int numberOfLines = 0;
-        for (; holodiskTextId < holodiskTextId + 500; holodiskTextId += 1) {
-            const char* line = getmsg(&gPipboyMessageList, &gPipboyMessageListItem, holodiskTextId);
-            if (strcmp(line, "**END-DISK**") == 0) {
+        // Vanilla's loop condition here was `holodiskTextId < holodiskTextId + 500` — a
+        // self-comparison that is always true, i.e. it relied entirely on the breaks. The
+        // accessor's nullptr end bounds it properly; behaviour only differs for a
+        // malformed disk that never terminates, which vanilla would have run off.
+        for (; ; line += 1) {
+            if (holodiskLine(_holodisk, line) == nullptr) {
                 debugPrint("\nPIPBOY: Premature page end in holodisk page search!\n");
                 break;
             }
@@ -1304,14 +1412,9 @@ static void pipboyRenderHolodiskText()
             }
         }
 
-        holodiskTextId += 1;
-
-        if (holodiskTextId >= holodisk->description + 500) {
-            debugPrint("\nPIPBOY: #2 Holodisk text end not found!\n");
-        }
+        line += 1;
     } else {
-        const char* name = getmsg(&gPipboyMessageList, &gPipboyMessageListItem, holodisk->name);
-        pipboyDrawText(name, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, _colorTable[992]);
+        pipboyDrawText(holodiskName(_holodisk), PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, _colorTable[992]);
     }
 
     if (gPipboyHolodiskLastPage != 0) {
@@ -1328,10 +1431,10 @@ static void pipboyRenderHolodiskText()
         gPipboyCurrentLine = 3;
     }
 
-    for (int line = 0; line < PIPBOY_HOLODISK_LINES_MAX; line += 1) {
-        const char* text = getmsg(&gPipboyMessageList, &gPipboyMessageListItem, holodiskTextId);
-        if (strcmp(text, "**END-DISK**") == 0) {
-            break;
+    for (int drawn = 0; drawn < PIPBOY_HOLODISK_LINES_MAX; drawn += 1) {
+        const char* text = holodiskLine(_holodisk, line);
+        if (text == nullptr) {
+            break; // end of disk
         }
 
         if (strcmp(text, "**END-PAR**") == 0) {
@@ -1340,7 +1443,7 @@ static void pipboyRenderHolodiskText()
             pipboyDrawText(text, PIPBOY_TEXT_NO_INDENT, _colorTable[992]);
         }
 
-        holodiskTextId += 1;
+        line += 1;
     }
 
     int moreOrDoneTextId;
@@ -1403,6 +1506,17 @@ static int pipboyWindowRenderHolodiskList(int a1)
             gPipboyCurrentLine++;
             knownHolodisksCount++;
         }
+    }
+
+    // Server-authored disks, after the vanilla ones and ALWAYS shown: a vanilla disk is
+    // gated on its gvar ("have you found it"), and a server disk has none — the server
+    // announcing it IS the grant. Highlight arithmetic matches the loop above exactly, so
+    // hover works the same on both kinds.
+    for (int index = 0; index < (int)gServerHolodisks.size(); index++) {
+        int color = ((gPipboyCurrentLine - 1) / 2 == a1 - 1) ? _colorTable[32747] : _colorTable[992];
+        pipboyDrawText(gServerHolodisks[index].name.c_str(), PIPBOY_TEXT_ALIGNMENT_RIGHT_COLUMN, color);
+        gPipboyCurrentLine++;
+        knownHolodisksCount++;
     }
 
     if (knownHolodisksCount != 0) {
@@ -1750,6 +1864,16 @@ static int pipboyRenderVideoArchive(int a1)
 static void pipboyHandleAlarmClock(int eventCode)
 {
     if (eventCode == 1024) {
+        // ►► A VIEWER MAY NOT REST LOCALLY — the rest sim advances gameTime and heals
+        // everyone, and the server owns both. But it may now ASK: the options menu opens
+        // as normal and picking one sends `restopt`, which the server runs
+        // authoritatively (see the option handler below). It used to be routed into
+        // vanilla's own "You cannot rest at this location!" refusal, which was honest but
+        // meant co-op simply had no way to pass time or heal on purpose.
+        //
+        // The can-rest gate still applies locally so an impossible location is answered
+        // instantly, exactly as in single-player; the server re-checks it anyway, because
+        // a client's answer to "may I" is never the authority's.
         if (_critter_can_obj_dude_rest()) {
             pipboyWindowDestroyButtons();
             pipboyWindowRenderRestOptions(0);
@@ -1780,7 +1904,13 @@ static void pipboyHandleAlarmClock(int eventCode)
         // the until-midnight midnight-render quirk.
         restOptionDecode(duration, &hours, &minutes, &kind);
 
-        if (duration == PIPBOY_REST_DURATION_UNTIL_MIDNIGHT) {
+        if (clientViewerActive()) {
+            // CO-OP: the pick is an intent. The server holds the clock, re-checks the
+            // location, rests the world and heals every player; the new game time and
+            // hit points arrive on the ordinary delta channels. Nothing local moves —
+            // an optimistic clock would be fought by the next update.
+            clientViewerRest(duration);
+        } else if (duration == PIPBOY_REST_DURATION_UNTIL_MIDNIGHT) {
             if (pipboyRest(hours, minutes, kind) == 0) {
                 pipboyDrawNumber(0, 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
             }
@@ -1921,216 +2051,58 @@ static void pipboyWindowDestroyButtons()
 }
 
 // 0x499A24
+// One rest FRAME's presentation: the clock, the date, the hit points, escape, and
+// the 50 ms of real time that makes a rest feel like one. The simulation half is
+// restPerform (rest.cc, f2_core) — the dedicated server drives the same loop with no
+// frame proc at all.
+static bool pipboyRestFrame()
+{
+    sharedFpsLimiter.mark();
+
+    unsigned int start = getTicks();
+
+    bool abort = inputGetInput() == KEY_ESCAPE || _game_user_wants_to_quit != 0;
+
+    pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
+    pipboyDrawDate();
+    pipboyDrawHitPoints();
+    windowRefresh(gPipboyWindow);
+
+    if (!abort) {
+        delay_ms(50 - (getTicks() - start));
+    }
+
+    renderPresent();
+    sharedFpsLimiter.throttle();
+
+    return abort;
+}
+
 static bool pipboyRest(int hours, int minutes, int duration)
 {
-    // Headless server driver: the real rest loop below runs unchanged, but
-    // every window/render/input/real-time-pacing call is guarded out under the
-    // headless probe (main.cc drives the true modal loop via pipboyRestHeadless
-    // instead of reimplementing its control flow). The gate is the BROAD
-    // headlessProbeActive() (not serverLoopActive()) so the legacy probe pump,
-    // which never opens the pipboy window, also skips the UI. The sim (restSim*
-    // clock/heal accrual, queue-event interrupt, _proc_bail_flag) is identical
-    // on both paths.
+    // Belt and braces for a SIM-DIVERGENCE hazard: whatever reaches this leaf, a viewer
+    // must never run the rest sim locally (it advances gameTime and heals everyone). The
+    // alarm-clock tab refuses above and the co-op path asks the SERVER with the `rest`
+    // verb instead; this makes any other route inert too.
+    if (clientViewerActive()) {
+        debugPrint("pipboy: rest refused - a viewer does not own the clock\n");
+        return false;
+    }
+
+    // The headless probe has no window to draw into, so it runs the loop bare — the
+    // same way the server does. The gate stays the BROAD headlessProbeActive() so the
+    // legacy probe pump, which never opens the pipboy window, also skips the UI.
     const bool headless = headlessProbeActive();
 
     if (!headless) {
         gameMouseSetCursor(MOUSE_CURSOR_WAIT_WATCH);
     }
 
-    bool rc = false;
+    RestOutcome outcome = restPerform(hours, minutes, duration, headless ? nullptr : pipboyRestFrame);
 
-    if (duration == 0) {
-        // Ledger H-40: rest-sim pacing (the animation frame counts both
-        // phases divide their clock interpolation and heal accrual by)
-        // extracted to core.
-        double v4;
-        double v7;
-        restSimPacing(hours, minutes, &v4, &v7);
-
-        if (minutes != 0) {
-            unsigned int gameTime = gameTimeGetTime();
-
-            int v5 = 0;
-            for (int v5 = 0; v5 < (int)v4; v5++) {
-                if (!headless) {
-                    sharedFpsLimiter.mark();
-                }
-
-                if (rc) {
-                    break;
-                }
-
-                unsigned int start = headless ? 0 : getTicks();
-
-                // Ledger H-40: clock interpolation, queue-event interrupt
-                // rule and clock advance extracted to core; the pipboy keeps
-                // the bail-flag bookkeeping, ESC polling and redraws.
-                int tick = restSimMinutesTick(gameTime, v5, v4, minutes);
-                if (tick == REST_SIM_TICK_EVENT) {
-                    rc = true;
-                    debugPrint("PIPBOY: Returning from Queue trigger...\n");
-                    _proc_bail_flag = 1;
-                    break;
-                }
-
-                if (tick == REST_SIM_TICK_QUIT) {
-                    rc = true;
-                }
-
-                if (!rc && !headless) {
-                    if (inputGetInput() == KEY_ESCAPE || _game_user_wants_to_quit != 0) {
-                        rc = true;
-                    }
-
-                    pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-                    pipboyDrawDate();
-                    windowRefresh(gPipboyWindow);
-
-                    delay_ms(50 - (getTicks() - start));
-                }
-
-                if (!headless) {
-                    renderPresent();
-                    sharedFpsLimiter.throttle();
-                }
-            }
-
-            if (!rc) {
-                // Ledger H-40: final clock snap + heal-cadence accrual
-                // extracted to core.
-                restSimMinutesFinish(gameTime, minutes);
-            }
-
-            if (!headless) {
-                pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-                pipboyDrawDate();
-                pipboyDrawHitPoints();
-                windowRefresh(gPipboyWindow);
-            }
-        }
-
-        if (hours != 0 && !rc) {
-            unsigned int gameTime = gameTimeGetTime();
-
-            for (int hour = 0; hour < (int)v7; hour++) {
-                if (!headless) {
-                    sharedFpsLimiter.mark();
-                }
-
-                if (rc) {
-                    break;
-                }
-
-                unsigned int start = headless ? 0 : getTicks();
-
-                if (!headless && (inputGetInput() == KEY_ESCAPE || _game_user_wants_to_quit != 0)) {
-                    rc = true;
-                }
-
-                if (!rc) {
-                    // Ledger H-40: clock interpolation, queue-event interrupt
-                    // rule, clock advance and per-frame heal accrual extracted
-                    // to core (restSimHoursTick).
-                    int tick = restSimHoursTick(gameTime, hour, v7, hours);
-                    if (tick == REST_SIM_TICK_EVENT) {
-                        rc = true;
-                        debugPrint("PIPBOY: Returning from Queue trigger...\n");
-                        _proc_bail_flag = 1;
-                        break;
-                    }
-
-                    if (tick == REST_SIM_TICK_QUIT) {
-                        rc = true;
-                    }
-                }
-
-                if (!rc && !headless) {
-                    pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-                    pipboyDrawDate();
-                    pipboyDrawHitPoints();
-                    windowRefresh(gPipboyWindow);
-
-                    delay_ms(50 - (getTicks() - start));
-                }
-
-                if (!headless) {
-                    renderPresent();
-                    sharedFpsLimiter.throttle();
-                }
-            }
-
-            if (!rc) {
-                // Ledger H-40: final clock snap extracted to core.
-                restSimHoursFinish(gameTime, hours);
-            }
-
-            if (!headless) {
-                pipboyDrawNumber(gameTimeGetHour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
-                pipboyDrawDate();
-                pipboyDrawHitPoints();
-                windowRefresh(gPipboyWindow);
-            }
-        }
-    } else if (duration == PIPBOY_REST_DURATION_UNTIL_HEALED || duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED) {
-        int currentHp = critterGetHitPoints(gDude);
-        int maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
-        if (currentHp != maxHp
-            || (duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED && partyIsAnyoneCanBeHealedByRest())) {
-            // First pass - healing dude is the top priority.
-            // Ledger H-40: rest-until-healed duration math extracted to core.
-            int hoursToHeal = restUntilHealedDuration();
-            while (!rc && hoursToHeal != 0) {
-                if (hoursToHeal <= 24) {
-                    rc = pipboyRest(hoursToHeal, 0, 0);
-                    hoursToHeal = 0;
-                } else {
-                    rc = pipboyRest(24, 0, 0);
-                    hoursToHeal -= 24;
-                }
-            }
-
-            // Second pass - attempt to heal delayed damage to dude (via poison
-            // or radiation), and remaining party members. This process is
-            // performed in 3 hour increments.
-            currentHp = critterGetHitPoints(gDude);
-            maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
-            int hpToHeal = maxHp - currentHp;
-
-            if (duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED) {
-                int partyHpToHeal = partyGetMaxWoundToHealByRest();
-                if (partyHpToHeal > hpToHeal) {
-                    hpToHeal = partyHpToHeal;
-                }
-            }
-
-            while (!rc && hpToHeal != 0) {
-                currentHp = critterGetHitPoints(gDude);
-                maxHp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
-                hpToHeal = maxHp - currentHp;
-
-                if (duration == PIPBOY_REST_DURATION_UNTIL_PARTY_HEALED) {
-                    int partyHpToHeal = partyGetMaxWoundToHealByRest();
-                    if (partyHpToHeal > hpToHeal) {
-                        hpToHeal = partyHpToHeal;
-                    }
-                }
-
-                rc = pipboyRest(3, 0, 0);
-            }
-        } else {
-            // No one needs healing.
-            if (!headless) {
-                gameMouseSetCursor(MOUSE_CURSOR_ARROW);
-            }
-            return rc;
-        }
-    }
-
-    // Ledger H-40: end-of-rest overdue-queue-event flush extracted to core.
-    if (restSimOverdueEvents()) {
-        debugPrint("PIPBOY: Returning from Queue trigger...\n");
+    // A queued event wants the screen gone; escape does not.
+    if (outcome == kRestInterrupted) {
         _proc_bail_flag = 1;
-        rc = true;
     }
 
     if (!headless) {
@@ -2141,15 +2113,7 @@ static bool pipboyRest(int hours, int minutes, int duration)
         gameMouseSetCursor(MOUSE_CURSOR_ARROW);
     }
 
-    return rc;
-}
-
-// Headless server rest driver entry (see main.cc): drives the real modal rest
-// loop above (pipboyRest) with all UI/real-time pacing guarded out under
-// serverLoopActive(). Returns true if a queued event/quit interrupted the rest.
-bool pipboyRestHeadless(int hours, int minutes, int kind)
-{
-    return pipboyRest(hours, minutes, kind);
+    return outcome != kRestCompleted;
 }
 
 // 0x49A0C8

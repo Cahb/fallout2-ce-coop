@@ -161,5 +161,35 @@ echo
 echo "== wire-combat gate (claimant drives a fight over the wire: claim + cattack → dude attack) =="
 "$ROOT/scripts/check_wire_combat.sh" || exit 1
 
+# Gate 11: character-sheet edit intents (PLAYER_SHEET_DESIGN.md §9). The level-up
+# spend rulings — entitlement, range, the undo baseline — driven against a TWO-SEAT
+# server. The only gate that runs N>1, and therefore the only one that can catch a
+# spend landing in the WRONG actor's row: with one actor, "the acting player's row"
+# and gDude's row are the same row and every subject bug hides.
+echo
+echo "== sheet gate (2 seats: skill/perk spend rulings + slot 0 untouched) =="
+"$ROOT/scripts/check_sheet.sh" || exit 1
+
+# Gate 12: rest + elevators (docs/COOP_COVERAGE.md). Two vanilla systems that were
+# dead in co-op — rest because its loop lived in the client, elevators because an
+# un-overridden request hook answered "cancelled". Asserts the rest clock/heal
+# arithmetic exactly, and that an UNSOLICITED `elev` is refused: without that check the
+# verb is a teleport-anywhere primitive, which is precisely the bug this gate caught on
+# its first run.
+echo
+echo "== rest/elevator gate (clock+heal exact, unsolicited elev refused) =="
+"$ROOT/scripts/check_rest_elevator.sh" || exit 1
+
+# ►►►► THE FIELD-LEVEL ORACLE, and the one gate that can see the bug class every
+# other gate here is blind to. Everything above validates the live stream on TILE AND
+# ELEVATION — replay.py's reconstructed object was those two fields and nothing else —
+# so a stream that got an object's proto, art frame, flags, hp or inventory wrong sailed
+# through a green suite and was found later by a human clicking something in a live
+# session. This asks the server for its own view of every object and diffs it against
+# what the stream alone could rebuild. See scripts/check_audit.sh.
+echo
+echo "== mirror divergence gate (the stream must reproduce the server field for field) =="
+"$ROOT/scripts/check_audit.sh" || exit 1
+
 echo
 echo "ALL GATES PASS"

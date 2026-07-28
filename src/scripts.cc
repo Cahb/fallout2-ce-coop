@@ -225,6 +225,14 @@ static CombatStartData gScriptsRequestedCSD;
 static CombatStartData gScriptsCSD;
 
 // 0x6649A8
+// WHO is riding. The request arrives from the elevator CONTROL's script, so the
+// requester in scriptsRequestElevator's signature is that scenery, not a player —
+// and the request is DRAINED on a later beat, by which time the verb's
+// ServerActorScope is long gone. So capture the acting player here, while the scope
+// still makes gDude mean "whoever pressed the button", and let the server's handler
+// read it at drain time. Single-player: this is the dude either way.
+static Object* gScriptsRequestedElevatorRider;
+
 static int gScriptsRequestedElevatorType;
 
 // 0x6649AC
@@ -979,69 +987,10 @@ int scriptsHandleRequests()
         if (scriptRequestHandler()->elevatorSelect(gScriptsRequestedElevatorType, &map, &elevation, &tile) != -1) {
             scriptRequestHandler()->automapSave();
 
-            if (map == gMapHeader.index) {
-                if (elevation == gElevation) {
-                    reg_anim_clear(gDude);
-                    objectSetRotation(gDude, ROTATION_SE, nullptr);
-                    _obj_attempt_placement(gDude, tile, elevation, 0);
-                } else {
-                    Object* elevatorDoors = objectFindFirstAtElevation(gDude->elevation);
-                    while (elevatorDoors != nullptr) {
-                        int pid = elevatorDoors->pid;
-                        if (PID_TYPE(pid) == OBJ_TYPE_SCENERY
-                            && (pid == PROTO_ID_0x2000099 || pid == PROTO_ID_0x20001A5 || pid == PROTO_ID_0x20001D6)
-                            && tileDistanceBetween(elevatorDoors->tile, gDude->tile) <= 4) {
-                            break;
-                        }
-                        elevatorDoors = objectFindNextAtElevation();
-                    }
-
-                    reg_anim_clear(gDude);
-                    objectSetRotation(gDude, ROTATION_SE, nullptr);
-                    _obj_attempt_placement(gDude, tile, elevation, 0);
-
-                    if (elevatorDoors != nullptr) {
-                        objectSetFrame(elevatorDoors, 0, nullptr);
-                        objectSetLocation(elevatorDoors, elevatorDoors->tile, elevatorDoors->elevation, nullptr);
-                        elevatorDoors->flags &= ~OBJECT_OPEN_DOOR;
-                        elevatorDoors->data.scenery.door.openFlags &= ~0x01;
-                        _obj_rebuild_all_light();
-                    } else {
-                        debugPrint("\nWarning: Elevator: Couldn't find old elevator doors!");
-                    }
-                }
-            } else {
-                Object* elevatorDoors = objectFindFirstAtElevation(gDude->elevation);
-                while (elevatorDoors != nullptr) {
-                    int pid = elevatorDoors->pid;
-                    if (PID_TYPE(pid) == OBJ_TYPE_SCENERY
-                        && (pid == PROTO_ID_0x2000099 || pid == PROTO_ID_0x20001A5 || pid == PROTO_ID_0x20001D6)
-                        && tileDistanceBetween(elevatorDoors->tile, gDude->tile) <= 4) {
-                        break;
-                    }
-                    elevatorDoors = objectFindNextAtElevation();
-                }
-
-                if (elevatorDoors != nullptr) {
-                    objectSetFrame(elevatorDoors, 0, nullptr);
-                    objectSetLocation(elevatorDoors, elevatorDoors->tile, elevatorDoors->elevation, nullptr);
-                    elevatorDoors->flags &= ~OBJECT_OPEN_DOOR;
-                    elevatorDoors->data.scenery.door.openFlags &= ~0x01;
-                    _obj_rebuild_all_light();
-                } else {
-                    debugPrint("\nWarning: Elevator: Couldn't find old elevator doors!");
-                }
-
-                MapTransition transition;
-                memset(&transition, 0, sizeof(transition));
-
-                transition.map = map;
-                transition.elevation = elevation;
-                transition.tile = tile;
-                transition.rotation = ROTATION_SE;
-
-                mapSetTransition(&transition);
-            }
+            // The ride itself is elevatorRideApply (elevator_data.cc, f2_core): the
+            // dedicated server has no picker screen and drives the same function from
+            // its own wire verb, so both paths have to be the same code.
+            elevatorRideApply(scriptsRequestedElevatorRider(), map, elevation, tile);
         }
     }
 
@@ -1086,48 +1035,11 @@ int _scripts_check_state_in_combat()
         if (scriptRequestHandler()->elevatorSelect(gScriptsRequestedElevatorType, &map, &elevation, &tile) != -1) {
             scriptRequestHandler()->automapSave();
 
-            if (map == gMapHeader.index) {
-                if (elevation == gElevation) {
-                    reg_anim_clear(gDude);
-                    objectSetRotation(gDude, ROTATION_SE, nullptr);
-                    _obj_attempt_placement(gDude, tile, elevation, 0);
-                } else {
-                    Object* elevatorDoors = objectFindFirstAtElevation(gDude->elevation);
-                    while (elevatorDoors != nullptr) {
-                        int pid = elevatorDoors->pid;
-                        if (PID_TYPE(pid) == OBJ_TYPE_SCENERY
-                            && (pid == PROTO_ID_0x2000099 || pid == PROTO_ID_0x20001A5 || pid == PROTO_ID_0x20001D6)
-                            && tileDistanceBetween(elevatorDoors->tile, gDude->tile) <= 4) {
-                            break;
-                        }
-                        elevatorDoors = objectFindNextAtElevation();
-                    }
-
-                    reg_anim_clear(gDude);
-                    objectSetRotation(gDude, ROTATION_SE, nullptr);
-                    _obj_attempt_placement(gDude, tile, elevation, 0);
-
-                    if (elevatorDoors != nullptr) {
-                        objectSetFrame(elevatorDoors, 0, nullptr);
-                        objectSetLocation(elevatorDoors, elevatorDoors->tile, elevatorDoors->elevation, nullptr);
-                        elevatorDoors->flags &= ~OBJECT_OPEN_DOOR;
-                        elevatorDoors->data.scenery.door.openFlags &= ~0x01;
-                        _obj_rebuild_all_light();
-                    } else {
-                        debugPrint("\nWarning: Elevator: Couldn't find old elevator doors!");
-                    }
-                }
-            } else {
-                MapTransition transition;
-                memset(&transition, 0, sizeof(transition));
-
-                transition.map = map;
-                transition.elevation = elevation;
-                transition.tile = tile;
-                transition.rotation = ROTATION_SE;
-
-                mapSetTransition(&transition);
-            }
+            // Same shared ride as the other drain site above (elevator_data.cc).
+            // NOTE this path did NOT close the doors behind on a map change; the shared
+            // function does. Unobservable — that scenery belongs to the map the
+            // transition is about to tear down.
+            elevatorRideApply(scriptsRequestedElevatorRider(), map, elevation, tile);
         }
     }
 
@@ -1248,8 +1160,14 @@ int scriptsRequestElevator(Object* a1, int a2)
     gScriptsRequests |= SCRIPT_REQUEST_ELEVATOR;
     gScriptsRequestedElevatorType = elevatorType;
     gScriptsRequestedElevatorLevel = elevatorLevel;
+    gScriptsRequestedElevatorRider = gDude;
 
     return 0;
+}
+
+Object* scriptsRequestedElevatorRider()
+{
+    return gScriptsRequestedElevatorRider != nullptr ? gScriptsRequestedElevatorRider : gDude;
 }
 
 // 0x4A4730
@@ -2493,6 +2411,43 @@ int _scr_remove_all()
     gMapSid = -1;
 
     programListFree();
+
+    // ►► THE SURVIVORS' PROGRAMS ARE GONE TOO, AND VANILLA NEVER SAYS SO. The loop
+    // above deliberately keeps every SCRIPT_FLAG_0x10 script (the dude script and each
+    // party member) — but programListFree() just freed EVERY Program, theirs included.
+    // Each survivor is left holding a dangling `program` plus SCRIPT_FLAG_0x01, which
+    // means "already loaded", so scriptExecProc skips the reload and dereferences freed
+    // memory. Vanilla gets away with it because a mapLoad always follows and clears
+    // both fields on the way back in (scriptLoadAll for map scripts,
+    // _partyMemberRecoverLoad / scriptsSetDudeScript for the survivors) — so in the
+    // vanilla ordering these two lines are a no-op.
+    //
+    // We have callers that can exit with no load behind them (a cancelled worldmap
+    // trip), where the same state is a use-after-free that presents as a SIGSEGV inside
+    // siglongjmp — see the note at wmTransitionSuspendScripts for the full chain. Say
+    // it here as well as avoiding it there: after this function no Program exists, so
+    // no Script may go on pointing at one.
+    //
+    // ►► NULL THE POINTER, LEAVE SCRIPT_FLAG_0x01 ALONE — deliberately, and it is the
+    // whole difference between a safety net and a behaviour change. scriptExecProc
+    // reloads a script whose 0x01 is clear and runs its start proc; clearing it here
+    // would make every orphaned survivor re-enter the interpreter at a moment vanilla
+    // never did, which is new script execution (and new RNG / gvar traffic) on the
+    // single-player path too. With the flag left set, the very next line of
+    // scriptExecProc — `if (program == nullptr) return -1;` — turns the survivor into
+    // a no-op until something legitimately re-initialises it, and every real re-init
+    // path (scriptLoadAll, _partyMemberRecoverLoad, a fresh scriptAdd) already clears
+    // pointer and flag together. Nothing that worked stops working; what stops is
+    // reading freed memory.
+    for (int scriptType = 0; scriptType < SCRIPT_TYPE_COUNT; scriptType++) {
+        ScriptList* scriptList = &(gScriptLists[scriptType]);
+        for (ScriptListExtent* extent = scriptList->head; extent != nullptr; extent = extent->next) {
+            for (int index = 0; index < extent->length; index++) {
+                extent->scripts[index].program = nullptr;
+            }
+        }
+    }
+
     _exportClearAllVariables();
 
     return 0;

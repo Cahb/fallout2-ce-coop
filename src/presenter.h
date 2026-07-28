@@ -26,6 +26,35 @@ struct PlayerRosterRow {
     bool alive;
 };
 
+// ►► Whose point of view world narration is currently being rendered from, as an
+// actor netId; 0 = nobody in particular, i.e. broadcast (single-player, and every
+// call site that predates this). Read by Presenter::consoleNarration.
+int presenterNarrationAddress();
+
+// Render world narration from ONE player's point of view for the lifetime of this
+// scope. Pair it with a ServerActorScope for the same actor: the scope rebinds gDude
+// so vanilla's own "you"/gender/name choices come out right, and this addresses the
+// resulting lines so only that player receives them.
+//
+//   for each player actor:
+//       ServerActorScope actorScope(actor);
+//       PresenterNarrationScope narration(actor->netId);
+//       _combat_display(attack);
+//
+// Nests safely (saves and restores), so a narrated pass that reaches other narrating
+// code cannot strand the address on an unrelated later message.
+class PresenterNarrationScope {
+public:
+    explicit PresenterNarrationScope(int actorNetId);
+    ~PresenterNarrationScope();
+
+    PresenterNarrationScope(const PresenterNarrationScope&) = delete;
+    PresenterNarrationScope& operator=(const PresenterNarrationScope&) = delete;
+
+private:
+    int _previous;
+};
+
 // Bits for Presenter::objectDelta's changedFields mask (MP_PROTOCOL.md §6.2).
 // Which syncable scalar fields of an object changed during a resolved beat.
 enum ObjectDeltaField {
@@ -51,6 +80,18 @@ enum ObjectDeltaField {
     // The object's own light emission changed (obj->lightDistance/lightIntensity, set by
     // op_obj_set_light_level) — scripted lamps/glow. Not otherwise streamed.
     OBJECT_DELTA_LIGHT = 1 << 10,
+    // ►►►► THE OBJECT BECAME A DIFFERENT KIND OF THING. obj->pid is not the constant
+    // it reads as: a script can swap it in place (op_obj_set_pid / art_change_fid
+    // pairings), and the engine does it itself when a charge is armed
+    // (explosiveActivate). The pid is what every "what can I do with this?" question
+    // resolves through — proto type, can-use, can-use-on, name, weight — so a client
+    // holding the OLD pid computes the wrong answer to all of them while rendering the
+    // NEW art perfectly, which is the most confusing shape a desync can take. Live
+    // case: dig a grave, and the viewer shows the opened grave but offers only
+    // "look" at it, because the primary-verb decision reads a pid that is no longer
+    // what the object is. It fixed itself on a map reload, which is exactly the
+    // signature of state that only the blob carries.
+    OBJECT_DELTA_PID = 1 << 11,
 };
 
 // Bits for Presenter::worldDelta (MP_PROTOCOL.md §2 worldDelta). Global sim
@@ -88,11 +129,15 @@ public:
     // points", "you cannot use that skill in combat", "you cannot get there".
     //
     // The split is by whether the message describes the WORLD or a REFUSAL. World
-    // text (damage, deaths, what someone hit) stays on plain consoleMessage and
-    // reaches every viewer, because that shared narration is most of what makes a
-    // co-op fight readable. A refusal is the opposite: nothing happened, so there
-    // is nothing for the other players to see, and at N=4 in a firefight it is
-    // pure log noise about non-events.
+    // text (damage, deaths, what someone hit) reaches every viewer, because that
+    // shared narration is most of what makes a co-op fight readable. A refusal is
+    // the opposite: nothing happened, so there is nothing for the other players to
+    // see, and at N=4 in a firefight it is pure log noise about non-events.
+    //
+    // ►► World narration is shared but NOT broadcast as one string: vanilla bakes
+    // "you" into the text against gDude, so a single broadcast copy tells every
+    // viewer that THEY were the one hit. It is therefore rendered once per player
+    // and addressed — see consoleNarration + PresenterNarrationScope below.
     //
     // Defaults to forwarding, so the local/narrating presenters — where there is
     // exactly one player and addressing is meaningless — need no override and
@@ -110,6 +155,28 @@ public:
     virtual void consoleMessageStyled(int actorNetId, int channel, const char* text)
     {
         consoleMessageFor(actorNetId, text);
+    }
+
+    // ►► WORLD NARRATION, personalized. Same line as consoleMessage, except that when
+    // a PresenterNarrationScope is active it is ADDRESSED to that scope's actor.
+    //
+    // Use it for text whose wording depends on who is reading — i.e. anything vanilla
+    // phrases against gDude ("You were hit for 12" vs "Sulik was hit for 12"). The
+    // narrator runs once per player under a rebound gDude, and each pass's lines are
+    // addressed to that player, so every viewer reads the same event in the right
+    // person. With no scope active this is byte-for-byte consoleMessage, which is what
+    // keeps single-player and every golden unchanged.
+    //
+    // NOT virtual on purpose: the addressing decision belongs to the sim (which player
+    // is being narrated to), while the transport belongs to the override below it.
+    void consoleNarration(const char* text)
+    {
+        int actorNetId = presenterNarrationAddress();
+        if (actorNetId != 0) {
+            consoleMessageFor(actorNetId, text);
+        } else {
+            consoleMessage(text);
+        }
     }
 
     // Play a full-screen movie on every viewer (MOVIE_* / GAME_MOVIE_* flags).
@@ -138,7 +205,29 @@ public:
     // releases, so any OTHER viewer still in the prompt box breaks out. No-op by
     // default: SP / golden reach showDialogBox directly.
     virtual void encounterPrompt(const char* title, const char* body) {}
+
+    // Co-op ELEVATOR (dedicated server). The server has no picker screen, so it asks
+    // the RIDER's client to show vanilla's, addressed by netId — every other viewer
+    // ignores it. The answer comes back as the `elev <level>` control verb and the
+    // server resolves that level index against its OWN destination table
+    // (elevator.h: the client must never say where a button leads).
+    //
+    // Fire-and-forget: the script request is answered "cancelled" immediately, so the
+    // simulation is NOT parked waiting for the answer, and the ride happens later on
+    // the verb. A player who closes the screen simply never rides.
+    virtual void elevatorPrompt(int actorNetId, int elevator, int startLevel) {}
     virtual void encounterClose() {}
+
+    // Co-op AUTOMAP, addressed. The Motion Sensor is a real carryable item whose whole
+    // effect is "open the automap with scanner detail" — a modal SCREEN, which is why
+    // reaching it on the core-only server used to abort the process. The automap is
+    // viewer-local state (the server contributes nothing: automapSaveCurrent is a
+    // deliberate no-op), so the honest seam is to tell the USER's client to open its
+    // own, addressed by netId — every other viewer ignores it.
+    //
+    // The charge is consumed server-side either way, so the item behaves the same for
+    // the simulation whether or not a viewer is listening.
+    virtual void automapOpen(int actorNetId, bool usingScanner) {}
 
     // World-state lifecycle (P5-B, MP_PROTOCOL.md §2 STATE primitives). These
     // are the authoritative object spawn/move/destroy deltas — the world-state
@@ -195,6 +284,28 @@ public:
     // a bitmask of WorldDeltaField; read current values (e.g. gameTimeGetTime())
     // for the set bits. Emitted once per beat by the per-beat delta scan.
     virtual void worldDelta(unsigned int changedFields) {}
+
+    // ►► GLOBAL VARIABLES that changed this beat, as parallel index/value arrays of
+    // `count` entries (object_delta.cc gvarDeltaScan). Quest steps, karma and
+    // reputation, "you have holodisk X" — all of it is a gvar, and none of it used to
+    // reach a client after its baseline, so everything rendered FROM a gvar (the
+    // pipboy's holodisk and quest lists, the character screen's karma/reputation)
+    // silently froze. Shared world state by design: a gvar is one value for the whole
+    // session, which is the party semantics co-op already assumes.
+    //
+    // Batched because one script step moves several gvars at once. The arrays are
+    // valid only for the duration of the call.
+    virtual void gvarDelta(const int* indices, const int* values, int count) {}
+
+    // ►► A SERVER-AUTHORED HOLODISK: a name plus `lineCount` body lines, appended to the
+    // viewer's pipboy after the disks that came from data/holodisk.txt. See pipboy.h for
+    // why this is cheap — a disk IS just a name and an array of lines.
+    //
+    // Announced as a WHOLE SET: holodiskSetBegin() clears, then one call per disk. That
+    // keeps re-announcement idempotent, which is what lets the server re-send on every
+    // baseline instead of persisting anything.
+    virtual void holodiskSetBegin() {}
+    virtual void holodiskAdd(const char* name, const char* const* lines, int lineCount) {}
 
     // A batched fieldwise delta on an existing object (MP_PROTOCOL.md §2/§6.2).
     // ONE per resolved action (per beat): fid/rotation/flags/hp/radiation/poison/
@@ -416,9 +527,16 @@ public:
     // the script's talking-head fid (-1 = none). Both come from start_gdialog's args and
     // are NOT derivable viewer-side: the critter proto's head_fid is unset for most
     // critters, so a viewer guessing from the proto shows no head at all.
+    // ►► `optionReactions` is the PER-OPTION reaction (GAME_DIALOG_REACTION_GOOD /
+    // NEUTRAL / BAD), parallel to `options`, and it is what the EMPATHY perk renders:
+    // the option list is colour-coded by how the listener will take each line. Without
+    // it on the wire the viewer had to hardcode NEUTRAL, so a player who spent a perk
+    // on Empathy saw a uniformly grey list and no hint at all — the perk silently did
+    // nothing. May be nullptr, which reads as all-neutral.
     virtual void dialogNode(Object* speaker, Object* driver, int reaction,
         const char* reply, const char* const* options, int optionCount,
-        const char* audioFileName = nullptr, int headFid = -1) {}
+        const char* audioFileName = nullptr, int headFid = -1,
+        const int* optionReactions = nullptr) {}
 
     // The conversation ended (every _gdProcess exit: normal end, ESC/dend, or a bail
     // on disconnect/combat/quit). Every viewer tears down its dialog window —
@@ -489,6 +607,28 @@ public:
     // The trade ended (done, cancel, or a bail). Every viewer closes its window.
     virtual void barterEnd() {}
 
+    // -- STEAL / PICKPOCKET / PLANT ----------------------------------------
+    // A steal session opened: `thief` has their hands in `target`'s pockets.
+    // Both are real world objects, so both are addressable by netId, and every
+    // viewer opens the SAME screen anchored on the thief — the party watches the
+    // crime. Only the thief's own client may send stake/splant/sdone.
+    virtual void stealBegin(Object* thief, Object* target) {}
+
+    // ►► A BARE NUDGE, DELIBERATELY CARRYING NOTHING — the one place steal is
+    // cheaper than barter. A trade shuffles items across tables that the wire
+    // cannot address (pid -1, no netId), so its state had to be snapshotted into
+    // the event. A steal moves items between two REAL objects every viewer
+    // already mirrors, so the truth rides the ordinary OBJECT_DELTA_INVENTORY
+    // reconcile. The only thing missing is a HEARTBEAT: the tick is parked in
+    // the steal barrier, so the once-per-beat scan never runs and the frame
+    // those deltas were written into is never flushed. The session runs the scan
+    // itself and then emits this, whose serializer flushes. Payload would be
+    // duplicated truth, and duplicated truth is how mirrors disagree.
+    virtual void stealState() {}
+
+    // The session ended (closed, caught, or a bail). Every viewer closes.
+    virtual void stealEnd() {}
+
     // Who owns which player actor, re-announced after every baseline (netIds are
     // re-minted on every rebaseline, so a roster row is only valid for the
     // generation it arrived in — persistent identity is the SLOT, never the
@@ -526,8 +666,16 @@ public:
     // viewers render the map; intents flow client→server; state flows back.
     virtual void worldmapBegin() {}
     virtual void worldmapEnd() {}
+    // `currentAreaVisitedState` and `currentAreaEntranceMask` describe THE AREA THE PARTY
+    // IS STANDING ON, and only that one, because that is the only area whose town map can
+    // open. They are here because "which districts have we discovered" is server sim
+    // state that never reached a viewer: without it a viewer's own CityInfo still holds
+    // whatever worldmap.txt started with, so it could never tell that a city has a layout
+    // to show and always asked for the front door. Bit i of the mask = entrance i is
+    // discovered.
     virtual void worldmapState(int worldPosX, int worldPosY, int walkDestX, int walkDestY,
-        bool isWalking, int walkDistance, int carFuel, int currentAreaId, bool isInCar) {}
+        bool isWalking, int walkDistance, int carFuel, int currentAreaId, bool isInCar,
+        int currentAreaVisitedState = 0, unsigned int currentAreaEntranceMask = 0) {}
     // Worldmap fog of war: the flattened per-subtile visited/known state grid
     // (tile-major, then row/column — wmTileInfoList order). The whole grid is
     // only ~840 bytes for FO2's 20 tiles, so it ships whole rather than as
@@ -593,8 +741,49 @@ public:
     // Screen fades around sim time-skips (legacy paletteFadeTo(gPaletteBlack)
     // and paletteFadeTo(_cmap) pairs: doctor/first-aid, book reading, script
     // fade opcodes).
-    virtual void screenFadeOut() {}
-    virtual void screenFadeIn() {}
+    // SCREEN FADE, addressed. A fade is almost always ONE player's time passing —
+    // reading a book, a Doctor session, a script's gfade_out around a grave dig — so a
+    // broadcast copy blacks out the whole party's screens for something happening to
+    // somebody else. actorNetId 0 keeps the old meaning (everyone), which is what
+    // single-player and the goldens use, and what a genuinely global cutscene wants.
+    //
+    // ►► THE VIEWER MUST NEVER BE ABLE TO END UP PERMANENTLY BLACK. A fade-out whose
+    // matching fade-in never arrives (script aborted, actor died mid-sequence, event
+    // dropped) is a bricked client, so the receiving side runs a watchdog and fades
+    // itself back in — see clientViewerFadeTick (main.cc). This channel is therefore
+    // best-effort by design: losing a fade costs a visual beat, never the session.
+    // ►► THE SERVER DECIDED THE LOOT SCREEN OPENS; SAY SO. Looting is the one
+    // interaction whose outcome lived entirely on the client: the server fired
+    // kInteractLoot and the VIEWER independently re-judged "am I adjacent yet?" to
+    // decide when to show the screen. Two judges, one question — and when they
+    // disagreed (server adjacent, client not) the result was a silent deadlock the
+    // player could only answer by clicking again, which re-fired _obj_use_container
+    // and TOGGLED the container open/shut once per click. Addressed to the actor
+    // that asked; nobody else's screen opens.
+    virtual void lootGrant(int actorNetId, int containerNetId) {}
+
+    // ─── Live mirror audit (state_audit.h) ──────────────────────────────────
+    // A chunk of the server's authoritative per-object state, for every connected
+    // viewer to diff against its own mirror. `final` marks the last chunk of one
+    // audit, which is when the receiver runs the comparison. Broadcast, not
+    // addressed: every mirror is worth checking, and a divergence on someone else's
+    // screen is still our bug.
+    virtual void stateAuditChunk(const void* records, int count, bool final) {}
+
+    virtual void screenFadeOut(int actorNetId = 0) {}
+    virtual void screenFadeIn(int actorNetId = 0) {}
+
+    // The scripted cutscene input lock (op_game_ui_disable / _enable, 0x8133/0x8134):
+    // mouse, keyboard and the interface bar go away so the player watches instead of
+    // acting. Addressed exactly like the fades above and for the same reason — the two
+    // are issued together by the same script, so they must aim at the same person.
+    //
+    // ►► Only the OPCODE path may reach this. gameUiDisable() has ~14 other call sites
+    // (combat.cc, actions.cc) using it as local pacing around an attack animation;
+    // broadcasting from those would lock every viewer on every combat beat. Same
+    // discriminator as the door/container frame double-stream: script-driven means
+    // cutscene, engine-internal means local.
+    virtual void screenInputLock(bool locked, int actorNetId = 0) {}
 
     // Combat HUD end-turn buttons (legacy interfaceBarEndButtons*).
     virtual void hudEndButtonsShow(bool animated) {}

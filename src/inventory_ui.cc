@@ -15,6 +15,9 @@
 #include "barter_intent.h"
 #include "client_barter.h"
 #include "client_dialog.h"
+#include "client_steal.h" // the viewer half of a server-owned steal session
+#include "object_delta.h" // objectDeltaScan — a parked tick streams nothing on its own
+#include "steal_intent.h"
 #include "msg_channel.h"
 #include "server_players.h"
 #include "client_net.h" // clientViewerActive — inventory is view-only on the wire viewer (Slice 3)
@@ -528,11 +531,25 @@ static int _barter_back_win;
 static FrmImage _inventoryFrmImages[INVENTORY_FRM_COUNT];
 static FrmImage _moveFrmImages[8];
 
+// True while gInventoryMessageList holds a loaded inventry.msg. Vanilla had no
+// need for this: the list was loaded when a screen opened and freed when it
+// closed, and nothing else ever spoke from it. The dedicated server does — it
+// runs the steal session with no screen anywhere on the machine — so the load
+// has to be reachable on its own, and reachable TWICE without leaking the first
+// copy. See inventoryMessageListInit's early return.
+static bool gInventoryMessageListLoaded = false;
+
 // inventory_msg_init
 // 0x46E73C
 static int inventoryMessageListInit()
 {
     char path[COMPAT_MAX_PATH];
+
+    // Already loaded (the server preloaded it for a steal session; see
+    // stealSessionRun). messageListInit on a live list would strand its entries.
+    if (gInventoryMessageListLoaded) {
+        return 0;
+    }
 
     if (!messageListInit(&gInventoryMessageList))
         return -1;
@@ -540,6 +557,8 @@ static int inventoryMessageListInit()
     snprintf(path, sizeof(path), "%s%s", asc_5186C8, "inventry.msg");
     if (!messageListLoad(&gInventoryMessageList, path))
         return -1;
+
+    gInventoryMessageListLoaded = true;
 
     return 0;
 }
@@ -549,6 +568,7 @@ static int inventoryMessageListInit()
 static int inventoryMessageListFree()
 {
     messageListFree(&gInventoryMessageList);
+    gInventoryMessageListLoaded = false;
     return 0;
 }
 
@@ -2120,6 +2140,7 @@ static int inventoryCommonInit()
         }
 
         messageListFree(&gInventoryMessageList);
+        gInventoryMessageListLoaded = false;
 
         return -1;
     }
@@ -3624,6 +3645,17 @@ static void inventoryWindowOpenContextMenu(int keyCode, int inventoryWindowType)
     _adjust_fid();
 }
 
+// True when this loot screen is somebody ELSE's steal session. Every player gets
+// the same window so the party can WATCH the theft (the owner's spec), which
+// means most of them are witnesses: their clicks must move nothing and send
+// nothing. The server refuses a non-thief's steal verb anyway ("You're only
+// watching"), so this keeps a pointless round trip off the wire and stops the
+// local drag from pretending it worked.
+static bool inventoryStealWatcherOnly()
+{
+    return clientViewerActive() && clientStealActive() && !clientStealIsDriver();
+}
+
 // 0x473904
 int inventoryOpenLooting(Object* looter, Object* target)
 {
@@ -3791,6 +3823,13 @@ int inventoryOpenLooting(Object* looter, Object* target)
             break;
         }
 
+        // Wire viewer, STEAL: the SESSION is the server's, so its end is the
+        // screen's end — caught, closed, or bailed, everyone's window comes down
+        // together. (A viewer never sets isCaughtStealing itself: it runs no roll.)
+        if (clientViewerActive() && clientStealEndPending()) {
+            break;
+        }
+
         int keyCode = inputGetInput();
 
         // Wire viewer: loot transfers (take/put/takeall) are server-authoritative —
@@ -3801,9 +3840,14 @@ int inventoryOpenLooting(Object* looter, Object* target)
         // reconciled — consume BOTH (bitwise | so neither is short-circuited away), else
         // an async transfer would not show until the next user event. Clamp both scroll
         // offsets in case items were removed out from under them.
+        // (Steal adds a third source: on a SPECTATOR neither of those two fires —
+        // the thief is not their dude and the victim is the loot target only for
+        // whoever set it — so the session's own STATE heartbeat is what tells
+        // their screen to repaint. Consumed with the others, never short-circuited.)
         if (clientViewerActive()
             && (static_cast<int>(clientViewerConsumeDudeInvDirty())
-                    | static_cast<int>(clientViewerConsumeLootTargetInvDirty()))
+                    | static_cast<int>(clientViewerConsumeLootTargetInvDirty())
+                    | static_cast<int>(clientStealConsumeDirty()))
                 != 0) {
             if (_stack_offset[_curr_stack] > _pud->length - gInventorySlotsCount) {
                 _stack_offset[_curr_stack] = _pud->length - gInventorySlotsCount;
@@ -3926,10 +3970,15 @@ int inventoryOpenLooting(Object* looter, Object* target)
             } else if ((mouseGetEvent() & MOUSE_EVENT_LEFT_BUTTON_DOWN) != 0) {
                 if (keyCode >= 1000 && keyCode <= 1000 + gInventorySlotsCount) {
                     if (gInventoryCursor == INVENTORY_WINDOW_CURSOR_ARROW) {
-                        inventoryWindowOpenContextMenu(keyCode, INVENTORY_WINDOW_TYPE_LOOT);
+                        // A witness to someone else's steal gets no item actions
+                        // either — Drop/Use here would act through THEIR own dude.
+                        if (!inventoryStealWatcherOnly()) {
+                            inventoryWindowOpenContextMenu(keyCode, INVENTORY_WINDOW_TYPE_LOOT);
+                        }
                     } else {
                         int slotIndex = keyCode - 1000;
-                        if (slotIndex + _stack_offset[_curr_stack] < _pud->length) {
+                        if (slotIndex + _stack_offset[_curr_stack] < _pud->length
+                            && !inventoryStealWatcherOnly()) {
                             _gStealCount += 1;
                             _gStealSize += itemGetSize(_stack[_curr_stack]);
 
@@ -3954,10 +4003,15 @@ int inventoryOpenLooting(Object* looter, Object* target)
                     }
                 } else if (keyCode >= 2000 && keyCode <= 2000 + gInventorySlotsCount) {
                     if (gInventoryCursor == INVENTORY_WINDOW_CURSOR_ARROW) {
-                        inventoryWindowOpenContextMenu(keyCode, INVENTORY_WINDOW_TYPE_LOOT);
+                        // A witness to someone else's steal gets no item actions
+                        // either — Drop/Use here would act through THEIR own dude.
+                        if (!inventoryStealWatcherOnly()) {
+                            inventoryWindowOpenContextMenu(keyCode, INVENTORY_WINDOW_TYPE_LOOT);
+                        }
                     } else {
                         int slotIndex = keyCode - 2000;
-                        if (slotIndex + _target_stack_offset[_target_curr_stack] < _target_pud->length) {
+                        if (slotIndex + _target_stack_offset[_target_curr_stack] < _target_pud->length
+                            && !inventoryStealWatcherOnly()) {
                             _gStealCount += 1;
                             _gStealSize += itemGetSize(_stack[_curr_stack]);
 
@@ -4015,7 +4069,23 @@ int inventoryOpenLooting(Object* looter, Object* target)
         }
 
         if (keyCode == KEY_ESCAPE) {
-            break;
+            // ►► IN A STEAL SESSION, LEAVING IS A REQUEST. The session is the
+            // server's: it holds the victim's detached gear and owes everyone a
+            // close, so a viewer that tore its own window down would be watching a
+            // theft it could no longer see (and a WITNESS could dismiss someone
+            // else's crime). The thief asks with `sdone` and the window closes on
+            // EVENT_STEAL_END; a witness's ESC is consumed and does nothing. Same
+            // ruling as the spectator's ESC in a streamed dialog.
+            if (clientViewerActive() && clientStealActive()) {
+                // ONCE. The window closes on EVENT_STEAL_END, not on the keypress,
+                // so a second ESC during the round trip only sends an `sdone` that
+                // arrives after the session is gone.
+                if (clientStealIsDriver() && clientStealConsumeCloseRequest()) {
+                    clientViewerStealVerb("sdone", -1, 0);
+                }
+            } else {
+                break;
+            }
         }
 
         renderPresent();
@@ -4028,7 +4098,11 @@ int inventoryOpenLooting(Object* looter, Object* target)
 
     lootTargetReattach(target, hiddenBox, item1, item2, armor);
 
-    if (_gIsSteal && !isCaughtStealing && stealingXp > 0) {
+    // A VIEWER AWARDS NOTHING. Its stealingXp counter tracked local clicks, but
+    // the rolls happened on the server and so did the XP (and the caught check) —
+    // paying it again here would be a client-side invention that the next sheet
+    // delta contradicts.
+    if (_gIsSteal && !isCaughtStealing && stealingXp > 0 && !clientViewerActive()) {
         // SFALL: Display actual xp received.
         int xpGained;
         if (lootStealExperience(looter, target, stealingXp, &xpGained)) {
@@ -4078,6 +4152,350 @@ int inventoryOpenStealing(Object* thief, Object* target)
     _gStealSize = 0;
 
     return rc;
+}
+
+// -- SERVER-AUTHORITATIVE STEAL SESSION (co-op) -----------------------------
+// Installed by f2_server (inventory.h). Null everywhere else.
+static std::function<bool()> gStealServerPump;
+
+// The live session, or nullptrs. Read by the stake/splant/sdone trust boundary
+// in server_control.cc: a steal verb only means anything inside a session, and
+// only from the actor whose hands are in the pockets.
+static Object* gStealSessionThief = nullptr;
+static Object* gStealSessionTarget = nullptr;
+
+void stealSetServerPump(std::function<bool()> pump)
+{
+    gStealServerPump = std::move(pump);
+}
+
+bool stealSessionActive()
+{
+    return gStealSessionThief != nullptr;
+}
+
+Object* stealSessionThief()
+{
+    return gStealSessionThief;
+}
+
+Object* stealSessionTarget()
+{
+    return gStealSessionTarget;
+}
+
+// Find a top-level stack by proto id, as the barter drain does and for the same
+// reason: the screen's slot math is reverse-indexed into a live window and means
+// nothing here, so the wire names items by pid.
+static Object* _steal_find_item_by_pid(Object* owner, int pid)
+{
+    if (owner == nullptr) {
+        return nullptr;
+    }
+    Inventory* inventory = &(owner->data.inventory);
+    for (int index = 0; index < inventory->length; index++) {
+        if (inventory->items[index].item != nullptr
+            && inventory->items[index].item->pid == pid) {
+            return inventory->items[index].item;
+        }
+    }
+    return nullptr;
+}
+
+// Ship what the two pockets look like right now.
+//
+// ►► WHY A SCAN AND NOT A SNAPSHOT (this is the one place steal is CHEAPER than
+// barter): barter had to invent an event carrying both tables because a barter
+// table is created with pid -1 and never reaches the wire at all. A steal
+// session moves items between two REAL world objects that every viewer already
+// mirrors by netId, so the existing OBJECT_DELTA_INVENTORY reconcile is exactly
+// the right channel — it already does add/remove/qty against a mirror, and the
+// loot screen already repaints off it. What is missing is only the TRIGGER: the
+// tick is parked inside this session, so the scan that normally runs once per
+// beat never fires. Run it here, then emit the (empty) state event, whose
+// serializer flushes the frame the deltas were just written into.
+static void stealEmitState()
+{
+    objectDeltaScan();
+    presenter()->stealState();
+}
+
+// Run a steal / pickpocket / plant session on the dedicated server.
+//
+// ►► THE SHAPE, AND WHY IT IS BARTER'S AND NOT LOOT'S. Looting in co-op is
+// viewer-local: the client opens the vanilla screen and every transfer is a
+// take/put verb, with the sim still running behind it. Stealing cannot be, for
+// two reasons the owner named directly. (1) The transfer is a SKILL ROLL —
+// whose skill, against whose Perception, with vanilla's per-item difficulty
+// ramp — and a client may not roll its own dice. (2) It is theatre the whole
+// party should see: the world stops and everyone watches the thief's screen, so
+// a steal that goes wrong goes wrong in front of witnesses. So this parks the
+// tick in a block-and-pump barrier exactly like a trade, and every viewer opens
+// the same screen (thief drives, the rest watch).
+//
+// Everything below the announce is vanilla's own steal loop
+// (inventoryOpenLooting with _gIsSteal set) with the UI amputated: the same
+// entry gates, the same detach of the target's equipped gear so it cannot be
+// lifted, the same _gStealCount difficulty ramp, the same 10/20/30 XP ladder,
+// the same caught-ends-it rule, the same PICKUP react on the way out. The parts
+// that are ours are the barrier, the addressing, and the fact that the roll
+// happens here instead of on the thief's machine.
+void stealSessionRun(Object* thief, Object* target)
+{
+    if (thief == nullptr || target == nullptr || thief == target) {
+        return;
+    }
+    if (gStealSessionThief != nullptr) {
+        // No nesting. A script cannot open a steal inside a steal, but a racing
+        // verb could try; refuse rather than corrupt the detach bookkeeping.
+        fprintf(stderr, "f2_server: steal session already open, ignoring net=%d -> net=%d\n",
+            thief->netId, target->netId);
+        return;
+    }
+
+    // ►► gDude := the THIEF for the whole session. skillsPerformStealing gates
+    // the Pickpocket perk and the steal-from-a-party-member auto-success on
+    // `thief == gDude`, skillGetValue reads the actor's own sheet, and
+    // lootStealExperience awards to the actor — every one of those is correct
+    // only inside this scope. This is the same conversation-long scope the
+    // dialog barrier holds, for the same reason.
+    ServerActorScope scope(thief);
+
+    // ►► THE SERVER HAS TO LOAD THE STRINGS ITSELF. inventry.msg is loaded by
+    // inventoryCommonInit — i.e. by OPENING A WINDOW — and a dedicated server never
+    // opens one, so every messageListGetItem below quietly returned false and the
+    // line was dropped. Two of them matter and both looked like missing FEATURES: the
+    // XP award ("You gain %d experience points for successfully using your Steal
+    // skill.", msg 29) went unannounced, so a successful theft read as paying nothing
+    // — the owner reasonably asked whether stealing granted XP at all; it always did,
+    // silently. And msg 50 ("You can't find anything to take from that.") meant a
+    // refused session opened and shut with no word at all.
+    inventoryMessageListInit();
+
+    _gIsSteal = PID_TYPE(thief->pid) == OBJ_TYPE_CRITTER && critterIsActive(target);
+    _gStealCount = 0;
+    _gStealSize = 0;
+
+    MessageListItem messageListItem;
+
+    switch (lootOpenCheck(thief, target, _gIsSteal)) {
+    case LOOT_OPEN_NO_STEAL:
+        // You can't find anything to take from that. (Addressed: it answers ONE
+        // player's click and means nothing to the others.)
+        messageListItem.num = 50;
+        if (messageListGetItem(&gInventoryMessageList, &messageListItem)) {
+            presenter()->consoleMessageFor(thief->netId, messageListItem.text);
+        }
+        _gIsSteal = 0;
+        return;
+    case LOOT_OPEN_BLOCKED:
+        _gIsSteal = 0;
+        return;
+    default:
+        break;
+    }
+
+    Object* item1 = nullptr;
+    Object* item2 = nullptr;
+    Object* armor = nullptr;
+    Object* hiddenBox = lootTargetDetach(target, _gIsSteal, &item1, &item2, &armor);
+    if (hiddenBox == nullptr) {
+        _gIsSteal = 0;
+        return;
+    }
+
+    gStealSessionThief = thief;
+    gStealSessionTarget = target;
+    // A verb that raced the previous session's teardown must not be spent on
+    // this target's pockets.
+    stealIntentClear();
+
+    // ►► TELL EVERYONE, BY NAME. Two things need saying and they are the same
+    // line: the world just stopped (the tick is parked in this barrier, and an
+    // unexplained freeze reads as a crash — bugs-list U), and somebody is
+    // committing a crime in front of you. The owner asked for this one
+    // explicitly. Emitted BEFORE stealBegin because consoleMessageStyled only
+    // BUFFERS — stealBegin force-flushes and carries it out.
+    for (int slot = 0; slot < playerActorCount(); slot++) {
+        Object* other = playerActorAt(slot);
+        if (other == nullptr || other == thief) {
+            continue;
+        }
+        char line[256];
+        snprintf(line, sizeof(line), "%s is stealing from %s.",
+            critterGetName(thief), objectGetName(target));
+        presenter()->consoleMessageStyled(other->netId, kMsgChannelSystem, line);
+    }
+
+    fprintf(stderr, "f2_server: steal session OPEN thief=net%d target=net%d isSteal=%d\n",
+        thief->netId, target->netId, _gIsSteal);
+
+    presenter()->stealBegin(thief, target);
+    stealEmitState();
+
+    bool caught = false;
+    int stealingXp = 0;
+    int stealingXpBonus = 10;
+
+    for (;;) {
+        StealIntent intent;
+        bool haveIntent = stealIntentPeek(&intent);
+        if (gStealServerPump != nullptr) {
+            // Block-and-pump, the steal twin of the barter barrier: park the tick
+            // inside the open screen and service the control channel until the
+            // thief's next move lands, or the pump bails (thief gone / quit).
+            while (!haveIntent) {
+                if (!gStealServerPump()) {
+                    break;
+                }
+                haveIntent = stealIntentPeek(&intent);
+            }
+        }
+        if (!haveIntent) {
+            // No pump installed (nothing but f2_server installs one) or the pump
+            // bailed. Either way the session is over; the teardown below returns
+            // the target's own gear, so a dropped thief costs the victim nothing.
+            break;
+        }
+        stealIntentPop();
+
+        if (intent.kind == STEAL_INTENT_DONE) {
+            break;
+        }
+
+        bool planting = intent.kind == STEAL_INTENT_PLANT;
+        Object* from = planting ? thief : target;
+        Object* item = _steal_find_item_by_pid(from, intent.pid);
+        if (item == nullptr) {
+            // Another player emptied that pocket, or the viewer's mirror is
+            // stale. Same wording as the loot path's identical case.
+            presenter()->consoleMessageFor(thief->netId, "That item is gone.");
+            stealEmitState();
+            continue;
+        }
+
+        int available = itemGetQuantity(from, item);
+        int quantity = intent.quantity;
+        if (quantity <= 0 || quantity > available) {
+            quantity = available;
+        }
+
+        // Vanilla's per-move difficulty ramp: every attempt in one session makes
+        // the next harder (stealModifier = -_gStealCount + 1). Counted for the
+        // ATTEMPT, before the roll, exactly as the screen's loop counts it.
+        _gStealCount += 1;
+        _gStealSize += itemGetSize(item);
+
+        LootTransferResult rc = lootTransferItem(thief, target, item, quantity, planting, _gIsSteal != 0);
+        fprintf(stderr, "f2_server: steal %s pid=%d qty=%d rc=%d count=%d\n",
+            planting ? "plant" : "take", intent.pid, quantity, (int)rc, _gStealCount);
+
+        if (rc == LOOT_TRANSFER_CAUGHT_STEALING) {
+            caught = true;
+            stealEmitState();
+            break;
+        }
+        if (rc == LOOT_TRANSFER_NO_ROOM) {
+            presenter()->consoleMessageFor(thief->netId,
+                planting ? "There is no space left for that item."
+                         : "You cannot pick that up. You are at your maximum weight capacity.");
+        } else {
+            stealingXp += stealingXpBonus;
+            stealingXpBonus += 10;
+        }
+
+        stealEmitState();
+    }
+
+    lootTargetReattach(target, hiddenBox, item1, item2, armor);
+    // ►► FLUSH THE RESTORE WHILE THE VIEWERS STILL KNOW WHO THE VICTIM IS. A viewer
+    // reconciles the victim's pockets in full only for the duration of the session
+    // (client_net.cc gViewerStealTargetNetId, set by BEGIN and cleared by END), which
+    // is what makes the detached weapon/armor vanish from the right panel. The
+    // reattach that puts them back is the mirror image and needs the same window:
+    // emitted after END it would arrive with the gate already shut, and the victim's
+    // mirror would stay stripped of its own gun until the next rebaseline.
+    stealEmitState();
+
+    if (_gIsSteal && !caught && stealingXp > 0) {
+        int xpGained;
+        if (lootStealExperience(thief, target, stealingXp, &xpGained)) {
+            // You gain %d experience points for successfully using your Steal skill.
+            messageListItem.num = 29;
+            if (messageListGetItem(&gInventoryMessageList, &messageListItem)) {
+                char formattedText[200];
+                snprintf(formattedText, sizeof(formattedText), messageListItem.text, xpGained);
+                presenter()->consoleMessageFor(thief->netId, formattedText);
+            }
+        }
+    }
+
+    bool reactNeeded = _gIsSteal && caught && _gStealCount > 0;
+
+    gStealSessionThief = nullptr;
+    gStealSessionTarget = nullptr;
+    _gIsSteal = 0;
+    _gStealCount = 0;
+    _gStealSize = 0;
+    stealIntentClear();
+
+    // Close every viewer's screen, THEN run the react. The react executes the
+    // target's PICKUP proc, which is script that can start a fight, talk, or
+    // move the world — none of which should happen with a modal held open on
+    // five machines.
+    presenter()->stealEnd();
+    stealEmitState();
+
+    fprintf(stderr, "f2_server: steal session CLOSE thief=net%d caught=%d xp=%d\n",
+        thief->netId, caught ? 1 : 0, stealingXp);
+
+    if (reactNeeded) {
+        lootCaughtStealingReact(thief, target);
+    }
+}
+
+// VIEWER-side steal screen. The server is running the session; this is what it
+// looks like from a seat.
+//
+// ►► ANCHORED ON THE THIEF, ON EVERY MACHINE. The left panel is the thief's pack
+// and the right is the victim's, for spectators too — that is the owner's spec
+// ("show the stealing player's view") and it is also the only rendering that
+// makes sense: an item leaving the victim has to arrive somewhere visible.
+// vanilla's `looter != _inven_dude` gate at the top of inventoryOpenLooting is
+// exactly the anchor test, so pointing _inven_dude at the thief is both what
+// opens the screen and what fills it.
+//
+// ►► AND THE ANCHOR MUST BE PUT BACK. _inven_dude / _stack[0] are the PERSISTENT
+// anchor the ordinary inventory screen reads; barter shipped the bug where a
+// spectator who watched someone else's trade found their own pack rendering
+// empty forever after. Same save/restore, same reason.
+void inventoryOpenStealingViewer(Object* thief, Object* target)
+{
+    if (thief == nullptr || target == nullptr || thief == target) {
+        return;
+    }
+
+    // ►► SUBJECT SLOTS MUST BE PROTO-RESOLVABLE (viewer-modal invariant I3): both
+    // of these land in subject slots (_inven_dude / _target_stack[0]) and go
+    // through proto/stat/art resolution at dozens of sites. A session naming an
+    // object this viewer has not been told about yet is not renderable — refuse
+    // it, because a missing screen is recoverable and a fault is not.
+    Proto* probe = nullptr;
+    if (protoGetProto(thief->pid, &probe) != 0 || protoGetProto(target->pid, &probe) != 0) {
+        debugPrint("client_steal: subject slot not proto-resolvable — refusing the steal screen\n");
+        return;
+    }
+
+    Object* savedInvenDude = _inven_dude;
+    Object* savedStack0 = _stack[0];
+
+    _inven_dude = thief;
+    _stack[0] = thief;
+
+    inventoryOpenStealing(thief, target);
+
+    _inven_dude = savedInvenDude;
+    _stack[0] = savedStack0;
 }
 
 // 0x474708
@@ -4175,7 +4593,16 @@ static InventoryMoveResult _move_inventory(Object* item, int slotIndex, Object* 
                     // make a client-only phantom the server never has). Read pid now (still
                     // valid — solo, nothing frees it mid-drag; the container-item deferred-
                     // free + item-instance-ids for the co-op case are banked).
-                    clientViewerLootPut(targetObj->netId, item->pid, quantityToMove);
+                    //
+                    // ►► PLANTING IS A DIFFERENT VERB, NOT A PUT. Inside a steal session the
+                    // transfer is a Steal ROLL that can be caught and end the session, so it
+                    // must reach the server as what it is; `put` would move the item with no
+                    // roll at all. The session names the victim, so this sends no netId.
+                    if (clientStealActive()) {
+                        clientViewerStealVerb("splant", item->pid, quantityToMove);
+                    } else {
+                        clientViewerLootPut(targetObj->netId, item->pid, quantityToMove);
+                    }
                     result = INVENTORY_MOVE_RESULT_SUCCESS;
                 } else {
                     // Batch-6 split: transfer rules extracted to core (item.cc).
@@ -4209,8 +4636,14 @@ static InventoryMoveResult _move_inventory(Object* item, int slotIndex, Object* 
             if (quantityToMove != -1) {
                 if (clientViewerActive()) {
                     // Wire viewer: drag ran locally for feel; fire the take verb
-                    // (container→dude) server-authoritatively (see the plant branch above).
-                    clientViewerLootTake(targetObj->netId, item->pid, quantityToMove);
+                    // (container→dude) server-authoritatively (see the plant branch above),
+                    // or the STEAL verb when this is a session — same reason: a pocket is
+                    // emptied by a roll, not by an itemMove.
+                    if (clientStealActive()) {
+                        clientViewerStealVerb("stake", item->pid, quantityToMove);
+                    } else {
+                        clientViewerLootTake(targetObj->netId, item->pid, quantityToMove);
+                    }
                     result = INVENTORY_MOVE_RESULT_SUCCESS;
                 } else {
                     // Batch-6 split: transfer rules extracted to core (item.cc).
@@ -5174,28 +5607,6 @@ void inventoryOpenTrade(int win, Object* barterer, Object* playerTable, Object* 
     inventoryCommonFree();
 }
 
-// ============================================================================
-// VIEWER-SIDE TRADE WINDOW (client_barter.h)
-//
-// The viewer never runs inventoryOpenTrade above: that function IS the trade, and
-// the trade belongs to the server. This is the render half only — the same window
-// and the same display calls, driven by the mirrored tables the barter stream
-// builds, and exited when the server says the trade is over.
-//
-// A no-op item-description sink for the viewer's nested quantity dial. During
-// barter, _setup_inventory(TRADE) points gInventoryPrintItemDescriptionHandler at
-// gameDialogRenderSupplementaryMessage, which draws into the dialog reply window.
-// That window is ALIVE on a normal client but TORN DOWN on a viewer (the node
-// subwindows come down when the trade screen goes up). inventoryQuantityWindowInit
-// ends with inventorySetCursor(ARROW), which -- because the clicked slot is still
-// armed (_im_value != -1) -- fires inventoryItemSlotOnMouseEnter ->
-// _obj_look_at_func(..., gInventoryPrintItemDescriptionHandler), rendering the
-// item description into that dead window and faulting in the font blit. Swapping
-// the handler to this sink for the dial's lifetime suppresses the render; the
-// description was never visible on the viewer anyway.
-static void inventoryTradeViewerDescriptionSink(char* /*string*/)
-{
-}
 
 // Same shape as client_dialog: bypass the loop that would execute authority
 // locally, call the pure-render pieces directly.
@@ -5250,11 +5661,13 @@ void inventoryOpenTradeViewer(Object* merchant, Object* playerTable, Object* mer
     // (money, the Offer/Talk buttons) draws on top of it, with an unloaded FRM in
     // the corner. The window below is the dialog window on purpose -- that is what
     // vanilla passes as `win` -- but it is the BACKING window, not the background.
-    // ►► TWO SUBWINDOWS MUST COME DOWN BEFORE THE TRADE WINDOW GOES UP.
-    // (1) The reply/option subwindows: barter REPLACES the option list; leaving them
-    // lit was the reported "dialog leftovers blended with the new background".
-    // clientBarterActive() is already true here, so this sync reconciles
-    // node-subwindows-wanted to false and takes them down — the single owner does it.
+    // ►► WHAT MUST COME DOWN BEFORE THE TRADE WINDOW GOES UP.
+    // (1) The OPTIONS list: barter replaces it, it is WINDOW_MOVE_ON_TOP, and leaving
+    // it lit was the reported "dialog leftovers blended with the new background".
+    // clientBarterActive() is already true here, so this sync hides it — the single
+    // owner does it. The REPLY window deliberately STAYS (vanilla keeps it through a
+    // trade, it does not overlap the trade strip, and it is where a moused-over
+    // item's description renders — see the handler note below).
     // (2) The NORMAL control subwindow (Barter/Review buttons): gGameDialogWindow is
     // one handle, and _gdialog_barter_create_win below OVERWRITES it. Without this
     // teardown the normal control window leaks and its Barter button stays live over
@@ -5343,20 +5756,21 @@ void inventoryOpenTradeViewer(Object* merchant, Object* playerTable, Object* mer
 
     inventorySetCursor(INVENTORY_WINDOW_CURSOR_HAND);
 
-    // ►► SUPPRESS THE ITEM-DESCRIPTION RENDER FOR THE WHOLE VIEWER TRADE, not just
-    // the quantity dial. _setup_inventory(TRADE) above pointed
-    // gInventoryPrintItemDescriptionHandler at gameDialogRenderSupplementaryMessage,
-    // which draws into the dialog reply window -- ALIVE on a normal client but TORN
-    // DOWN on a viewer. Anything that renders an item description here faults in the
-    // font blit: an ARROW-cursor hover over a slot (_process_bk -> _GNW_check_buttons
-    // -> inventoryItemSlotOnMouseEnter -> _obj_look_at_func) OR the quantity dial's
-    // closing cursor reset. The trade window keeps a HAND cursor so hovers are
-    // normally inert, but the dial leaves the cursor ARROW on exit and the next hover
-    // then fires the render -- the reported "cancel the dial, then segfault". The
-    // viewer never shows this text anyway, so route the handler to a sink for the
-    // trade's lifetime and restore it on the way out (all exits are below this point).
-    InventoryPrintItemDescriptionHandler* savedDescHandler = gInventoryPrintItemDescriptionHandler;
-    gInventoryPrintItemDescriptionHandler = inventoryTradeViewerDescriptionSink;
+    // ►► INSPECT IS LIVE AGAIN, AND THE FIX WAS UPSTREAM. This used to route the
+    // description handler to a no-op sink, because _setup_inventory(TRADE) points it
+    // at gameDialogRenderSupplementaryMessage — which draws into the dialog REPLY
+    // window, and the viewer used to tear that window down when the trade screen went
+    // up. Anything that rendered a description then faulted in the font blit (an
+    // ARROW-cursor hover, or the quantity dial's closing cursor reset — the reported
+    // "cancel the dial, then segfault"). Suppressing the render was treating the
+    // symptom: the real defect was that the viewer destroyed a window VANILLA KEEPS
+    // ALIVE FOR THE WHOLE CONVERSATION, trade included. client_dialog now keeps it and
+    // only hides the options list, so the handler has its true target back and an
+    // item description appears where vanilla puts it — the text area above the trade
+    // strip (reply y225..283, trade y290..470: no overlap). The renderer also guards
+    // the handle it writes to now, so a stale one is a no-op instead of a crash.
+    // Nothing to save and restore any more: the handler _setup_inventory chose is
+    // the one that runs.
 
     // Repaint everything the stream can change. Called on open and on every
     // STATE, which is the whole visual cue: no animation, no travel, the item is
@@ -5452,6 +5866,18 @@ void inventoryOpenTradeViewer(Object* merchant, Object* playerTable, Object* mer
                     _btable_offset += 1;
                     inventoryWindowRenderInnerInventories(win, nullptr, _btable, -1);
                 }
+            } else if ((mouseGetEvent() & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0) {
+                // ►► RIGHT-CLICK SWAPS HAND <-> ARROW, exactly as it does on every
+                // other inventory screen — and on the trade screen that IS the
+                // inspect switch. Under HAND a slot hover is inert (that is what
+                // makes drag-and-drop feel like dragging); under ARROW the hover
+                // fires _obj_look_at_func and the item's description renders into
+                // the reply area above. It was missing here only because the render
+                // it triggers used to fault (see the handler note above), so the
+                // toggle was left out along with it.
+                inventorySetCursor(gInventoryCursor == INVENTORY_WINDOW_CURSOR_HAND
+                        ? INVENTORY_WINDOW_CURSOR_ARROW
+                        : INVENTORY_WINDOW_CURSOR_HAND);
             } else if ((mouseGetEvent() & MOUSE_EVENT_LEFT_BUTTON_DOWN) != 0
                 && gInventoryCursor == INVENTORY_WINDOW_CURSOR_HAND) {
                 // ►► REAL DRAG/DROP, VANILLA MACHINERY. A left-click on a slot runs
@@ -5555,10 +5981,12 @@ void inventoryOpenTradeViewer(Object* merchant, Object* playerTable, Object* mer
     // session as over and _gdialogExitFromScript cleans the background + the already
     // -gone control, no orphan windows.
     //
-    // ►► NODE SUBWINDOWS ARE NOT REBUILT HERE — the main loop's clientModalWindowsSync()
-    // owns those (I2). On the next reconcile clientBarterActive() is false, so it
-    // rebuilds them IFF the conversation is still live. The old order-of-arrival guess
-    // (BARTER_END vs DIALOG_END) is gone: the reconcile reads the final latched state.
+    // ►► NODE SUBWINDOWS ARE NOT TOUCHED HERE — the main loop's clientModalWindowsSync()
+    // owns those (I2). They stayed UP for the whole trade (vanilla does the same, and
+    // it is what let an item description render above the trade strip); the options
+    // list was merely hidden, and the next reconcile un-hides it iff the conversation
+    // is still live. The old order-of-arrival guess (BARTER_END vs DIALOG_END) is
+    // gone: the reconcile reads the final latched state.
     if (clientDialogActive()) {
         gameDialogInitControlWindow();
     }
@@ -5568,7 +5996,6 @@ void inventoryOpenTradeViewer(Object* merchant, Object* playerTable, Object* mer
     _stack[0] = savedStack0;
     // Restore the item-description handler we routed to a sink for the trade (the
     // loop only breaks, never returns, so this is the one exit past that swap).
-    gInventoryPrintItemDescriptionHandler = savedDescHandler;
     inventoryCommonFree();
 }
 

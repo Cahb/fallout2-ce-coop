@@ -33,6 +33,9 @@ echo "=== run  F2_SERVER_MAP=$MAP  (ticks=$TICKS)  in $GAME_DIR -> $LOG"
     -ex "set confirm off" \
     -ex "set env F2_SERVER_MAP=$MAP" \
     -ex "set env F2_SERVER_TICKS=$TICKS" \
+    `# Pin the per-tick pacing sleep: its default belongs to live play, and under a` \
+    `# debugger a 100ms/tick sleep makes a stepping session unusable. Harnesses opt out.` \
+    -ex "set env F2_SERVER_PACE_MS=0" \
     -ex "run" \
     -ex "bt 40" \
     "$ROOT/build/f2_server" 2>&1) | tee "$LOG"

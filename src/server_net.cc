@@ -436,6 +436,17 @@ bool SocketByteSink::hasSession(int sessionId) const
     return false;
 }
 
+bool SocketByteSink::closeSession(int sessionId)
+{
+    for (size_t i = 0; i < _clients.size(); i++) {
+        if (_clients[i].sessionId == sessionId) {
+            dropClient(i, "kicked");
+            return true;
+        }
+    }
+    return false;
+}
+
 void SocketByteSink::dropClient(size_t index, const char* why)
 {
     fprintf(stderr, "f2_server: client dropped (%s), %zu remain\n", why, _clients.size() - 1);

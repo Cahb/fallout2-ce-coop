@@ -40,9 +40,19 @@
 
 namespace fallout {
 
+// ►►►► LOOKING IS PRIVATE. This bridge used to call the BROADCAST consoleMessage, so
+// every description any player read was printed on everybody's screen — owner-observed
+// as "P2 inspects and the whole server is told <you see xyz with a spear 35/35>". Worse
+// than noise: with Awareness the line carries the target's exact HP and weapon, so one
+// player's perk silently leaked its intel to seats that had not earned it.
+//
+// consoleMessageFor(0, …) IS the old broadcast, byte-for-byte (presenter_network special-
+// cases address 0), so every OTHER user of this bridge — the inventory's description
+// callback, single player, the golden probes — is unchanged. Only the paths that open a
+// PresenterNarrationScope below become per-seat.
 static void presenterConsoleMessageBridge(char* string)
 {
-    presenter()->consoleMessage(string);
+    presenter()->consoleMessageFor(presenterNarrationAddress(), string);
 }
 
 static int _obj_remove_from_inven(Object* critter, Object* item);
@@ -183,6 +193,10 @@ int _obj_new_sid_inst(Object* obj, int scriptType, int scriptIndex)
 // 0x49AC3C
 int _obj_look_at(Object* a1, Object* a2)
 {
+    // Address the description to whoever looked (see presenterConsoleMessageBridge).
+    // netId 0 — single player, a scripted critter, an actor with no wire identity —
+    // means broadcast, which is the pre-existing behavior verbatim.
+    PresenterNarrationScope narration(a1 != nullptr ? a1->netId : 0);
     return _obj_look_at_func(a1, a2, presenterConsoleMessageBridge);
 }
 
@@ -241,6 +255,9 @@ int _obj_look_at_func(Object* a1, Object* a2, void (*a3)(char* string))
 // 0x49AD78
 int _obj_examine(Object* a1, Object* a2)
 {
+    // Same as _obj_look_at: the examine text, including the Awareness HP/weapon line,
+    // belongs to the player who examined and to nobody else.
+    PresenterNarrationScope narration(a1 != nullptr ? a1->netId : 0);
     return _obj_examine_func(a1, a2, presenterConsoleMessageBridge);
 }
 
@@ -797,14 +814,16 @@ static int _obj_use_book(Object* book)
         }
     }
 
-    presenter()->screenFadeOut();
+    // Reading a book is the reader's hour, not everyone's: this runs inside the acting
+    // player's ServerActorScope, so gDude IS whoever opened the book.
+    presenter()->screenFadeOut(gDude != nullptr ? gDude->netId : 0);
 
     int intelligence = critterGetStat(gDude, STAT_INTELLIGENCE);
     gameTimeAddSeconds(3600 * (11 - intelligence));
 
     scriptsExecMapUpdateProc();
 
-    presenter()->screenFadeIn();
+    presenter()->screenFadeIn(gDude != nullptr ? gDude->netId : 0);
 
     // You read the book.
     messageListItem.num = 800;
@@ -1939,7 +1958,30 @@ int _obj_use_container(Object* critter, Object* item)
     if (serverLoopActive()) {
         bool opening = (item->frame == 0);
         const char* sfx = sfxBuildOpenName(item, opening ? SCENERY_SOUND_EFFECT_OPEN : SCENERY_SOUND_EFFECT_CLOSED);
-        item->frame = opening ? 1 : 0;
+
+        // ►►►► DELIBERATE VANILLA DIVERGENCE — THIS IS THE "CAR TRUNK DISAPPEARED" BUG.
+        // Vanilla assigns item->frame directly here, bypassing objectSetFrame — which
+        // would have REFUSED it (`if (frame >= framesPerDirection) return -1`,
+        // object.cc:1555). Most container art has 2 frames (closed/open) so frame 1 is
+        // fine. But `cartrunk.frm` has framesPerDirection == 1, so opening the car trunk
+        // ONCE sets frame=1, which is out of range, and an out-of-range frame renders
+        // NOTHING — the trunk becomes permanently invisible (and unclickable, its rect
+        // being derived from art it no longer has). frame is serialized, so the save
+        // carries the damage forever. Owner-hit: a visible car with no trunk, surviving
+        // reloads and map cycles, while every server-side field looked perfectly healthy.
+        //
+        // Fix: only advance to the open frame when the art actually HAS one. A 1-frame
+        // container just stays on frame 0 — it plays its sound and opens its inventory,
+        // it simply has no distinct "open" sprite to show, which is the truth about its
+        // art. Same class as [[frame-index-render-gotcha]] (the S5 corpse bug).
+        int frameCount = 1;
+        CacheEntry* frameArtHandle;
+        Art* frameArt = artLock(item->fid, &frameArtHandle);
+        if (frameArt != nullptr) {
+            frameCount = artGetFrameCount(frameArt);
+            artUnlock(frameArtHandle);
+        }
+        item->frame = (opening && frameCount > 1) ? 1 : 0;
 
         presRecordSectionBegin();
         reg_anim_begin(ANIMATION_REQUEST_RESERVED);

@@ -69,11 +69,10 @@ run_server() {
 # scratch (keyed on this script's PID) keeps concurrent clients from clobbering
 # each other's reassembly. Foreground, so Ctrl-C disconnects this client cleanly.
 run_client() {
-    local tmp="/tmp/f2ce_client_$$.bin"
     echo "client: connecting to $HOST:$WIRE_PORT (join scratch $tmp)"
     echo "  first viewer to connect controls; later viewers spectate (claim refused)."
     ( cd "$GAME" && exec env F2_CLIENT_CONNECT="$HOST:$WIRE_PORT" F2_WINDOWED=1 \
-        F2_JOIN_TMP_CLIENT="$tmp" "$ROOT/build/fallout2-ce" )
+        "$ROOT/build/fallout2-ce" )
 }
 
 # All-in-one: server (background) + controller viewer + optional spectators, torn
@@ -91,7 +90,7 @@ run_all() {
     # Controller connects FIRST (backgrounded) so it wins the control claim; the
     # script then blocks on it (wait), exactly as the old foreground launch did.
     ( cd "$GAME" && exec env F2_CLIENT_CONNECT="$HOST:$WIRE_PORT" \
-        ${windowed:+F2_WINDOWED=1} F2_JOIN_TMP_CLIENT="/tmp/f2ce_ctrl_$$.bin" \
+        ${windowed:+F2_WINDOWED=1} \
         "$ROOT/build/fallout2-ce" ) &
     CTRL=$!
 
@@ -101,7 +100,7 @@ run_all() {
         for i in $(seq 1 "$SPECTATORS"); do
             echo "spectator $i: connecting (watch-only — claim will be refused)"
             ( cd "$GAME" && exec env F2_CLIENT_CONNECT="$HOST:$WIRE_PORT" F2_WINDOWED=1 \
-                F2_JOIN_TMP_CLIENT="/tmp/f2ce_spectator_$i.bin" "$ROOT/build/fallout2-ce" ) &
+                "$ROOT/build/fallout2-ce" ) &
             SPEC_PIDS="$SPEC_PIDS $!"
             sleep 3
         done

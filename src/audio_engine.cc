@@ -10,7 +10,19 @@
 
 namespace fallout {
 
-#define AUDIO_ENGINE_SOUND_BUFFERS 8
+// ►► 8 WAS THE SILENCE. This is the mixer's whole slot pool — music, the ambient
+// bed, speech and EVERY sound effect come out of it — and gameSoundInit already
+// asks soundInit for 24, so the engine was the narrower half of its own contract.
+// Vanilla combat never noticed: it is strictly one animation at a time, so four
+// concurrent effects (SOUND_EFFECTS_MAX_COUNT) was more headroom than it could
+// use. Our paced presentation is not sequential — a turn boundary with a dozen
+// hostiles fires their cues together — and the pool ran dry mid-burst, at which
+// point soundEffectLoad returns nullptr and the NEXT effect is simply not played.
+// That is the "the gunshot had no sound" report: nothing failed loudly, an actor
+// just went quiet. 24 matches what soundInit is told; the array holds descriptors
+// only (each buffer's samples are malloc'd on create and freed on release), so the
+// cost of the raise is a few hundred bytes and a longer walk in the mix callback.
+#define AUDIO_ENGINE_SOUND_BUFFERS 24
 
 struct AudioEngineSoundBuffer {
     bool active;

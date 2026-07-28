@@ -24,12 +24,14 @@
 #include "game_sound.h"
 #include "input.h"
 #include "interface.h"
+#include "inventory.h" // _invenUnwieldFunc — a destroyed weapon leaves the sprite too
 #include "item.h"
 #include "kb.h"
 #include "loadsave.h"
 #include "map.h"
 #include "memory.h"
 #include "message.h"
+#include "msg_channel.h" // kMsgChannelReward — XP payout is addressed to its earner
 #include "object.h"
 #include "party_member.h"
 #include "perk.h"
@@ -38,6 +40,7 @@
 #include "pres_record.h"
 #include "presenter.h"
 #include "proto.h"
+#include "proto_instance.h" // _obj_drop / _obj_destroy — crit-failure weapon outcomes
 #include "queue.h"
 #include "random.h"
 #include "scripts.h"
@@ -2541,6 +2544,63 @@ static int _combatAIInfoSetLastMove(Object* object, int move)
 }
 
 // 0x421A34
+// ►►►► ARM A COMBATANT'S BODY AT COMBAT ENTRY, before anything can hold the delta.
+//
+// A critter that walked into the fight already holding a weapon has an UNARMED fid: the
+// armed fid is derived by _invenWieldFunc, which only runs on an explicit wield. Arming it
+// at the attack (below, in _combat_attack) fixes the server but lands too late for the
+// VIEWER — the client deliberately HOLDS an attack participant's fid until its replay
+// finishes (client_net.cc, S4 deferred-final-state), so the fid meant to ENABLE the
+// animation arrives after it. Owner-observed as "unequipped -> throw -> ... -> armed".
+//
+// The distinction worth keeping: an OUTCOME fid (a death pose) must be held until the
+// animation that earns it finishes; an ENABLING fid (the body that the animation is drawn
+// from) must be in place BEFORE it plays. Combat entry is the natural place — no sequence
+// has been recorded yet, so nothing reserves the critter and the delta applies at once.
+//
+// artExists-guarded; frame is reset with the fid because objectSetFid does not touch it.
+// serverDedicatedActive so the headless golden probe keeps its byte stream.
+static void combatArmCritterFid(Object* critter)
+{
+    if (!serverDedicatedActive() || critter == nullptr || critterIsDead(critter)) {
+        return;
+    }
+
+    // Whichever hand holds a weapon decides the body. Right hand first, matching the
+    // engine's own default hand.
+    Object* weapon = critterGetItem2(critter);
+    if (weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+        weapon = critterGetItem1(critter);
+    }
+    if (weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+        return; // empty-handed: an unarmed body is already correct
+    }
+
+    int weaponAnimationCode = weaponGetAnimationCode(weapon);
+    int currentCode = (critter->fid & 0xF000) >> 12;
+    if (weaponAnimationCode == currentCode) {
+        return;
+    }
+
+    // ►► PRESERVE THE CURRENT ANIM. Forcing ANIM_STAND writes a standing pose onto a
+    // critter that may be mid-walk, and the client's walk then finds the object wearing a
+    // fid its animation did not ask for — owner's log flooded with
+    // "[walk] FID-FOREIGN got=0x100400C exp=0x10E400C" (stand vs walk, same weapon
+    // nibble). Swap ONLY the weapon nibble and leave the pose alone: arming is about what
+    // the hands hold, not what the body is doing.
+    int armedFid = buildFid(OBJ_TYPE_CRITTER, critter->fid & 0xFFF,
+        FID_ANIM_TYPE(critter->fid), weaponAnimationCode, critter->rotation + 1);
+    if (!artExists(armedFid)) {
+        return; // no armed art for this body; the inven_wield diagnostic covers it
+    }
+
+    fprintf(stderr, "f2_server: arming net=%d at combat entry: fid 0x%x -> 0x%x "
+                    "(weapon pid=%d animCode=%d, was %d)\n",
+        critter->netId, critter->fid, armedFid, weapon->pid, weaponAnimationCode, currentCode);
+    critter->frame = 0;
+    objectSetFid(critter, armedFid, nullptr);
+}
+
 static void _combat_begin(Object* attacker)
 {
     _combat_turn_running = 0;
@@ -2577,6 +2637,9 @@ static void _combat_begin(Object* attacker)
 
             // NOTE: Uninline.
             _combatAIInfoSetLastMove(critter, 0);
+
+            // Make the body match the weapon before any sequence is recorded.
+            combatArmCritterFid(critter);
 
             scriptSetObjects(critter->sid, nullptr, nullptr);
             scriptSetFixedParam(critter->sid, 0);
@@ -2877,12 +2940,18 @@ void _combat_give_exps(int exp_points, Object* earner)
     int xpGained;
     pcAddExperience(exp_points, &xpGained, subject);
 
-    // The award above is per-actor; the LINE below is not. It is the host's
-    // console, so an extra earns silently until per-client message routing
-    // exists — which also spares the host a wall of "you earn N exp" lines for
-    // kills that were not theirs. Note the flavour roll is inside this gate, so
-    // an extra's payout consumes no RNG (it must not: the sim is shared).
-    if (subject != gDude) {
+    // ►► THE LINE GOES TO WHOEVER EARNED IT. This used to return early for anyone
+    // but the host, so an extra player killed something and was paid in complete
+    // silence — XP and levels arriving with nothing on their screen to say why. It
+    // is ADDRESSED rather than broadcast because the text is second-person ("you
+    // earn"), and because at N players a broadcast copy per kill is a wall of other
+    // people's payouts.
+    //
+    // The flavour roll now runs for every earner, one draw per line actually read.
+    // It was previously inside the host gate to keep an extra's payout from
+    // consuming RNG; that is still true where it matters — with one player actor
+    // nothing here changes at all.
+    if (!playerActorIs(subject)) {
         return;
     }
 
@@ -2893,8 +2962,9 @@ void _combat_give_exps(int exp_points, Object* earner)
 
     v9.num = randomBetween(0, 3) + 622; // generate prefix for message
 
-    current_hp = critterGetStat(gDude, STAT_CURRENT_HIT_POINTS);
-    max_hp = critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS);
+    // "...without taking a scratch" is about the EARNER's own hide, not the host's.
+    current_hp = critterGetStat(subject, STAT_CURRENT_HIT_POINTS);
+    max_hp = critterGetStat(subject, STAT_MAXIMUM_HIT_POINTS);
     if (current_hp == max_hp && randomBetween(0, 100) > 65) {
         v9.num = 626; // Best possible prefix: For destroying your enemies without taking a scratch,
     }
@@ -2904,7 +2974,7 @@ void _combat_give_exps(int exp_points, Object* earner)
     }
 
     snprintf(text, sizeof(text), v7.text, v9.text, xpGained);
-    presenter()->consoleMessage(text);
+    presenter()->consoleMessageStyled(subject->netId, kMsgChannelReward, text);
 }
 
 // 0x4222A8
@@ -3592,14 +3662,14 @@ static void combatTeardown()
 // already file-local and gated on serverLoopActive().
 // ===========================================================================
 
-// Gate: server loop active AND F2_SERVER_RESUMABLE_COMBAT=1. Env cached like
-// server_anim.cc's smoothWalkEnabled(); serverLoopActive() checked live.
+// Gate: server loop active AND the resumable-combat feature enabled. DEFAULT ON for a
+// server and OFF under the headless probe (serverFeatureEnabled) — beat-spanning combat is
+// basic co-op behaviour, not an experiment, and without it there is no combat presentation
+// and no player-started combat at all. Env cached like server_anim.cc's smoothWalkEnabled();
+// serverLoopActive() checked live. F2_SERVER_RESUMABLE_COMBAT=0 disables.
 static bool combatResumableEnabled()
 {
-    static bool enabled = [] {
-        const char* v = getenv("F2_SERVER_RESUMABLE_COMBAT");
-        return v != nullptr && strcmp(v, "1") == 0;
-    }();
+    static bool enabled = serverFeatureEnabled("F2_SERVER_RESUMABLE_COMBAT");
     return serverLoopActive() && enabled;
 }
 
@@ -4369,6 +4439,49 @@ int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocat
             attacker->netId, attacker->fid, _main_ctd.hitMode,
             h1 ? h1->pid : -1, h2 ? h2->pid : -1);
     }
+
+    // ►►►► ARM THE BODY BEFORE THE ANIMATION IS BUILT.
+    // Owner-hit on a slaver run: critters attack while HOLDING a weapon (item2_pid=7/4)
+    // but with a fid whose weapon-animation nibble is 0 — an UNARMED body. The attack
+    // animation is composed from the attacker's fid, so an unarmed body swinging a spear
+    // either renders a punch or, when that (body, hit-mode) art does not exist, renders
+    // NOTHING: the "0-frame hit" in the banked viewer bugs. It also means every client
+    // draws the critter empty-handed, which is what the owner actually reported.
+    //
+    // Why the fid is wrong: the armed fid is derived by _invenWieldFunc, and that only
+    // runs when something explicitly WIELDS. A critter that entered the fight already
+    // holding a weapon (map-placed, or restored from a save) never went through it — and
+    // the log shows the proof: after an AI pickup+wield the same critter attacks with
+    // fid 0x1004040 (nibble 4) and animates correctly, while its earlier attacks used
+    // 0x1000040 (nibble 0).
+    //
+    // So re-derive it here, at the moment of the attack, from the weapon the attack
+    // itself names. artExists-guarded: if the body genuinely has no armed art we leave
+    // the fid alone and the pre-existing inven_wield diagnostic covers it. frame is reset
+    // with the fid because objectSetFid does NOT touch it, and a stale index past the new
+    // art's frame count renders nothing ([[frame-index-render-gotcha]]).
+    // serverDedicatedActive so the headless golden probe keeps its exact byte stream.
+    if (serverDedicatedActive() && _main_ctd.weapon != nullptr) {
+        int weaponAnimationCode = weaponGetAnimationCode(_main_ctd.weapon);
+        int currentCode = (attacker->fid & 0xF000) >> 12;
+        if (weaponAnimationCode != currentCode) {
+            // Same reasoning as combatArmCritterFid: swap the weapon nibble, keep the pose.
+            int armedFid = buildFid(OBJ_TYPE_CRITTER, attacker->fid & 0xFFF,
+                FID_ANIM_TYPE(attacker->fid), weaponAnimationCode, attacker->rotation + 1);
+            if (artExists(armedFid)) {
+                fprintf(stderr, "f2_server: arming net=%d for the attack: fid 0x%x -> 0x%x "
+                                "(weapon pid=%d animCode=%d, was %d)\n",
+                    attacker->netId, attacker->fid, armedFid, _main_ctd.weapon->pid,
+                    weaponAnimationCode, currentCode);
+                attacker->frame = 0;
+                objectSetFid(attacker, armedFid, nullptr);
+            } else if (getenv("F2_TRACE_EVENTS") != nullptr) {
+                fprintf(stderr, "[satk] net=%d has NO armed art for animCode=%d (fid 0x%x) — "
+                                "leaving it unarmed\n",
+                    attacker->netId, weaponAnimationCode, armedFid);
+            }
+        }
+    }
     bool recording = combatAttackRecorded(attacker, _main_ctd.hitMode);
     if (!serverLoopActive() || recording) {
         if (recording) {
@@ -4736,22 +4849,35 @@ static int attackCompute(Attack* attack)
         }
     }
 
+    // TEST HOOK (`crithit <slot>` / `critfail <slot>`): force THIS seat's armed critical.
+    // Placed at the ROLL, so everything downstream — the switch below, the crit tables,
+    // the effect flags, the state application, the narration — runs exactly as it would
+    // have on a lucky die. Forcing the OUTCOME instead would test the hook, not the game.
+    // One-shot per arming (take = read + clear); a non-player attacker maps to slot -1 and
+    // does not consume it. Nothing happens unless a verb armed a seat.
+    if (attack->attacker != nullptr) {
+        int forcedCrit = serverActorTakeForceCrit(playerActorSlotOf(attack->attacker));
+        if (forcedCrit == kForceCritHit) {
+            roll = ROLL_CRITICAL_SUCCESS;
+        } else if (forcedCrit == kForceCritFail) {
+            roll = ROLL_CRITICAL_FAILURE;
+        }
+    }
+
     if (roll == ROLL_SUCCESS) {
         if ((attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) && playerActorIs(attack->attacker)) {
             if (perkHasRank(attack->attacker, PERK_SLAYER)) {
                 roll = ROLL_CRITICAL_SUCCESS;
             }
 
-            // ⚠ SILENT DEATH stays HOST-ONLY, deliberately. It is gated on
-            // dudeHasState(DUDE_STATE_SNEAKING), which is still a PC-GLOBAL —
-            // generalizing the perk without generalizing sneak would grant an
-            // extra a x4 backstab whenever the HOST happened to be sneaking.
-            // Unblocks when sneak becomes per-actor (PLAYER_SHEET_DESIGN.md §8).
-            if (attack->attacker == gDude
-                && perkHasRank(gDude, PERK_SILENT_DEATH)
-                && !_is_hit_from_front(gDude, attack->defender)
-                && dudeHasState(DUDE_STATE_SNEAKING)
-                && gDude != attack->defender->data.critter.combat.whoHitMe) {
+            // SILENT DEATH is per-attacker now that the sneak state is per-actor
+            // (dudeHasState takes a subject). It was held host-only for exactly one
+            // reason — the flag was a PC-global, so generalizing the perk alone would
+            // have handed an extra a x4 backstab whenever the HOST was sneaking.
+            if (perkHasRank(attack->attacker, PERK_SILENT_DEATH)
+                && !_is_hit_from_front(attack->attacker, attack->defender)
+                && dudeHasState(DUDE_STATE_SNEAKING, attack->attacker)
+                && attack->attacker != attack->defender->data.critter.combat.whoHitMe) {
                 damageMultiplier = 4;
             }
 
@@ -4792,13 +4918,12 @@ static int attackCompute(Attack* attack)
         damageMultiplier = attackComputeCriticalHit(attack);
 
         // SFALL: Fix Silent Death bonus not being applied to critical hits.
-        // Host-only for the same reason as the other Silent Death site above:
-        // it is gated on the PC-global sneak state, not on a per-actor one.
-        if ((attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) && attack->attacker == gDude) {
-            if (perkHasRank(gDude, PERK_SILENT_DEATH)
-                && !_is_hit_from_front(gDude, attack->defender)
-                && dudeHasState(DUDE_STATE_SNEAKING)
-                && gDude != attack->defender->data.critter.combat.whoHitMe) {
+        // Per-attacker for the same reason as the site above.
+        if ((attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) && playerActorIs(attack->attacker)) {
+            if (perkHasRank(attack->attacker, PERK_SILENT_DEATH)
+                && !_is_hit_from_front(attack->attacker, attack->defender)
+                && dudeHasState(DUDE_STATE_SNEAKING, attack->attacker)
+                && attack->attacker != attack->defender->data.critter.combat.whoHitMe) {
                 damageMultiplier *= 2;
             }
         }
@@ -5062,6 +5187,13 @@ static int attackComputeCriticalFailure(Attack* attack)
 {
     attack->attackerFlags &= ~DAM_HIT;
 
+    // Consumed FIRST, before any early return, so an arming is always spent by the attack
+    // it was armed for — otherwise an invulnerable attacker or the six-day grace below
+    // would silently carry it to some later, unrelated critical failure. -1 = dice pick.
+    int forcedSeverity = attack->attacker != nullptr
+        ? serverActorTakeForceCritSeverity(playerActorSlotOf(attack->attacker))
+        : -1;
+
     if (attack->attacker != nullptr && _critter_flag_check(attack->attacker->pid, CRITTER_INVULNERABLE)) {
         return 0;
     }
@@ -5096,6 +5228,15 @@ static int attackComputeCriticalFailure(Attack* attack)
         effect = 3;
     else
         effect = 4;
+
+    // `critfail <slot> <0-4>` pins the column. The severity roll above is INDEPENDENT of the
+    // forced critical, and only column 4 carries the weapon explosion — which the LUCK term
+    // makes rarer the better the character is — so without this the interesting effects stay
+    // unreachable. The randomBetween above still runs, keeping the RNG stream (and therefore
+    // the goldens) where it was.
+    if (forcedSeverity >= 0 && forcedSeverity <= 4) {
+        effect = forcedSeverity;
+    }
 
     int flags = _cf_table[criticalFailureTableIndex][effect];
     if (flags == 0) {
@@ -5469,8 +5610,35 @@ static void attackComputeDamage(Attack* attack, int ammoQuantity, int bonusDamag
         int damageMultiplier = bonusDamageMultiplier * weaponGetAmmoDamageMultiplier(attack->weapon);
         int damageDivisor = weaponGetAmmoDamageDivisor(attack->weapon);
 
+        // ►► F2_TRACE_DAMAGE=1 — the damage calc INSIDE the deciding branch.
+        //
+        // "No damage" has been reasoned about from the outside repeatedly and patched more
+        // than once without the reports going away, which is the signal to stop inferring
+        // and print what the arithmetic actually did. Every term, per shot, so a zero can be
+        // attributed instead of theorised: a DT that ate it, a DR of 100, a multiplier of 1
+        // against the vanilla /2, a weaponGetDamage of 0, or a real 0 that the NARRATION is
+        // simply mis-reporting (a different bug, and this tells the two apart immediately).
+        //
+        // fprintf, not debugPrint: f2_server DROPS every debugPrint.
+        bool traceDamage = getenv("F2_TRACE_DAMAGE") != nullptr;
+        if (traceDamage) {
+            fprintf(stderr,
+                "[dmg] ctd=%p attacker=%s(net=%d) defender=%s(net=%d) %s weapon=%s hitMode=%d type=%d\n"
+                "[dmg]   DT=%d DR=%d bonus=%d mult=%d div=%d diffMod=%d rounds=%d\n",
+                (void*)attack,
+                critterGetName(attack->attacker), attack->attacker->netId,
+                critter != nullptr ? critterGetName(critter) : "(none)",
+                critter != nullptr ? critter->netId : 0,
+                (attack->attackerFlags & DAM_HIT) != 0 ? "HIT" : "SELF/MISS",
+                attack->weapon != nullptr ? itemGetName(attack->weapon) : "(unarmed)",
+                attack->hitMode, damageType,
+                damageThreshold, damageResistance, damageBonus, damageMultiplier,
+                damageDivisor, combatDifficultyDamageModifier, ammoQuantity);
+        }
+
         for (int index = 0; index < ammoQuantity; index++) {
             int damage = weaponGetDamage(attack->attacker, attack->hitMode);
+            int rawRoll = damage;
 
             damage += damageBonus;
 
@@ -5482,19 +5650,37 @@ static void attackComputeDamage(Attack* attack, int ammoQuantity, int bonusDamag
 
             // TODO: Why we're halving it?
             damage /= 2;
+            int afterHalving = damage;
 
             damage *= combatDifficultyDamageModifier;
             damage /= 100;
 
             damage -= damageThreshold;
+            int afterThreshold = damage;
 
             if (damage > 0) {
                 damage -= damage * damageResistance / 100;
             }
 
+            if (traceDamage) {
+                fprintf(stderr,
+                    "[dmg]   shot %d: roll=%d -> x%d/2=%d -> -DT=%d -> -DR=%d %s\n",
+                    index, rawRoll, damageMultiplier, afterHalving, afterThreshold, damage,
+                    damage > 0 ? "" : "<<< ZERO");
+            }
+
             if (damage > 0) {
                 *damagePtr += damage;
             }
+        }
+
+        if (traceDamage) {
+            // Print WHERE the total landed, not just its value: [dmg-say] reports a 0 for the
+            // same field, so the open question is whether this is the same struct (something
+            // resets it later) or a different one (the narrated attack never saw this damage).
+            fprintf(stderr, "[dmg]   TOTAL=%d -> %s@%p\n", *damagePtr,
+                (attack->attackerFlags & DAM_HIT) != 0 ? "defenderDamage" : "attackerDamage",
+                (void*)damagePtr);
         }
     }
 
@@ -5840,7 +6026,7 @@ static void _combat_apply_attack_results(bool animated)
     }
 
     if (_combat_call_display) {
-        _combat_display(&_main_ctd);
+        combatNarrateAttack(&_main_ctd);
         _combat_call_display = false;
     }
 
@@ -5925,6 +6111,77 @@ static void _combat_apply_attack_results(bool animated)
     // tiles were captured pre-damage; independent of the _main_ctd re-init below.
     if (!animated) {
         _combat_commit_knockback(kbVictims, kbDests, kbCount);
+    }
+
+    // ►►►► CRITICAL-FAILURE WEAPON OUTCOMES — state that has been riding a PRESENTATION
+    // channel, and so has never once happened on this server. Owner-reported as "you
+    // critically missed and your weapon was destroyed; yet I still can reload it, it's
+    // in my hands".
+    //
+    // DAM_DESTROY / DAM_DROP have exactly ONE consumer in the tree (actions.cc:590-594),
+    // and it registers ANIMATION CALLBACKS. Two things then eat them on a dedicated
+    // server: the callbacks are filtered by the allowlist in server_anim.cc (which admits
+    // neither), and more fundamentally `_action_attack` — the only path that reaches that
+    // code at all — runs here ONLY when the attack is being RECORDED (the
+    // `!serverLoopActive() || recording` gate above). So the outcome was mode-dependent
+    // even in principle, which is why allowlisting the callbacks is the WRONG fix: it
+    // would give record mode a destroyed weapon and non-record mode an intact one, the
+    // same trap that keeps `_show_death` out of that list (server_anim.cc:1159-1167) and
+    // the defect shape the record-purity gate exists to catch.
+    //
+    // Here is mode-invariant by construction: this function runs on every server attack,
+    // in both modes, at the same point in the same order. The animated (client) path
+    // passes animated=true and still applies the outcome through its real animation
+    // callback, so nothing double-applies. Third instance of the pattern already in this
+    // function — see the critterKill and thrown-weapon blocks above.
+    //
+    // Placed AFTER attackResult/knockback deliberately: those read _main_ctd.weapon, and
+    // destroying it first would hand them a freed pointer. Viewers learn through the
+    // ordinary object-destroy/inventory streaming, not the record channel.
+    //
+    // The narration was never the liar — combatNarrateAttack reads the COMPUTED flags, so
+    // it printed the truth about a consequence nothing had applied.
+    //
+    // ►► ATTACKER SIDE ONLY, and that is a finding rather than an omission. Vanilla hands
+    // `attack->weapon` — the ATTACKER's weapon — to EVERY _show_damage_to_object call,
+    // including the defender's (actions.cc:742/746), so wiring defenderFlags through the
+    // same object would make a defender's disarm crit destroy the ATTACKER's gun. That is
+    // vanilla's own defect; both readings change behaviour, so it needs a ruling, not a
+    // guess.
+    //
+    // ►► DAM_EXPLODE now DESTROYS the weapon too (owner ruling 2026-07-27, previously held
+    // back). Vanilla's state half is drop-then-HIDE, and "hidden" is not "destroyed" — a
+    // hidden netId'd object loose on a co-op map is a worse server state than no object.
+    // The ruling was made on GAMEPLAY grounds, where the two are indistinguishable: either
+    // way the gun is gone from your hands and you took the blast. The other two thirds of
+    // DAM_EXPLODE already worked and are untouched — self-damage (attackComputeCriticalFailure)
+    // and the blast catching nearby critters (_compute_explosion_on_extras); the weapon
+    // disposal was the only half stranded in the animation-callback path.
+    if (!animated && _main_ctd.attacker != nullptr && _main_ctd.weapon != nullptr
+        && (_main_ctd.attackerFlags & (DAM_DESTROY | DAM_EXPLODE | DAM_DROP)) != 0) {
+        // UNWIELD FIRST, then dispose. The weapon lives in two places — the inventory and
+        // the critter's fid (bits 0xF000 are the weapon animation code, i.e. what the sprite
+        // is holding) — and _invenUnwieldFunc is the one function that takes both. Vanilla
+        // gets away without calling it here because its callback path is followed by an
+        // attack animation that rewrites the fid anyway; applying the outcome directly (what
+        // makes it mode-invariant) has to go through the same door. Unanimated: the server
+        // owns the result and the fid change streams as an ordinary OBJECT_DELTA_FID.
+        _invenUnwieldFunc(_main_ctd.attacker,
+            (_main_ctd.weapon->flags & OBJECT_IN_LEFT_HAND) != 0 ? HAND_LEFT : HAND_RIGHT,
+            false);
+
+        if ((_main_ctd.attackerFlags & (DAM_DESTROY | DAM_EXPLODE)) != 0) {
+            _obj_destroy(_main_ctd.weapon);
+        } else {
+            _obj_drop(_main_ctd.attacker, _main_ctd.weapon);
+        }
+
+        // The unwield above only touches the fid when the hand it was given matches the
+        // ACTIVE one, and server/client do not always agree which that is — measured live:
+        // the client's interface said LEFT while the server registry default said RIGHT, so
+        // the sprite kept the destroyed weapon. Re-derive from the hands now that they are
+        // actually empty; that has no active-hand dependency to get wrong.
+        invenRederiveWeaponFid(_main_ctd.attacker);
     }
 
     // Idle-deadline pacing (server_loop.h): an AI attack adds a swing estimate to the

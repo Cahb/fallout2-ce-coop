@@ -8,15 +8,15 @@ namespace fallout {
 extern int gCharacterEditorRemainingCharacterPoints;
 
 int characterEditorShow(bool isCreationMode);
-// The co-op viewer's character sheet: characterEditorShow(0) with every edit
-// rolled back on the way out. See the definition for why.
+// The co-op player's character sheet: characterEditorShow(0) whose spends EMIT
+// WIRE INTENTS instead of mutating locally. See the definition.
 int characterEditorShowViewOnly();
 void characterEditorInit();
 bool _isdoschar(int ch);
-// Live in character_editor_state.cc so the savegame driver in f2_core can
-// reach them; the editor screen owns only the undo copies.
+// Lives in character_editor_state.cc so the savegame driver in f2_core can reach
+// it; the editor screen owns only the undo copy. The owed PERK moved to
+// perkOwedPickGet/Set (per player — this one is per process).
 extern int gCharacterEditorLastLevel;
-extern unsigned char gCharacterEditorHasFreePerk;
 
 int characterEditorSave(File* stream);
 int characterEditorLoad(File* stream);

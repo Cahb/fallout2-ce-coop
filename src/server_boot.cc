@@ -453,7 +453,14 @@ int serverBootLoadSlot(int slot)
     char gcdPath[COMPAT_MAX_PATH];
     strcpy(gcdPath, "premade\\combat.gcd");
     if (_proto_dude_init(gcdPath) == -1) {
-        debugPrint("server-boot: dude init failed\n");
+        // ►► stderr, NOT debugPrint: f2_server installs no debug output handler, so
+        // every diagnostic on this path was being dropped and a failed boot printed
+        // exactly one useless line ("boot failed for slot 11"). An operator whose save
+        // will not load has nothing to act on, and neither does anyone reading a bug
+        // report. Owner-hit, and the whole reason it read as "this stuff is annoying".
+        fprintf(stderr, "f2_server: load slot %d: DUDE INIT FAILED (premade '%s' unreadable — "
+                        "is the CWD the game dir?)\n",
+            slot + 1, gcdPath);
         return -1;
     }
 
@@ -465,7 +472,13 @@ int serverBootLoadSlot(int slot)
     savegameRefreshPatchesPath();
     savegameSetSlot(slot);
     if (lsgLoadGameInSlot(slot) == -1) {
-        debugPrint("server-boot: load of slot %d failed (error %d)\n", slot + 1, savegameGetErrorCode());
+        // Error 1 is vanilla's "this save was made by a different version"; anything
+        // else is a read/parse failure part-way through, which on THIS server usually
+        // means a truncated slot (killed mid-write) or a map .SAV the loader choked on.
+        int code = savegameGetErrorCode();
+        fprintf(stderr, "f2_server: load slot %d FAILED (ls_error_code=%d%s)\n",
+            slot + 1, code,
+            code == 1 ? " = save made by an incompatible version" : "");
         return -1;
     }
 

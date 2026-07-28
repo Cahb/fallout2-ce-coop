@@ -1824,20 +1824,22 @@ int actionUseSkill(Object* user, Object* target, int skill)
 
         return -1;
     case SKILL_SNEAK:
-        dudeToggleState(DUDE_STATE_SNEAKING);
+        // The user's own state — this is reached from the server's `skill` verb too,
+        // where `user` is the acting player and not necessarily the host.
+        dudeToggleState(DUDE_STATE_SNEAKING, user);
         return 0;
     default:
         debugPrint("\nskill_use: invalid skill used.");
     }
 
-    // Performer is either dude, or party member who's best at the specified
-    // skill in entire party, and this skill is his/her own best.
-    Object* performer = gDude;
+    // Performer is either the acting player, or the party member who's best at the
+    // specified skill in the entire party, and this skill is his/her own best.
+    Object* performer = user != nullptr ? user : gDude;
 
-    if (user == gDude) {
-        Object* partyMember = partyMemberGetBestInSkill(skill);
+    if (playerActorIs(user)) {
+        Object* partyMember = partyMemberGetBestInSkill(skill, user);
 
-        if (partyMember == gDude) {
+        if (partyMember == user) {
             partyMember = nullptr;
         }
 
@@ -1857,7 +1859,7 @@ int actionUseSkill(Object* user, Object* target, int skill)
             int anim = FID_ANIM_TYPE(partyMember->fid);
             if (anim != ANIM_WALK && anim != ANIM_RUNNING) {
                 if (anim != ANIM_STAND) {
-                    performer = gDude;
+                    performer = user;
                     partyMember = nullptr;
                 }
             } else {
@@ -1866,8 +1868,10 @@ int actionUseSkill(Object* user, Object* target, int skill)
         }
 
         if (partyMember != nullptr) {
+            // "Is the acting player already standing on it?" — if so they do it
+            // themselves rather than sending a companion over.
             bool isDude = false;
-            if (objectGetDistanceBetween(gDude, target) <= 1) {
+            if (objectGetDistanceBetween(user, target) <= 1) {
                 isDude = true;
             }
 
@@ -1876,7 +1880,7 @@ int actionUseSkill(Object* user, Object* target, int skill)
             presenter()->floatText(partyMember, msg, 101, _colorTable[32747], _colorTable[0]);
 
             if (isDude) {
-                performer = gDude;
+                performer = user;
                 partyMember = nullptr;
             }
         }
@@ -2313,7 +2317,7 @@ int _report_explosion(Attack* attack, Object* sourceObj)
     }
 
     attackComputeDeathFlags(attack);
-    _combat_display(attack);
+    combatNarrateAttack(attack);
     _apply_damage(attack, false);
 
     Object* anyDefender = nullptr;
@@ -2596,7 +2600,7 @@ void actionDamage(int tile, int elevation, int minDamage, int maxDamage, int dam
 // 0x41363C
 int _report_dmg(Attack* attack, Object* a2)
 {
-    _combat_display(attack);
+    combatNarrateAttack(attack);
     _apply_damage(attack, false);
     internal_free(attack);
     gameUiEnable();

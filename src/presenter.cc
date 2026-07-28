@@ -33,6 +33,26 @@ void presenterSetEmissionsSuppressed(bool suppressed)
     gSuppressPresenterEmissions = suppressed;
 }
 
+// -- WORLD-NARRATION POINT OF VIEW (see presenter.h for the why) -------------
+
+static int gNarrationActorNetId = 0;
+
+int presenterNarrationAddress()
+{
+    return gNarrationActorNetId;
+}
+
+PresenterNarrationScope::PresenterNarrationScope(int actorNetId)
+    : _previous(gNarrationActorNetId)
+{
+    gNarrationActorNetId = actorNetId;
+}
+
+PresenterNarrationScope::~PresenterNarrationScope()
+{
+    gNarrationActorNetId = _previous;
+}
+
 // -- TIME-SKIP MOVE COALESCING (see presenter.h for the why) ---------------
 
 namespace {

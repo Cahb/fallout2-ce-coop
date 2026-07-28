@@ -13,7 +13,21 @@ any socket): it proves the LOGICAL protocol is sufficient to reconstruct state,
 decoupled from wire encoding and networking. When the socket lands (later P5-C
 slice) the file source is swapped for a socket; the reconstruction logic is reused.
 
-SCOPE OF THIS SLICE — POSITION / PRESENCE reconstruction.
+►► SCOPE, 2026-07-26: POSITION/PRESENCE **plus** the full syncable field set.
+It reconstructed exactly (tile, elev) for a long time, and that is why a whole bug
+class was invisible to every gate: a stream can be wrong about an object's proto,
+art frame, flags, hp or inventory all day and still pass a position check. The
+reconstructor now applies EVENT_OBJECT_DELTA field by field (it used to skip the
+event whole) and can be asked to check itself:
+
+    tools/replay.py --audit <stream>
+
+which compares the server's own EVENT_STATE_AUDIT records — its authoritative view
+of every object — against what this reconstruction produced, and exits non-zero on
+any divergence. A difference there is a PROTOCOL hole, not a client bug: no viewer
+can be right about a field the wire never sent. See src/state_audit.h.
+
+SCOPE OF THE ORIGINAL SLICE — POSITION / PRESENCE reconstruction.
 The world is seeded FIRST from the join baseline `snapshot` (server_loop.cc
 serverInstall): one line per object present at t=0, carrying pid/tile/elev/netid.
 Objects that appear only later are still seeded lazily from the first event that
@@ -83,7 +97,19 @@ NOT_IN_WORLD = -1  # obj->tile == -1: in an inventory / limbo, not on a map tile
 
 
 class Obj:
-    __slots__ = ("tile", "elev", "alive", "pid", "seed_tile")
+    # ►► THIS USED TO BE (tile, elev) AND NOTHING ELSE, and that is the single reason
+    # a whole bug class was invisible to 69 green gates. Every "the art changed but
+    # the proto did not", "the mirror kept a thing the server retired", "the frame
+    # never streamed" defect lived in a field this reconstructor did not model, so
+    # the stream could be wrong all day and the gate still passed on position.
+    # Reconstructing the FULL syncable set is what lets EVENT_STATE_AUDIT be checked
+    # against it — see audit_compare(). A field here that the stream cannot maintain
+    # is a hole in the protocol, and the audit will now say so out loud.
+    __slots__ = ("tile", "elev", "alive", "pid", "seed_tile",
+                 "fid", "frame", "rotation", "flags",
+                 "light_distance", "light_intensity",
+                 "hp", "radiation", "poison", "ap", "combat_results",
+                 "inv")
 
     def __init__(self, tile, elev, pid=None):
         self.tile = tile
@@ -91,6 +117,54 @@ class Obj:
         self.alive = True
         self.pid = pid  # from spawn/connect/destroy; None if only ever seen moving
         self.seed_tile = tile  # first-revealed tile; net displacement != this == a real move
+        # None = never told. A field the stream never carried is NOT the same as a
+        # field it carried as zero, and conflating them would hide exactly the holes
+        # this exists to find, so unknown fields are skipped by the comparison and
+        # counted separately.
+        self.fid = None
+        self.frame = None
+        self.rotation = None
+        self.flags = None
+        self.light_distance = None
+        self.light_intensity = None
+        self.hp = None
+        self.radiation = None
+        self.poison = None
+        self.ap = None
+        self.combat_results = None
+        self.inv = None  # list of (netId, pid, qty, flags) from the last inventory delta
+
+
+def _u32(x):
+    return x & 0xFFFFFFFF
+
+
+def _hash_mix(h):
+    """murmur3 fmix32 -- byte-for-byte the avalanche state_audit.cc uses."""
+    h = _u32(h)
+    h ^= h >> 16
+    h = _u32(h * 0x85EBCA6B)
+    h ^= h >> 13
+    h = _u32(h * 0xC2B2AE35)
+    h ^= h >> 16
+    return h
+
+
+def inventory_hash(items):
+    """The audit's inventory fingerprint, recomputed from what the WIRE carried.
+
+    Matching it proves the per-item inventory payload (identity included) survived
+    the trip; a mismatch says the stream's idea of who is carrying what differs from
+    the server's, which is the armed-charge / thrown-rock class of bug.
+    """
+    h = _u32(len(items))
+    for (net_id, pid, qty, flags) in items:
+        item_hash = _u32(_u32(net_id * 2654435761)
+                         + _u32(pid * 2246822519)
+                         + _u32(qty * 3266489917)
+                         + _u32(flags * 40503))
+        h = _u32(h + _hash_mix(item_hash))
+    return h
 
 
 def reconstruct(stream_path):
@@ -164,6 +238,23 @@ NETSTREAM_MAGIC = b"F2NS"
 
 E_SPAWN, E_MOVE, E_DESTROY, E_CONNECT, E_DISCONNECT = 1, 2, 3, 4, 5
 E_SNAPSHOT_OBJECT, E_SNAPSHOT_BEGIN, E_SNAPSHOT_END = 8, 9, 10
+E_OBJECT_DELTA = 6
+E_STATE_AUDIT = 60
+
+# ObjectDeltaField bits (presenter.h). Order IS the wire order: the writer emits set
+# fields in ascending bit order and the reader must walk them the same way.
+D_FID = 1 << 0
+D_ROTATION = 1 << 1
+D_FLAGS = 1 << 2
+D_HP = 1 << 3
+D_RADIATION = 1 << 4
+D_POISON = 1 << 5
+D_AP = 1 << 6
+D_COMBAT_RESULTS = 1 << 7
+D_INVENTORY = 1 << 8
+D_FRAME = 1 << 9
+D_LIGHT = 1 << 10
+D_PID = 1 << 11
 
 
 class _Reader:
@@ -213,6 +304,11 @@ def reconstruct_binary(stream_path):
         r.take(4)
 
     world = {}
+    # Completed EVENT_STATE_AUDIT batches (one per `audit` the server was asked for).
+    # Accumulated here and compared after the whole stream is applied, so the world we
+    # judge is the world the stream actually produced.
+    audits = []
+    audit_batches = []
 
     def seed(oid, tile, elev):
         if oid not in world:
@@ -276,19 +372,190 @@ def reconstruct_binary(stream_path):
                 o = world.get(oid)
                 if o is not None:
                     o.alive = False
+            elif etype == E_OBJECT_DELTA:
+                # ►► PARSED, NOT SKIPPED. This event carries every scalar the server
+                # considers syncable, and this reconstructor used to step over it whole
+                # (its own comment said the layout change was "transparent here" --
+                # transparent because nothing was being checked). Walking the mask in
+                # bit order is mandatory: the payload is sparse and self-describing
+                # only through the mask.
+                oid = body.i32()
+                mask = body.u16()
+                o = world.get(oid)
+                if o is None:
+                    o = Obj(NOT_IN_WORLD, 0)
+                    world[oid] = o
+                if mask & D_FID:
+                    o.fid = body.i32()
+                if mask & D_ROTATION:
+                    o.rotation = body.i32()
+                if mask & D_FLAGS:
+                    o.flags = body.i32() & 0xFFFFFFFF
+                if mask & D_HP:
+                    o.hp = body.i32()
+                if mask & D_RADIATION:
+                    o.radiation = body.i32()
+                if mask & D_POISON:
+                    o.poison = body.i32()
+                if mask & D_AP:
+                    o.ap = body.i32()
+                if mask & D_COMBAT_RESULTS:
+                    o.combat_results = body.i32()
+                if mask & D_INVENTORY:
+                    n = body.u16()
+                    items = []
+                    for _i in range(n):
+                        it_net = body.i32()
+                        it_pid = body.i32()
+                        it_qty = body.i32()
+                        it_flags = body.i32() & 0xFFFFFFFF
+                        body.i32()  # ammoQuantity -- folded into no audit field
+                        body.i32()  # ammoTypePid
+                        items.append((it_net, it_pid, it_qty, it_flags))
+                    o.inv = items
+                if mask & D_FRAME:
+                    o.frame = body.i32()
+                if mask & D_LIGHT:
+                    o.light_distance = body.i32()
+                    o.light_intensity = body.i32()
+                if mask & D_PID:
+                    o.pid = body.i32()
+            elif etype == E_STATE_AUDIT:
+                is_final = body.u8()
+                n = body.u16()
+                for _i in range(n):
+                    rec = {
+                        "netId": body.i32(), "pid": body.i32(), "tile": body.i32(),
+                        "elevation": body.i32(), "fid": body.i32(), "frame": body.i32(),
+                        "rotation": body.i32(), "flags": body.i32() & 0xFFFFFFFF,
+                        "lightDistance": body.i32(), "lightIntensity": body.i32(),
+                        "hp": body.i32(), "radiation": body.i32(), "poison": body.i32(),
+                        "ap": body.i32(), "combatResults": body.i32(),
+                        "inventoryCount": body.i32(),
+                        "inventoryHash": body.i32() & 0xFFFFFFFF,
+                    }
+                    audits.append(rec)
+                if is_final:
+                    # ►► COMPARE HERE, NOT AT THE END OF THE STREAM. An audit describes
+                    # the world at the instant the server took it; judging it against
+                    # the FINAL reconstruction reports every legitimate change that
+                    # happened afterwards as a divergence. (Written the wrong way round
+                    # first, and the gate caught it immediately: an audit taken before a
+                    # `give` was blamed for the give.) The client's own comparison runs
+                    # at decode for exactly the same reason.
+                    report = []
+                    div, unknown = audit_compare(world, audits, report)
+                    audit_batches.append((len(audits), div, unknown, report))
+                    audits.clear()
             # else: unknown/irrelevant type -- skipped whole via elen.
 
         if er.pos != len(payload):
             raise ValueError(f"frame seq {seq}: {len(payload) - er.pos} trailing bytes")
-    return world
+    return world, audit_batches
 
 
 def load_stream(stream_path):
-    """Dispatch on the magic: binary netstream or narrate text."""
+    """Dispatch on the magic: binary netstream or narrate text.
+
+    Returns (world, audit_batches). The text ("narrate") path carries no audits, so
+    it returns an empty list -- it is a position-only log by construction.
+    """
     with open(stream_path, "rb") as f:
         if f.read(4) == NETSTREAM_MAGIC:
             return reconstruct_binary(stream_path)
-    return reconstruct(stream_path)
+    return reconstruct(stream_path), []
+
+
+# Which Obj attribute answers each audited field. `None` = the audit ships it but the
+# stream is not expected to carry it independently (netId is the key itself).
+AUDIT_FIELD_MAP = (
+    ("pid", "pid"),
+    ("tile", "tile"),
+    ("elevation", "elev"),
+    ("fid", "fid"),
+    ("frame", "frame"),
+    ("rotation", "rotation"),
+    ("flags", "flags"),
+    ("lightDistance", "light_distance"),
+    ("lightIntensity", "light_intensity"),
+    ("hp", "hp"),
+    ("radiation", "radiation"),
+    ("poison", "poison"),
+    ("ap", "ap"),
+    ("combatResults", "combat_results"),
+)
+
+CRITTER_ONLY = {"hp", "radiation", "poison", "ap", "combatResults"}
+OBJ_TYPE_CRITTER = 1
+
+
+def audit_compare(world, records, report):
+    """Diff the server's own state (records) against what the STREAM rebuilt (world).
+
+    ►► THIS IS THE QUESTION THE GATES COULD NOT ASK: does the live protocol carry
+    enough to reconstruct the server's world? A divergence here is a protocol hole,
+    not a client bug -- no viewer can be right about a field the wire never sent.
+
+    Returns (divergences, unknown_fields). `unknown_fields` counts fields the stream
+    NEVER mentioned for an object it does know; those are reported separately because
+    "never sent" and "sent wrong" are different defects with different fixes.
+    """
+    divergences = 0
+    unknown = 0
+    seen = set()
+    for rec in records:
+        oid = rec["netId"]
+        seen.add(oid)
+        o = world.get(oid)
+        if o is None or not o.alive:
+            report.append(
+                f"[audit] net={oid} pid={rec['pid']} MISSING -- the server has it, "
+                f"the stream never produced it")
+            divergences += 1
+            continue
+        is_critter = (rec["pid"] >> 24) & 0xF == OBJ_TYPE_CRITTER
+        for wire_name, attr in AUDIT_FIELD_MAP:
+            if wire_name in CRITTER_ONLY and not is_critter:
+                continue
+            ours = getattr(o, attr)
+            if ours is None:
+                unknown += 1
+                continue
+            theirs = rec[wire_name]
+            if wire_name == "flags":
+                # OBJECT_NO_REMOVE / OBJECT_NO_SAVE are LOCAL lifecycle bits the
+                # receiver deliberately keeps for itself (objectApplyWireFlags), so
+                # they are not a divergence -- mask them out on both sides rather
+                # than report a difference nobody can fix.
+                local = 0x00000400 | 0x00000800
+                theirs &= ~local
+                ours &= ~local
+            if theirs != ours:
+                report.append(
+                    f"[audit] net={oid} pid={rec['pid']} {wire_name}: "
+                    f"server={theirs} (0x{theirs & 0xFFFFFFFF:X}) "
+                    f"stream={ours} (0x{ours & 0xFFFFFFFF:X})")
+                divergences += 1
+        if o.inv is not None:
+            if len(o.inv) != rec["inventoryCount"]:
+                report.append(
+                    f"[audit] net={oid} inventoryCount: server={rec['inventoryCount']} "
+                    f"stream={len(o.inv)}")
+                divergences += 1
+            elif inventory_hash(o.inv) != rec["inventoryHash"]:
+                report.append(
+                    f"[audit] net={oid} inventoryHash: server=0x{rec['inventoryHash']:08X} "
+                    f"stream=0x{inventory_hash(o.inv):08X} (same count, different contents)")
+                divergences += 1
+        else:
+            unknown += 1
+    for oid, o in world.items():
+        if oid not in seen and o.alive and o.tile != NOT_IN_WORLD:
+            report.append(
+                f"[audit] net={oid} pid={o.pid} EXTRA -- the stream produced it, "
+                f"the server does not have it")
+            divergences += 1
+    return divergences, unknown
 
 
 def parse_dump(dump_path):
@@ -311,10 +578,31 @@ def parse_dump(dump_path):
 
 
 def main(argv):
+    # ►► AUDIT MODE: `replay.py --audit <stream>` compares the server's own
+    # EVENT_STATE_AUDIT records against the world this stream rebuilt, and exits
+    # non-zero on any divergence. No dump, no client, no display -- which is exactly
+    # what makes it usable as a gate. Without an audit in the stream it says so and
+    # fails, because "no divergences found" and "nothing was checked" must never
+    # look the same in a gate.
+    if len(argv) == 3 and argv[1] == "--audit":
+        world, audit_batches = load_stream(argv[2])
+        if not audit_batches:
+            print("AUDIT: no EVENT_STATE_AUDIT in the stream -- nothing was checked "
+                  "(send the `audit` command to the server's CMD port)")
+            return 2
+        total_div = 0
+        for i, (count, div, unknown, report) in enumerate(audit_batches):
+            for line in report:
+                print(line)
+            print(f"AUDIT #{i + 1}: {count} server objects, {div} divergences, "
+                  f"{unknown} fields the stream never carried")
+            total_div += div
+        return 1 if total_div else 0
+
     if len(argv) != 3:
         print(__doc__)
         return 2
-    world = load_stream(argv[1])
+    world, _audits = load_stream(argv[1])
     positions, dump_lines = parse_dump(argv[2])
 
     # An object the stream can validate = one it tracked that ended up ON A MAP

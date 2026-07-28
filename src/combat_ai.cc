@@ -30,6 +30,7 @@
 #include "proto_instance.h"
 #include "random.h"
 #include "scripts.h"
+#include "server_players.h" // playerActorIs — sneak is per-actor
 #include "settings.h"
 #include "skill.h"
 #include "stat.h"
@@ -3533,13 +3534,16 @@ bool isWithinPerception(Object* critter, Object* target)
             maxDistance /= 2;
         }
 
-        if (target == gDude) {
-            if (dudeIsSneaking()) {
+        // Sneak shortens the range at which THIS target can be spotted, and both the
+        // flag and the last roll are the target's own now — an extra creeping up used
+        // to be seen at full range unless the host happened to be sneaking too.
+        if (playerActorIs(target)) {
+            if (dudeIsSneaking(target)) {
                 maxDistance /= 4;
                 if (sneak > 120) {
                     maxDistance -= 1;
                 }
-            } else if (dudeHasState(DUDE_STATE_SNEAKING)) {
+            } else if (dudeHasState(DUDE_STATE_SNEAKING, target)) {
                 maxDistance = maxDistance * 2 / 3;
             }
         }
@@ -3556,13 +3560,13 @@ bool isWithinPerception(Object* critter, Object* target)
         maxDistance = perception;
     }
 
-    if (target == gDude) {
-        if (dudeIsSneaking()) {
+    if (playerActorIs(target)) {
+        if (dudeIsSneaking(target)) {
             maxDistance /= 4;
             if (sneak > 120) {
                 maxDistance -= 1;
             }
-        } else if (dudeHasState(DUDE_STATE_SNEAKING)) {
+        } else if (dudeHasState(DUDE_STATE_SNEAKING, target)) {
             maxDistance = maxDistance * 2 / 3;
         }
     }

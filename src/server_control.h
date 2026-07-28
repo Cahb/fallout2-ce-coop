@@ -81,6 +81,12 @@ struct Object;
 // touch the client set.
 void serverControlBeginDrain(const std::function<bool(int sessionId)>& liveSession);
 
+// Install the KICK primitive (f2_server owns the socket sink; the control plane does
+// not). Used to disconnect a session whose login was refused — see the duplicate-login
+// path in serverControlLine. Unset (single-player, goldens) = no kick, refusal is
+// stderr-only.
+void serverControlSetKicker(std::function<bool(int sessionId)> kicker);
+
 // Dispatch one inbound line from wire client `sessionId`. The ONLY entry point for
 // viewer-wire lines (server_main routes netSink.pollInbound here). Unknown or
 // disallowed verbs are ignored with a one-line debug log. A cheap flood guard
@@ -130,6 +136,13 @@ bool serverControlHasClaimant();
 // Registry slot this session drives, or -1 (a spectator).
 int serverControlSlotForSession(int sessionId);
 
+// ── ELEVATORS ────────────────────────────────────────────────────────────────
+// Remember that `slot` was offered elevator `elevator` (the script request handler
+// calls this as it streams the panel). The `elev <level>` verb is refused unless it
+// answers an offer this actor actually received: without that, the verb would be a
+// teleport-anywhere primitive any session could send at any time. -1 clears.
+void serverControlSetPendingElevator(int slot, int elevator);
+
 // The actor this session drives, or nullptr. THE lookup the verb layer uses.
 Object* serverControlActorForSession(int sessionId);
 
@@ -141,6 +154,12 @@ bool serverControlAnyBound();
 
 // This server binary's own OS ("Linux"/"Windows"/"macOS"), compile-time.
 const char* serverPlatformName();
+
+// Announce the server-authored holodisk set to every viewer (currently one SERVER
+// INFORMATION disk — see server_control.cc). Called from serverEmitBaseline, so it
+// re-announces on join / rebaseline / map change; that is what lets these disks skip
+// persistence entirely. No-op unless serverDedicatedActive().
+void serverEmitHolodisks();
 
 // Drop a session's pending walk-then-act latch (its binding was released).
 void serverControlDropPendingFor(int sessionId);

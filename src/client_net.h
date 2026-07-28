@@ -1,6 +1,8 @@
 #ifndef CLIENT_NET_H
 #define CLIENT_NET_H
 
+#include <string> // takeEncounterPrompt hands back the latched title/body
+
 namespace fallout {
 
 struct Object;
@@ -15,10 +17,10 @@ struct Object;
 
 // S2 file-sourced consumer: reads a captured F2NS wire stream from `path`, loads
 // the join snapshot, applies the live stream, and leaves the sim in the
-// reconstructed state (ready for a state_dump). `blobTmpPath` is scratch used to
-// reassemble the blob before mapLoad. Returns false on a framing error, a
-// blob-guard mismatch, or a load failure.
-bool clientApplyStreamFile(const char* path, const char* blobTmpPath);
+// reconstructed state (ready for a state_dump). The blob is reassembled in RAM —
+// there is no scratch file. Returns false on a framing error, a blob-guard
+// mismatch, or a load failure.
+bool clientApplyStreamFile(const char* path);
 
 // S3 live viewer connection (CLIENT_JOIN_DESIGN.md §A). A TCP ByteSource that
 // connects to a running f2_server, receives the join snapshot + live wire, and
@@ -44,10 +46,9 @@ public:
     ClientConnection& operator=(const ClientConnection&) = delete;
 
     // Open a blocking TCP connection to host:port (TCP_NODELAY, SIGPIPE ignored).
-    // `blobTmpPath` is the scratch file the decoder reassembles the join blob into
-    // (its bytes must outlive the connection). Returns false on any resolve/socket/
-    // connect error, leaving the connection closed.
-    bool connect(const char* host, int port, const char* blobTmpPath);
+    // The join blob is reassembled in RAM (no scratch file). Returns false on any
+    // resolve/socket/connect error, leaving the connection closed.
+    bool connect(const char* host, int port);
 
     // Non-blocking: recv whatever has arrived and apply every now-complete frame.
     // Returns false on a fatal framing error or a server disconnect (the caller
@@ -76,6 +77,12 @@ public:
     // combatExit and map transitions.
     bool inCombat() const;
     bool myTurn() const;
+
+    // False = the server never bound this client to a player slot (we never appeared in a
+    // roster under our own session). That is what a REFUSED LOGIN looks like from the
+    // client: the wire has no per-session channel, so the server kicks the socket instead
+    // of explaining, and this is how we report the likely reason.
+    bool everBoundToSlot() const;
 
     // Drive combat presentation once per render frame (viewer only): start the next
     // queued attack replay when the previous one is idle, and apply the deferred
@@ -108,6 +115,30 @@ public:
     // setCombatModalOpen() brackets it so the service ticker's combat
     // force-ESC skips the one screen the server just charged us for.
     bool takeInventoryGrant();
+
+    // The container the server just opened for this actor (0 = none). One-shot, same
+    // shape as the inventory grant and for the same reason: the loot screen is a
+    // blocking modal, so the decoder only latches and the main loop opens it.
+    // ►► THE SERVER DECIDES, NOT US. The viewer used to re-judge adjacency itself and
+    // open the screen when it thought the dude had arrived; see Presenter::lootGrant.
+    int takeLootGrant();
+
+    // One-shot: the server offered this actor an elevator panel (EVENT_ELEVATOR_PROMPT).
+    // Consumed by the main loop, NOT by the decoder — the panel blocks, and a blocking
+    // loop must never be entered from inside pump() (same rule as the grant above).
+    // One-shot: the streamed random-encounter prompt, latched out of the decoder
+    // (see onEncounterPrompt — opening it inside pump() re-enters drain()).
+    bool takeEncounterPrompt(std::string* title, std::string* body);
+    bool takeElevatorPrompt(int* elevator, int* startLevel);
+    // One-shot: the server says WE used a Motion Sensor, so open our own automap.
+    bool takeAutomapOpen(bool* usingScanner);
+    // One-shot: a fade addressed to us (or to everyone). true = to black.
+    // The fade itself is applied at DECODE, in wire order — see the decoder's
+    // applyFade for why that placement is the whole point. All the main loop owns is
+    // the watchdog: a fade-out whose matching fade-in never arrives must not leave the
+    // player looking at a black screen forever.
+    bool fadeWatchdogExpired(unsigned int nowMs, unsigned int maxBlackMs) const;
+    void clearFadeBlack();
     void setCombatModalOpen(bool open);
     bool combatModalOpen() const;
 
@@ -156,6 +187,42 @@ bool clientViewerTakeRefusal();
 // itemDropStack and streams the result back. hand: 0 = left, 1 = right, 2 = armor
 // (invunwield only; invwield auto-detects armor and ignores the hand). No-ops when
 // no connection is registered.
+// Send a chat line ("SAY"). No-op without a connection or on empty text; strips
+// newlines so a chat line can never forge a second control verb.
+void clientViewerSay(const char* text);
+
+// Ask the server to rest: `option` is a pipboy rest-menu index
+// (PIPBOY_REST_DURATION_*), so the until-healed kinds travel too. The server owns the
+// clock and everyone's hit points — the new time and HP come back on the ordinary
+// delta channels, and nothing is applied locally.
+void clientViewerRest(int option);
+
+// Answer to EVENT_ELEVATOR_PROMPT: which BUTTON the player pressed. The server
+// resolves what that button means from its own table and performs the ride — the
+// level index is the only thing a client is trusted to say (elevator.h).
+void clientViewerElevatorRide(int level);
+
+// ── Character-sheet edit intents (PLAYER_SHEET_DESIGN.md §9.5) ────────────────
+// The character screen's spends. It sends these INSTEAD of mutating the local sheet:
+// the server owns every character, checks the entitlement (unspent points, an owed
+// perk pick, prerequisites) and streams the authoritative row back, so a refusal is
+// simply a row that did not change plus a line on the refusal channel.
+//
+// Open/close bracket the server's edit session, whose one job is to hold the undo
+// baseline "-" may walk back to. skillup/skilldown/perkpick are GRANULAR — one point,
+// one perk, one intent. tagpick/mutpick answer the follow-up Tag!/Mutate! demand;
+// -1 (both -1 for mutpick) means the player cancelled, which takes the perk back off.
+// Sheet state changed by anything else (a drug, a level-up) arrives on the same
+// channel, so clientViewerConsumeSheetDirty tells an open screen to repaint.
+void clientViewerSheetOpen();
+void clientViewerSheetClose();
+void clientViewerSkillUp(int skill);
+void clientViewerSkillDown(int skill);
+void clientViewerPerkPick(int perk);
+void clientViewerTagPick(int skill);
+void clientViewerMutatePick(int dropTrait, int gainTrait);
+bool clientViewerConsumeSheetDirty();
+
 void clientViewerWield(Object* item, int hand);
 void clientViewerUnwield(int hand);
 void clientViewerDrop(Object* item, int quantity);
@@ -189,6 +256,7 @@ void clientViewerDialogEnd();
 // block-and-pump barrier drains. No-op when no connection is registered.
 void clientViewerWmMove(int x, int y);
 void clientViewerWmEnter();
+void clientViewerWmEnterEntrance(int entranceIndex);
 void clientViewerWmEscape();
 
 // True (once) if a live dude-inventory reconcile mutated the mirror while a screen was
@@ -206,6 +274,10 @@ void clientViewerFlushDeferredItemFrees();
 // call this -- the server refuses everyone else, so sending anyway would just
 // earn a refusal message.
 void clientViewerBarterVerb(const char* verb, int pid, int quantity);
+
+// Steal-screen verbs (stake/splant/sdone). pid < 0 sends the bare verb. No netId:
+// the server's session owns the victim, so a steal verb cannot be aimed.
+void clientViewerStealVerb(const char* verb, int pid, int quantity);
 
 } // namespace fallout
 

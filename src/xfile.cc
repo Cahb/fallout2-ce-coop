@@ -194,6 +194,86 @@ XFile* xfileOpenMemory(const void* data, size_t size)
     return stream;
 }
 
+XFile* xfileOpenMemoryWrite()
+{
+    XFile* stream = (XFile*)malloc(sizeof(*stream));
+    if (stream == nullptr) {
+        return nullptr;
+    }
+
+    memset(stream, 0, sizeof(*stream));
+    stream->type = XFILE_TYPE_MEMORY;
+    stream->memoryCapacity = 8192; // a join blob is tens of KB; this grows anyway
+    stream->memoryBuffer = (unsigned char*)malloc((size_t)stream->memoryCapacity);
+    if (stream->memoryBuffer == nullptr) {
+        free(stream);
+        return nullptr;
+    }
+    stream->memoryWritable = true;
+    return stream;
+}
+
+const unsigned char* xfileMemoryData(XFile* stream)
+{
+    if (stream == nullptr || stream->type != XFILE_TYPE_MEMORY) {
+        return nullptr;
+    }
+    return stream->memoryBuffer;
+}
+
+long xfileMemorySize(XFile* stream)
+{
+    if (stream == nullptr || stream->type != XFILE_TYPE_MEMORY) {
+        return 0;
+    }
+    return stream->memorySize;
+}
+
+// Make room for `needed` bytes at the current position, growing geometrically. Returns
+// false if the allocation failed, in which case the stream is left untouched so the caller
+// reports a short write rather than losing the buffer it already has.
+static bool xfileMemoryReserve(XFile* stream, long needed)
+{
+    long required = stream->memoryPosition + needed;
+    if (required <= stream->memoryCapacity) {
+        return true;
+    }
+    long capacity = stream->memoryCapacity > 0 ? stream->memoryCapacity : 8192;
+    while (capacity < required) {
+        capacity *= 2;
+    }
+    unsigned char* grown = (unsigned char*)realloc(stream->memoryBuffer, (size_t)capacity);
+    if (grown == nullptr) {
+        return false;
+    }
+    stream->memoryBuffer = grown;
+    stream->memoryCapacity = capacity;
+    return true;
+}
+
+// Write into a writable memory stream at the cursor. A seek-back-and-patch (which the map
+// writer does for its header) therefore OVERWRITES in place, exactly as it would on a real
+// file, and memorySize stays the high-water mark rather than the cursor.
+static size_t xfileMemoryWrite(const void* ptr, size_t size, size_t count, XFile* stream)
+{
+    if (!stream->memoryWritable) {
+        return 0; // a read-only memory stream (xfileOpenMemory)
+    }
+    size_t bytes = size * count;
+    if (bytes == 0) {
+        return 0;
+    }
+    if (!xfileMemoryReserve(stream, (long)bytes)) {
+        return 0;
+    }
+    memcpy(stream->memoryBuffer + stream->memoryPosition, ptr, bytes);
+    stream->memoryPosition += (long)bytes;
+    if (stream->memoryPosition > stream->memorySize) {
+        stream->memorySize = stream->memoryPosition;
+    }
+    return size != 0 ? bytes / size : 0;
+}
+
 // 0x4DF11C
 int xfilePrintFormatted(XFile* stream, const char* format, ...)
 {
@@ -226,9 +306,20 @@ int xfilePrintFormattedArgs(XFile* stream, const char* format, va_list args)
     case XFILE_TYPE_GZFILE:
         rc = gzvprintf(stream->gzfile, format, args);
         break;
-    case XFILE_TYPE_MEMORY:
-        rc = -1; // read-only stream
+    case XFILE_TYPE_MEMORY: {
+        // Format into a bounded scratch then write it. Nothing in this codebase formats
+        // anything near this size into a stream; a longer line is truncated rather than
+        // silently dropped, and vsnprintf reports the length it WANTED.
+        char formatted[4096];
+        int wanted = vsnprintf(formatted, sizeof(formatted), format, args);
+        if (wanted < 0) {
+            rc = -1;
+            break;
+        }
+        size_t length = (size_t)wanted < sizeof(formatted) ? (size_t)wanted : sizeof(formatted) - 1;
+        rc = (length == 0 || xfileMemoryWrite(formatted, 1, length, stream) == length) ? wanted : -1;
         break;
+    }
     default:
         rc = vfprintf(stream->file, format, args);
         break;
@@ -318,9 +409,11 @@ int xfileWriteChar(int ch, XFile* stream)
     case XFILE_TYPE_GZFILE:
         rc = gzputc(stream->gzfile, ch);
         break;
-    case XFILE_TYPE_MEMORY:
-        rc = -1; // read-only stream
+    case XFILE_TYPE_MEMORY: {
+        unsigned char byte = (unsigned char)ch;
+        rc = xfileMemoryWrite(&byte, 1, 1, stream) == 1 ? ch : -1;
         break;
+    }
     default:
         rc = fputc(ch, stream->file);
         break;
@@ -344,9 +437,11 @@ int xfileWriteString(const char* string, XFile* stream)
     case XFILE_TYPE_GZFILE:
         rc = gzputs(stream->gzfile, string);
         break;
-    case XFILE_TYPE_MEMORY:
-        rc = -1; // read-only stream
+    case XFILE_TYPE_MEMORY: {
+        size_t length = strlen(string);
+        rc = (length == 0 || xfileMemoryWrite(string, 1, length, stream) == length) ? 0 : -1;
         break;
+    }
     default:
         rc = fputs(string, stream->file);
         break;
@@ -416,7 +511,7 @@ size_t xfileWrite(const void* ptr, size_t size, size_t count, XFile* stream)
         elementsWritten = gzwrite(stream->gzfile, ptr, size * count);
         break;
     case XFILE_TYPE_MEMORY:
-        elementsWritten = 0; // read-only stream
+        elementsWritten = xfileMemoryWrite(ptr, size, count, stream);
         break;
     default:
         elementsWritten = fwrite(ptr, size, count, stream->file);

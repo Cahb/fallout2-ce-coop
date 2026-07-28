@@ -10,6 +10,7 @@
 
 #include "art.h"
 #include "character_transaction.h"
+#include "client_net.h" // clientViewerActive + the sheet edit intents (co-op)
 #include "color.h"
 #include "combat.h"
 #include "critter.h"
@@ -265,6 +266,13 @@ static int characterEditorDrawCardWithOptions(int graphicId, const char* name, c
 static void characterEditorHandleFolderButtonPressed();
 static void characterEditorHandleInfoButtonPressed(int eventCode);
 static void characterEditorHandleAdjustSkillButtonPressed(int a1);
+// True when THIS process does not own the character sheet — a co-op client, whose
+// sheet the dedicated server owns. Every spend then travels as an intent and comes
+// back as an authoritative row (PLAYER_SHEET_DESIGN.md §9.5); nothing here writes
+// the sheet locally, because a local write is drift the next row overwrites.
+static bool characterEditorSheetIsServerOwned();
+static void characterEditorAdjustSkillIntent(int keyCode);
+static void characterEditorRedrawSheet();
 static void characterEditorToggleTaggedSkill(int skill);
 static void characterEditorDrawOptionalTraits();
 static void characterEditorToggleOptionalTrait(int trait);
@@ -755,7 +763,7 @@ static int gCharacterEditorTaggedSkillCount;
 static int gCharacterEditorTempTaggedSkills[NUM_TAGGED_SKILLS];
 
 // 0x570A28
-static char gCharacterEditorHasFreePerkBackup;
+static bool gCharacterEditorHasFreePerkBackup;
 
 // 0x570A2A
 static unsigned char gCharacterEditorIsSkillsFirstDraw;
@@ -810,6 +818,14 @@ int characterEditorShow(bool isCreationMode)
         int keyCode = inputGetInput();
 
         convertMouseWheelToArrowKey(&keyCode);
+
+        // A sheet row arrived off the wire while the screen is open — the server's
+        // answer to a spend, or someone else's effect on this actor (a drug, a
+        // level-up, a revive). Repaint from the new values; this is the whole return
+        // path for a co-op edit, and the reason the editor needs no optimistic state.
+        if (characterEditorSheetIsServerOwned() && clientViewerConsumeSheetDirty()) {
+            characterEditorRedrawSheet();
+        }
 
         bool done = false;
         if (keyCode == 500) {
@@ -1169,7 +1185,29 @@ int characterEditorShow(bool isCreationMode)
 
     characterEditorWindowFree();
 
-    if (rc == 1) {
+    // ►►►► THE ROLLBACK THAT ATE EVERY LEVEL-UP: "the perk and the skill points only
+    // show up if I relog, or switch map." rc == 1 is not an error path — it is
+    // CANCEL / ESCAPE / pressing C again (see the keyCode branch that sets it), i.e.
+    // every way a player closes this screen except clicking Done. On a server-owned
+    // sheet that rollback is actively wrong, and the wrapper's own comment already
+    // says so — but the wrapper (characterEditorShowViewOnly) is the only place the
+    // unconditional restore was removed from, and this one, three lines inside the
+    // function it calls, was missed. So the whole round trip worked and was then
+    // thrown away locally:
+    //   server:  perkpick rc=0, skillup ... value=60 sp=0    (applied, authoritative)
+    //   wire:    [psht] emit slot=0 len=937                  (row streamed)
+    //   viewer:  [psht] apply slot=0 len=937 rc=0             (row IN gDudeProto)
+    //   ESC   :  characterEditorRestorePlayer()               (reverted to the OPEN snapshot)
+    // characterSnapshotRestore rewrites the dude's whole CritterProtoData, plus skill
+    // points, perk ranks, owed pick, tagged skills and traits — so it cannot lose a
+    // *little* of the level-up, it loses all of it. Relogging or changing map re-seeds
+    // the row from the server, which is why those looked like the fix.
+    //
+    // CREATION MODE KEEPS IT. There the character is not on the server yet (main.cc
+    // runs characterEditorShow(1) before the join), the snapshot is the only truth
+    // there is, and cancelling out of creation must really discard.
+    bool serverOwnsSheet = characterEditorSheetIsServerOwned() && !gCharacterEditorIsCreationMode;
+    if (rc == 1 && !serverOwnsSheet) {
         characterEditorRestorePlayer();
     }
 
@@ -1182,20 +1220,27 @@ int characterEditorShow(bool isCreationMode)
     return rc;
 }
 
-// The co-op viewer's character sheet. The DEDICATED SERVER owns every character,
-// and the sheet rides the join blob, so anything this screen writes locally is
-// drift that the next rebaseline silently reverts. Level-up spends and perk picks
-// have no wire verb yet; until they do, rolling the edits back unconditionally
-// makes "Done" and "Cancel" mean the same thing — a player who spends five skill
-// points and presses Done loses them either way, and this way they lose them
-// visibly, on the screen they are looking at, instead of a minute later.
+// The co-op player's character sheet. The DEDICATED SERVER owns every character, so
+// this screen never writes the sheet: its spends travel as INTENTS (skillup /
+// skilldown / perkpick, plus the Tag!/Mutate! follow-ups) and the authoritative row
+// streams back on EVENT_PLAYER_SHEET, which the main loop repaints.
 //
-// Restore AFTER the editor's own rc==1 branch may already have restored: _pop_perks
-// and the snapshot restore are idempotent against a snapshot the editor just took.
+// ►► THERE IS NO ROLLBACK ANY MORE, and that matters twice over. It used to call
+// characterEditorRestorePlayer() unconditionally, which is what made every player a
+// viewer: edits were discarded on the way out, so in co-op nobody — host included —
+// could spend a skill point or take a perk at all. Now that the server applies them,
+// a rollback would be actively wrong: it restores the snapshot taken when the screen
+// OPENED, and would therefore wipe the rows the server streamed in while it was up.
+// "Done" and "Cancel" both simply close the screen; whatever was spent is already
+// committed, one point at a time, on the authority that owns it.
+//
+// The open/close pair brackets the server's edit session, whose only job is to hold
+// the undo baseline "-" may walk back to (sheet_intent.h #4).
 int characterEditorShowViewOnly()
 {
+    clientViewerSheetOpen();
     int rc = characterEditorShow(0);
-    characterEditorRestorePlayer();
+    clientViewerSheetClose();
     return rc;
 }
 
@@ -1896,7 +1941,7 @@ void characterEditorInit()
     characterEditorSelectedItem = 0;
     gCharacterEditorCurrentSkill = 0;
     gCharacterEditorSkillValueAdjustmentSliderY = 27;
-    gCharacterEditorHasFreePerk = 0;
+    perkOwedPickSet(gDude, false);
     characterEditorWindowSelectedFolder = EDITOR_FOLDER_PERKS;
 
     for (i = 0; i < 2; i++) {
@@ -4801,7 +4846,7 @@ static void characterEditorSavePlayer()
         gCharacterEditorPerksBackup[perk] = perkGetRank(gDude, perk);
     }
 
-    gCharacterEditorHasFreePerkBackup = gCharacterEditorHasFreePerk;
+    gCharacterEditorHasFreePerkBackup = perkOwedPickGet(gDude);
 
     characterSnapshotTakeSkillPoints(&gCharacterEditorSnapshot);
 
@@ -4829,7 +4874,7 @@ static void characterEditorRestorePlayer()
     characterSnapshotRestore(&gCharacterEditorSnapshot);
 
     gCharacterEditorLastLevel = gCharacterEditorLastLevelBackup;
-    gCharacterEditorHasFreePerk = gCharacterEditorHasFreePerkBackup;
+    perkOwedPickSet(gDude, gCharacterEditorHasFreePerkBackup);
 
     characterSnapshotRestoreSkillPoints(&gCharacterEditorSnapshot);
 
@@ -5133,9 +5178,90 @@ static void characterEditorHandleInfoButtonPressed(int eventCode)
 }
 
 // 0x43B230
+static bool characterEditorSheetIsServerOwned()
+{
+    return clientViewerActive();
+}
+
+// Repaint everything a streamed sheet row can have changed. Called when a delta
+// lands while the screen is open, which is how a co-op spend becomes visible: the
+// server applied it, the row arrived, and these draws re-read the live values.
+static void characterEditorRedrawSheet()
+{
+    critterUpdateDerivedStats(gDude);
+    characterEditorDrawPrimaryStat(RENDER_ALL_STATS, 0, 0);
+    characterEditorDrawOptionalTraits();
+    characterEditorDrawSkills(0);
+    characterEditorDrawPcStats();
+    characterEditorDrawDerivedStats();
+    characterEditorDrawFolders();
+    characterEditorDrawCard();
+    windowRefresh(gCharacterEditorWindow);
+}
+
+// The co-op "+"/"-" press: ONE intent per click, then nothing — no local mutation
+// and no optimistic display. The number on the screen changes when the server's row
+// comes back (the main loop's delta poll repaints), so what the player reads is
+// always what the server holds.
+//
+// Deliberately NOT vanilla's hold-to-repeat loop. Auto-repeat would fire a verb per
+// frame into a per-beat line cap, and the pointless round trips would be dropped
+// silently — one point per press is honest about a networked spend.
+static void characterEditorAdjustSkillIntent(int keyCode)
+{
+    bool up;
+    switch (keyCode) {
+    case KEY_PLUS:
+    case KEY_UPPERCASE_N:
+    case KEY_ARROW_RIGHT:
+    case 521:
+        up = true;
+        break;
+    case KEY_MINUS:
+    case KEY_UPPERCASE_J:
+    case KEY_ARROW_LEFT:
+    case 523:
+        up = false;
+        break;
+    default:
+        return;
+    }
+
+    // Cheap local pre-checks for the two refusals the row already answers, so an
+    // obvious no-op shows vanilla's own dialog box instead of a wire round trip.
+    // Everything else — the cost of the next point, the 300%% ceiling, whether this
+    // actor is allowed at all — is the server's ruling, arriving on the refusal
+    // channel.
+    if (up && pcGetStat(PC_STAT_UNSPENT_SKILL_POINTS) <= 0) {
+        soundPlayFile("iisxxxx1");
+        char title[64];
+        // Not enough skill points available.
+        strcpy(title, getmsg(&gCharacterEditorMessageList, &gCharacterEditorMessageListItem, 136));
+        showDialogBox(title, nullptr, 0, 192, 126, _colorTable[32328], nullptr, _colorTable[32328], DIALOG_BOX_LARGE);
+        return;
+    }
+
+    if (up) {
+        clientViewerSkillUp(gCharacterEditorCurrentSkill);
+    } else {
+        clientViewerSkillDown(gCharacterEditorCurrentSkill);
+    }
+
+    // Follow the click with the selection/card even before the row answers.
+    characterEditorSelectedItem = gCharacterEditorCurrentSkill + 61;
+    characterEditorDrawCard();
+    characterEditorDrawSkills(1);
+    windowRefresh(gCharacterEditorWindow);
+}
+
 static void characterEditorHandleAdjustSkillButtonPressed(int keyCode)
 {
     if (gCharacterEditorIsCreationMode) {
+        return;
+    }
+
+    if (characterEditorSheetIsServerOwned()) {
+        characterEditorAdjustSkillIntent(keyCode);
         return;
     }
 
@@ -5636,14 +5762,26 @@ void characterEditorReset()
 // 0x43C228
 static int characterEditorUpdateLevel()
 {
+    // RECONCILE ONLY — the award itself moved onto the XP funnel (stat.cc), which
+    // grants the points and sets the owed pick on the level, for the actor that
+    // earned it. What is left here is the case the funnel cannot see: a level
+    // raised by some other path (a script writing PC_STAT_LEVEL). The funnel
+    // stamps gCharacterEditorLastLevel as it awards, so the common case falls
+    // through without awarding twice.
+    //
+    // ⚠ NEVER award locally when the sheet is server-owned: on a co-op client this
+    // would hand the player points the server does not know about, and the first
+    // sheet delta would take them away again mid-screen.
     int level = pcGetStat(PC_STAT_LEVEL);
     if (level != gCharacterEditorLastLevel && level <= PC_LEVEL_MAX) {
-        if (pcLevelUpApply(gCharacterEditorLastLevel, level)) {
-            gCharacterEditorHasFreePerk = 1;
+        if (!characterEditorSheetIsServerOwned()) {
+            if (pcLevelUpApply(gCharacterEditorLastLevel, level, gDude)) {
+                perkOwedPickAdd(gDude, 1); // SP local award, same per-level cadence
+            }
         }
     }
 
-    if (gCharacterEditorHasFreePerk != 0) {
+    if (perkOwedPickGet(gDude)) {
         characterEditorWindowSelectedFolder = 0;
         characterEditorDrawFolders();
         windowRefresh(gCharacterEditorWindow);
@@ -5656,7 +5794,7 @@ static int characterEditorUpdateLevel()
             characterEditorDrawFolders();
         } else if (rc == 1) {
             characterEditorDrawFolders();
-            gCharacterEditorHasFreePerk = 0;
+            perkOwedPickAdd(gDude, -1); // spend ONE; a multi-level jump may owe more
         }
     }
 
@@ -5855,7 +5993,24 @@ static int perkDialogShow()
     // choice which the dialog drives below (H-48/H-47).
     int pendingChoice = PERK_CHOICE_PENDING_NONE;
     if (rc == 1) {
-        if (perkChoiceApply(gDude, gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value, gCharacterEditorPerksBackup, &pendingChoice) == -1) {
+        int pickedPerk = gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value;
+        if (characterEditorSheetIsServerOwned()) {
+            // CO-OP: the pick is an intent. The server checks the owed pick, the
+            // prerequisites and the perk cap, applies it and streams the row back.
+            //
+            // The follow-up dialogs below still run LOCALLY (they are a UI question —
+            // which skill, which trait) but commit through their own intents. We drive
+            // them off the perk's identity rather than off perkChoiceApply's answer,
+            // because nothing was applied here to compare against; the server enforces
+            // that a follow-up is actually owed, so a refused pick cannot smuggle a
+            // free tag or trait swap through.
+            clientViewerPerkPick(pickedPerk);
+            if (pickedPerk == PERK_TAG) {
+                pendingChoice = PERK_CHOICE_PENDING_TAG;
+            } else if (pickedPerk == PERK_MUTATE) {
+                pendingChoice = PERK_CHOICE_PENDING_MUTATE;
+            }
+        } else if (perkChoiceApply(gDude, pickedPerk, gCharacterEditorPerksBackup, &pendingChoice) == -1) {
             debugPrint("\n*** Unable to add perk! ***\n");
             rc = 2;
         }
@@ -5864,12 +6019,16 @@ static int perkDialogShow()
     rc &= 1;
 
     if (rc != 0) {
+        // A cancelled follow-up takes the perk back off. In co-op the CANCEL is an
+        // intent too (the handlers send it), because the perk is on the server's row,
+        // not this one — see clientViewerTagPick / clientViewerMutatePick.
+        bool serverOwned = characterEditorSheetIsServerOwned();
         if (pendingChoice == PERK_CHOICE_PENDING_TAG) {
-            if (!perkDialogHandleTagPerk()) {
+            if (!perkDialogHandleTagPerk() && !serverOwned) {
                 perkRemove(gDude, PERK_TAG);
             }
         } else if (pendingChoice == PERK_CHOICE_PENDING_MUTATE) {
-            if (!perkDialogHandleMutatePerk()) {
+            if (!perkDialogHandleMutatePerk() && !serverOwned) {
                 perkRemove(gDude, PERK_MUTATE);
             }
         }
@@ -6271,6 +6430,11 @@ static bool perkDialogHandleMutatePerk()
     gCharacterEditorTempTraitCount = TRAITS_MAX_SELECTED_COUNT - traitIndex;
 
     bool result = true;
+    // Co-op: the two picks are collected as TRAIT IDS and committed as one intent at
+    // the tail instead of being applied to the local trait pair stage by stage.
+    bool serverOwned = characterEditorSheetIsServerOwned();
+    int dropTrait = -1;
+    int gainTrait = -1;
     if (gCharacterEditorTempTraitCount >= 1) {
         fontSetCurrent(103);
 
@@ -6292,9 +6456,18 @@ static bool perkDialogHandleMutatePerk()
 
         int rc = perkDialogHandleInput(gCharacterEditorTempTraitCount, perkDialogRefreshTraits);
         if (rc == 1) {
-            // Ledger H-47: the lose-a-trait rule lives in traitsMutateDrop
-            // (trait.cc); the dialog passes its selection state as arguments.
-            traitsMutateDrop(gCharacterEditorTempTraits, gCharacterEditorTempTraitCount, gPerkDialogCurrentLine, gPerkDialogOptionList[0].value);
+            if (serverOwned) {
+                // CO-OP: remember WHICH TRAIT, do not drop it locally. The list here is
+                // the actor's current traits sorted by name (perkDialogDrawTraits with
+                // a1 == 0), so the picked line names the trait — and a trait id is what
+                // the intent carries, precisely so the protocol does not depend on this
+                // sort order or on the language of the message file.
+                dropTrait = gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value;
+            } else {
+                // Ledger H-47: the lose-a-trait rule lives in traitsMutateDrop
+                // (trait.cc); the dialog passes its selection state as arguments.
+                traitsMutateDrop(gCharacterEditorTempTraits, gCharacterEditorTempTraitCount, gPerkDialogCurrentLine, gPerkDialogOptionList[0].value);
+            }
         } else {
             result = false;
         }
@@ -6327,12 +6500,25 @@ static bool perkDialogHandleMutatePerk()
 
         int rc = perkDialogHandleInput(count, perkDialogRefreshTraits);
         if (rc == 1) {
-            // Ledger H-47: the gain-a-trait commit lives in traitsMutateGain
-            // (trait.cc), which also commits via traitsSetSelected.
-            traitsMutateGain(gCharacterEditorTempTraits, gCharacterEditorTempTraitCount, gPerkDialogOptionList[gPerkDialogCurrentLine + gPerkDialogTopLine].value);
+            if (serverOwned) {
+                gainTrait = gPerkDialogOptionList[gPerkDialogCurrentLine + gPerkDialogTopLine].value;
+            } else {
+                // Ledger H-47: the gain-a-trait commit lives in traitsMutateGain
+                // (trait.cc), which also commits via traitsSetSelected.
+                traitsMutateGain(gCharacterEditorTempTraits, gCharacterEditorTempTraitCount, gPerkDialogOptionList[gPerkDialogCurrentLine + gPerkDialogTopLine].value);
+            }
         } else {
             result = false;
         }
+    }
+
+    if (serverOwned) {
+        // ONE intent for the whole swap — the server applies the drop and the gain
+        // together, so a trait pair can never be observed half-changed. Cancelling at
+        // either stage sends (-1, -1), which takes Mutate! back off and returns the
+        // pick; nothing was changed locally to undo.
+        clientViewerMutatePick(result ? dropTrait : -1, result ? gainTrait : -1);
+        return result;
     }
 
     if (!result) {
@@ -6387,14 +6573,27 @@ static bool perkDialogHandleTagPerk()
 
     int rc = perkDialogHandleInput(gPerkDialogOptionCount, perkDialogRefreshSkills);
     if (rc != 1) {
+        if (characterEditorSheetIsServerOwned()) {
+            // Escaped: tell the server, which drops Tag! again and hands the pick
+            // back. Nothing is restored locally — the row that comes back is the
+            // restore.
+            clientViewerTagPick(-1);
+            return false;
+        }
         memcpy(gCharacterEditorTempTaggedSkills, gCharacterEditorTaggedSkillsBackup, sizeof(gCharacterEditorTempTaggedSkills));
         skillsSetTagged(gCharacterEditorTaggedSkillsBackup, NUM_TAGGED_SKILLS);
         return false;
     }
 
+    int taggedSkill = gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value;
+    if (characterEditorSheetIsServerOwned()) {
+        clientViewerTagPick(taggedSkill);
+        return true;
+    }
+
     // Ledger H-48: the 4th-tag commit lives in skillsTagPerkApply (skill.cc);
     // the dialog passes its session copy and the picked skill as arguments.
-    skillsTagPerkApply(gCharacterEditorTempTaggedSkills, gPerkDialogOptionList[gPerkDialogTopLine + gPerkDialogCurrentLine].value);
+    skillsTagPerkApply(gCharacterEditorTempTaggedSkills, taggedSkill);
 
     return true;
 }

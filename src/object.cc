@@ -1399,7 +1399,36 @@ int objectSetLocation(Object* obj, int tile, int elevation, Rect* rect)
     }
 
     if (obj == gDude) {
-        ObjectListNode* objectListNode = gObjectListHeadByTile[tile];
+        // ►►►► A WIRE VIEWER MUST NOT DISCOVER ITS OWN EXIT GRIDS. Transitions belong
+        // to the authority: the server walks its dude onto the grid, latches the
+        // MapTransition, performs the load and rebaselines us. Our gDude is a MIRROR
+        // being replayed, so when the replayed walk lands on the same tile this block
+        // used to latch a SECOND, local transition — and mapSetTransition opens with
+        //
+        //     if (isInCombat()) { _game_user_wants_to_quit = 1; }
+        //
+        // which on a viewer is read off a MIRRORED combat state, not a local fight.
+        // Vanilla is safe because that 1 is an in-band "break out of the combat loop"
+        // signal that combat.cc itself clears again (combat.cc:3294/3643). The viewer
+        // has no such loop to consume it, so the flag survived, and BOTH the worldmap
+        // modal (worldmap_ui.cc `if (_game_user_wants_to_quit != 0) break;`) and the
+        // frame loop (`while (_game_user_wants_to_quit == 0)`) then exited. The client
+        // vanished the instant you walked off the edge of a map during a fight, which
+        // reads exactly like a crash and leaves no core file, because it is a clean
+        // return out of main.
+        //
+        // ►► THE SAME BUG, ONE BRANCH DOWN, WAS ALREADY FOUND AND FIXED: the elevation
+        // change at the bottom of this function carries `&& !clientViewerActive()` with
+        // a comment saying a wire-driven change "would silently kill mainClientViewer"
+        // (COMBAT_CLIENT_DESIGN.md §5.1). That guard was put on the symptom that had
+        // been noticed; this scan is the other door into the identical failure. Whenever
+        // gDude is a mirror, ask of every `obj == gDude` branch whether it is OBSERVING
+        // the dude or DECIDING for it — deciding is the authority's job.
+        //
+        // Nothing else in this scan is wanted on a viewer either: it looks for exit
+        // grids and does nothing but latch the transition and mark the worldmap entrance
+        // known, and that entrance state is server-owned too.
+        ObjectListNode* objectListNode = clientViewerActive() ? nullptr : gObjectListHeadByTile[tile];
         while (objectListNode != nullptr) {
             Object* obj = objectListNode->obj;
             int elev = obj->elevation;

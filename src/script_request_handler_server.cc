@@ -2,6 +2,9 @@
 
 #include <cstdio>
 #include "critter.h"
+#include "elevator.h" // elevatorResolveStartLevel — where the rider's gauge starts
+#include "inventory.h" // stealSessionRun — the server-owned steal screen
+#include "scripts.h" // scriptsRequestedElevatorRider — WHO pressed the button
 #include "msg_channel.h"
 #include "object.h"
 #include "presenter.h"
@@ -18,11 +21,19 @@ namespace fallout {
 // the server (game_dialog.cc executes the choice procs that mutate gvars/lvars;
 // the viewer only renders a node + returns the picked index — Stage A2/A3).
 //
-// Every other request is intentionally left as the base no-op: looting, stealing,
-// endgame, town/world map and elevator selection are dropped on the server exactly
-// as the previous null handler dropped them (client-side modal presentation, not
-// yet server-authoritative). This keeps A1 a pure additive unblock of the dialog
-// path with no behavior change to any other request.
+// Every other request is intentionally left as the base no-op: looting and the
+// endgame are dropped on the server exactly as the previous null handler dropped
+// them (client-side modal presentation, not yet server-authoritative). Looting
+// stays that way on purpose — it is viewer-local, driven by take/put verbs, and
+// the sim keeps running behind it. STEALING cannot be, so it is answered here.
+//
+// ►► A DROPPED REQUEST IS SILENT, and that is the trap this seam sets. The base
+// class answers "nothing happened" — elevatorSelect returned -1, which the drain
+// reads as "the player cancelled the picker" — so for a long time every elevator in
+// the game simply did nothing on a dedicated server: no error, no log, no crash, and
+// no way to enter Sierra, Navarro, the Military Base, Vault City's vault, Vault 15,
+// the Shi Temple or the Wanamingo Mine. When a vanilla feature "just doesn't
+// happen" in co-op, look here first (docs/COOP_COVERAGE.md).
 class ServerScriptRequestHandler : public ScriptRequestHandler {
 public:
     void dialogEnter(Object* speaker) override
@@ -78,6 +89,56 @@ public:
     void worldMap() override
     {
         worldmapServerDriver();
+    }
+
+    // STEAL / PICKPOCKET / PLANT. The one request in this class that the server
+    // must answer itself rather than delegate to a screen: every transfer is a
+    // Steal roll against the victim, and a client cannot be trusted to roll its
+    // own dice (nor could it — the skill, the perk and the difficulty ramp all
+    // live here). So the session runs on the server and the viewers render it.
+    // stealSessionRun blocks in its own block-and-pump barrier, exactly like a
+    // trade; see its definition in inventory_ui.cc for why the world stops.
+    void stealing(Object* thief, Object* target) override
+    {
+        stealSessionRun(thief, target);
+    }
+
+    // ELEVATORS. The server owns no screen, so it does not answer this request at
+    // all: it asks the rider's client to show vanilla's panel and returns -1, the
+    // same "cancelled" the base class returned. The ride happens LATER, when the
+    // player's `elev <level>` verb arrives (server_control.cc), which resolves the
+    // level against the server's own table and calls elevatorRideApply.
+    //
+    // ►► WHY NOT PARK THE SIM AND WAIT, like dialog and the encounter prompt do? A
+    // block-and-pump driver is the heavier shape, and an elevator does not need it:
+    // nothing in the script depends on the answer (vanilla's own cancel path returns
+    // -1 and continues), so freezing every other player while one of them reads a
+    // floor panel would buy nothing but a wedge risk. Answer immediately, ride on the
+    // verb.
+    int elevatorSelect(int elevator, int* map, int* elevation, int* tile) override
+    {
+        Object* rider = scriptsRequestedElevatorRider();
+        int slot = rider != nullptr ? playerActorSlotOf(rider) : -1;
+        if (slot < 0) {
+            // Not a player (a script drove it) — nothing to ask, nothing to ride.
+            return -1;
+        }
+
+        // The gauge's starting position is the rider's CURRENT floor, computed from
+        // the map/elevation the drain handed us (including the Sierra / Military Base
+        // remap math), so the panel opens showing where they are.
+        int startLevel = elevatorResolveStartLevel(elevator, *map, *elevation);
+
+        // Remember what was offered, to whom. `elev` is refused unless it answers a
+        // prompt this actor was actually given — otherwise the verb would be a
+        // teleport primitive addressable from any session.
+        serverControlSetPendingElevator(slot, elevator);
+
+        presenter()->elevatorPrompt(rider->netId, elevator, startLevel);
+        fprintf(stderr, "f2_server: elevator %d offered to slot %d (start level %d)\n",
+            elevator, slot, startLevel);
+
+        return -1;
     }
 };
 

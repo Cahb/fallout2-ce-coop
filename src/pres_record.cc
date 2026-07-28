@@ -1,5 +1,7 @@
 #include "pres_record.h"
 
+#include "server_loop.h" // serverFeatureEnabled — features default ON for a server
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -110,7 +112,10 @@ void presRecordSetBackendActive(bool active)
 
 bool presRecordEnabled()
 {
-    static bool env = getenv("F2_SERVER_PRES_RECORD") != nullptr;
+    // Default ON for a server; the headless probe keeps it OFF so the goldens stay the
+    // vanilla baseline (serverFeatureEnabled). F2_SERVER_PRES_RECORD=0 disables it, which
+    // is what the record-purity gate's "off" arm now passes explicitly.
+    static bool env = serverFeatureEnabled("F2_SERVER_PRES_RECORD");
     // Backend gate: only the server_anim.cc recording backend may record. In the
     // animation.cc backend (fallout2-ce) the leaves execute for real, so recording
     // there double-frees `attack` via the explosion callback + the fast-path.
@@ -191,6 +196,21 @@ static int resolveRef(Object* obj)
     // signals together are exact.
     bool transient = obj->netId == 0
         || (obj->netId >= gBeatNetIdWatermark && (obj->flags & OBJECT_NO_SAVE) != 0);
+    // ►► WHY DID THIS REF SHIP THE WAY IT DID. The client says transientsMinted=0 for
+    // throws while reporting refsDROPPED=5, i.e. the flight projectile shipped BY netId and
+    // the viewer could not resolve it — even though the projectile is created mid-section
+    // with OBJECT_NO_SAVE and should therefore satisfy the watermark clause. One of the two
+    // signals is not what we assume at this moment, so print both rather than guess:
+    // netId vs the beat watermark, and whether NO_SAVE is actually set YET (the flag is set
+    // inside actions.cc's presRecordActive() block — if any leaf references the projectile
+    // BEFORE that line, the first resolveRef mints a by-netId ref and gHandles never gets an
+    // entry, which would explain a stream with unresolvable refs and zero OBJ_CREATEs).
+    if (getenv("F2_TRACE_EVENTS") != nullptr) {
+        fprintf(stderr, "[presref] obj=%p netId=%d watermark=%d NO_SAVE=%d fid=0x%x => %s\n",
+            (void*)obj, obj->netId, gBeatNetIdWatermark,
+            (obj->flags & OBJECT_NO_SAVE) != 0 ? 1 : 0, obj->fid,
+            transient ? "TRANSIENT(OBJ_CREATE)" : "BY-NETID");
+    }
     if (transient) {
         auto it = gHandles.find(obj);
         if (it != gHandles.end()) {

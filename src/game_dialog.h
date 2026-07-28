@@ -9,6 +9,25 @@
 
 namespace fallout {
 
+// How the listener takes a dialog option. Set per option by the script when it adds
+// the option, rendered as the EMPATHY perk's colour coding, and carried per option on
+// the dialog-node wire event — which is why it lives in the header now rather than as
+// a file-local enum in game_dialog.cc.
+typedef enum GameDialogReaction {
+    GAME_DIALOG_REACTION_GOOD = 49,
+    GAME_DIALOG_REACTION_NEUTRAL = 50,
+    GAME_DIALOG_REACTION_BAD = 51,
+} GameDialogReaction;
+
+// Scroll the dialog OPTION list by `delta` options, re-rendering if it moved; true if it
+// moved (so a caller can swallow the key). Refuses to scroll past the last option or past
+// "nothing hidden below". The options panel is a fixed size and the renderer drops what
+// does not fit — before this, a crowded co-op dialog made those options unreachable, with
+// no button and no hotkey.
+bool gameDialogScrollOptions(int delta);
+bool gameDialogOptionsScrolled();
+bool gameDialogOptionsClipped();
+
 extern Object* gGameDialogSpeaker;
 extern bool gGameDialogSpeakerIsPartyMember;
 extern int gGameDialogHeadFid;
@@ -56,6 +75,10 @@ int gameDialogInitNodeWindows();
 // _gdProcessExit). Call once before _gdialogExitFromScript on the viewer. No-op
 // on the server.
 void gameDialogExitNodeWindows();
+// Show/hide only the OPTIONS list (the reply window stays up). See the
+// definition: vanilla keeps both alive through a trade, and the reply window is
+// where a moused-over item's description renders.
+void gameDialogSetOptionsWindowVisible(bool visible);
 
 // Viewer-side barter window lifecycle (see the .cc note). The viewer bypasses
 // _gdProcess, so the trade window's normal mode-switch construction never runs.

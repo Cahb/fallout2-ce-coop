@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <vector>
 
+#include "debug.h"
 #include "game.h"
 #include "light.h" // lightGetAmbientIntensity — global ambient-light worldDelta
 #include "map.h"
@@ -20,6 +22,7 @@ namespace fallout {
 // A snapshot of an object's syncable scalar fields (MP_PROTOCOL.md §6.2). The
 // critter-only fields are 0 for non-critters (never diffed for them).
 struct ObjectShadow {
+    int pid; // yes, pid: scripts swap it in place — see OBJECT_DELTA_PID
     int fid;
     int frame; // art frame index (obj->frame) — scripted frame swaps (graves/doors/levers)
     int lightDistance; // per-object light emission (op_obj_set_light_level)
@@ -142,6 +145,7 @@ static bool objectIsSyncable(Object* obj)
 static ObjectShadow objectCaptureShadow(Object* obj)
 {
     ObjectShadow shadow = {};
+    shadow.pid = obj->pid;
     shadow.fid = obj->fid;
     shadow.frame = obj->frame;
     shadow.lightDistance = obj->lightDistance;
@@ -164,6 +168,7 @@ static ObjectShadow objectCaptureShadow(Object* obj)
 static unsigned int objectDiffShadow(const ObjectShadow& before, const ObjectShadow& after, bool isCritter)
 {
     unsigned int mask = 0;
+    if (before.pid != after.pid) mask |= OBJECT_DELTA_PID;
     if (before.fid != after.fid) mask |= OBJECT_DELTA_FID;
     if (before.frame != after.frame) mask |= OBJECT_DELTA_FRAME;
     if (before.lightDistance != after.lightDistance || before.lightIntensity != after.lightIntensity)
@@ -216,6 +221,14 @@ void objectDeltaNotePresentedFrame(Object* obj)
     }
 }
 
+void objectDeltaForgetShadow(Object* obj)
+{
+    if (obj == nullptr) {
+        return;
+    }
+    gShadow.erase(obj);
+}
+
 void objectDeltaScan()
 {
     // A map transition wholesale-replaces the object set; rebaseline silently
@@ -256,7 +269,8 @@ void objectDeltaScan()
                 // existence; objectDelta = authoritative state). No-op under the null
                 // presenter (goldens unaffected); does not move the object, so the
                 // netstream position profile is unchanged.
-                unsigned int mask = OBJECT_DELTA_FID | OBJECT_DELTA_FRAME | OBJECT_DELTA_LIGHT | OBJECT_DELTA_ROTATION | OBJECT_DELTA_FLAGS;
+                unsigned int mask = OBJECT_DELTA_PID | OBJECT_DELTA_FID | OBJECT_DELTA_FRAME
+                    | OBJECT_DELTA_LIGHT | OBJECT_DELTA_ROTATION | OBJECT_DELTA_FLAGS;
                 if (objectIsCritter(obj)) {
                     mask |= OBJECT_DELTA_HP | OBJECT_DELTA_RADIATION | OBJECT_DELTA_POISON
                         | OBJECT_DELTA_AP | OBJECT_DELTA_COMBAT_RESULTS;
@@ -270,9 +284,10 @@ void objectDeltaScan()
 
     gShadow.swap(next);
 
-    // worldDelta: in-game clock advance + global ambient light (gvars/mvars stay
-    // server-only in v1). Coalesced into one event so a beat that changes both sends
-    // one worldDelta; the presenter reads each field's value itself when its bit is set.
+    // worldDelta: in-game clock advance + global ambient light (gvars ride their own
+    // event, see gvarDeltaScan below; mvars stay server-only). Coalesced into one event
+    // so a beat that changes both sends one worldDelta; the presenter reads each field's
+    // value itself when its bit is set.
     unsigned int worldMask = 0;
     unsigned int gameTime = gameTimeGetTime();
     if (gameTime != gLastGameTime) {
@@ -286,6 +301,68 @@ void objectDeltaScan()
     }
     if (worldMask != 0) {
         presenter()->worldDelta(worldMask);
+    }
+}
+
+// ─── GVAR streaming (see object_delta.h for WHY this is a diff, not a hook) ──
+
+// Max gvar changes carried in one beat's event. Bounds the event against a runaway
+// script; the emitter logs loudly if a beat ever exceeds it (see gvarDeltaScan).
+static constexpr int kGvarDeltaMaxPerBeat = 64;
+
+// Last-emitted value of every gvar, index-parallel to gGameGlobalVars. Sized from
+// gGameGlobalVarsLength at reset; a world with no gvars loaded leaves it empty.
+static std::vector<int> gGvarShadow;
+
+void gvarDeltaReset()
+{
+    gGvarShadow.assign(gGameGlobalVars != nullptr && gGameGlobalVarsLength > 0
+            ? gGameGlobalVars : nullptr,
+        gGameGlobalVars != nullptr && gGameGlobalVarsLength > 0
+            ? gGameGlobalVars + gGameGlobalVarsLength : nullptr);
+}
+
+void gvarDeltaScan()
+{
+    if (gGameGlobalVars == nullptr || gGameGlobalVarsLength <= 0) {
+        return;
+    }
+    // A load / new game reallocates the array to a different length. Re-seed SILENTLY
+    // rather than reporting every gvar as changed: the blob the client is about to load
+    // (or has just loaded) is authoritative for the whole set, exactly like
+    // objectDeltaScan's map-generation rebaseline.
+    if ((int)gGvarShadow.size() != gGameGlobalVarsLength) {
+        gvarDeltaReset();
+        return;
+    }
+    // Collect this beat's changes, then emit ONCE. A quest step or a karma swing moves
+    // several gvars in one script, and one event with N pairs beats N events.
+    int indices[kGvarDeltaMaxPerBeat];
+    int values[kGvarDeltaMaxPerBeat];
+    int count = 0;
+    for (int index = 0; index < gGameGlobalVarsLength; index++) {
+        if (gGvarShadow[index] == gGameGlobalVars[index]) {
+            continue;
+        }
+        gGvarShadow[index] = gGameGlobalVars[index];
+        if (count < kGvarDeltaMaxPerBeat) {
+            indices[count] = index;
+            values[count] = gGameGlobalVars[index];
+            count++;
+        } else {
+            // Over the per-beat cap. The SHADOW IS STILL ADVANCED above, so this value
+            // would never be re-diffed and would be lost silently — say so, loudly,
+            // rather than letting a client diverge in a way nothing can explain later.
+            // Not reachable by ordinary play (a beat changing >64 gvars is a script
+            // doing something extraordinary); if it ever fires, raise the cap or split
+            // the emit across beats.
+            debugPrint("object_delta: gvar delta overflow at index %d (cap %d) — "
+                       "value NOT streamed this beat\n",
+                index, kGvarDeltaMaxPerBeat);
+        }
+    }
+    if (count != 0) {
+        presenter()->gvarDelta(indices, values, count);
     }
 }
 

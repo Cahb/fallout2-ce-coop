@@ -71,13 +71,25 @@ int gcdLoad(const char* path);
 int protoCritterDataRead(File* stream, CritterProtoData* critterData);
 int gcdSave(const char* path);
 int protoCritterDataWrite(File* stream, CritterProtoData* critterData);
-void dudeDisableState(int state);
-void dudeEnableState(int state);
-void dudeToggleState(int state);
-bool dudeHasState(int state);
+// ►► THE THREE DUDE_STATE_* FLAGS (sneaking, level-up available, addicted) LIVE IN
+// THE PLAYER'S PROTO ROW, and every player actor has its own row — so these take a
+// SUBJECT. They used to read gDude->pid unconditionally, which meant an extra
+// player's sneak toggle, level-up badge and addiction marker were all written into
+// (and read out of) SLOT 0's sheet: the host's indicator bar lit up for someone
+// else's chem habit, an extra could never see its own level-up badge, and two
+// players sneaking shared one flag.
+//
+// `subject == nullptr` means gDude, so every vanilla call site keeps its exact
+// behaviour and single-player is byte-identical. The row is marked sheet-dirty on
+// change, which is what streams the new flags to that actor's own client.
+void dudeDisableState(int state, Object* subject = nullptr);
+void dudeEnableState(int state, Object* subject = nullptr);
+void dudeToggleState(int state, Object* subject = nullptr);
+bool dudeHasState(int state, Object* subject = nullptr);
 int sneakEventProcess(Object* obj, void* data);
 int _critter_sneak_clear(Object* obj, void* data);
-bool dudeIsSneaking();
+// True iff `subject` (default gDude) is sneaking AND its last sneak roll held.
+bool dudeIsSneaking(Object* subject = nullptr);
 int knockoutEventProcess(Object* obj, void* data);
 int _critter_wake_clear(Object* obj, void* data);
 int _critter_set_who_hit_me(Object* a1, Object* a2);

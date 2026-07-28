@@ -14,6 +14,7 @@
 #include "interface.h"
 #include "item.h"
 #include "message.h"
+#include "msg_channel.h" // kMsgChannelReward — skill-use XP is addressed to its earner
 #include "object.h"
 #include "palette.h"
 #include "party_member.h"
@@ -566,8 +567,11 @@ int skillRoll(Object* critter, int skill, int modifier, int* howMuch)
         return ROLL_FAILURE;
     }
 
-    if (critter == gDude && skill != SKILL_STEAL) {
-        Object* partyMember = partyMemberGetBestInSkill(skill);
+    if (playerActorIs(critter) && skill != SKILL_STEAL) {
+        // The acting player is a candidate for their own roll (see party_member.h): an
+        // extra used to be replaced by whichever companion was best, even when the extra
+        // was the best in the group.
+        Object* partyMember = partyMemberGetBestInSkill(skill, critter);
         if (partyMember != nullptr) {
             if (partyMemberGetBestSkill(partyMember) == skill) {
                 critter = partyMember;
@@ -577,9 +581,12 @@ int skillRoll(Object* critter, int skill, int modifier, int* howMuch)
 
     int skillValue = skillGetValue(critter, skill);
 
-    if (critter == gDude && skill == SKILL_STEAL) {
-        if (dudeHasState(DUDE_STATE_SNEAKING)) {
-            if (dudeIsSneaking()) {
+    // The sneaking-thief bonus belongs to the thief — and now that stealing is a
+    // real server-side session (inventory_ui.cc stealSessionRun), an EXTRA sneaking
+    // up on a mark actually collects it.
+    if (playerActorIs(critter) && skill == SKILL_STEAL) {
+        if (dudeHasState(DUDE_STATE_SNEAKING, critter)) {
+            if (dudeIsSneaking(critter)) {
                 skillValue += 30;
             }
         }
@@ -642,9 +649,9 @@ static void _show_skill_use_messages(Object* obj, int skill, Object* target, int
 
     int before = pcGetStat(PC_STAT_EXPERIENCE, obj);
 
-    // The award is the actor's; the console line is the host's screen only,
-    // until per-client message routing exists.
-    if (pcAddExperience(xpToAdd, nullptr, obj) == 0 && successCount > 0 && obj == gDude) {
+    // The award is the actor's and so is the line — addressed, so an extra player
+    // honing a skill hears about it on their own screen instead of paying the host's.
+    if (pcAddExperience(xpToAdd, nullptr, obj) == 0 && successCount > 0 && playerActorIs(obj)) {
         MessageListItem messageListItem;
         messageListItem.num = 505; // You earn %d XP for honing your skills
         if (messageListGetItem(&gSkillsMessageList, &messageListItem)) {
@@ -652,7 +659,7 @@ static void _show_skill_use_messages(Object* obj, int skill, Object* target, int
 
             char text[60];
             snprintf(text, sizeof(text), messageListItem.text, after - before);
-            presenter()->consoleMessage(text);
+            presenter()->consoleMessageStyled(obj->netId, kMsgChannelReward, text);
         }
     }
 }
@@ -713,7 +720,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
         }
 
         if (currentHp < maximumHp) {
-            presenter()->screenFadeOut();
+            presenter()->screenFadeOut(obj->netId);
 
             int roll;
             if (critterGetBodyType(target) == BODY_TYPE_ROBOTIC) {
@@ -762,7 +769,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
             }
 
             scriptsExecMapUpdateProc();
-            presenter()->screenFadeIn();
+            presenter()->screenFadeIn(obj->netId);
         } else {
             if (obj == gDude) {
                 // 501: You look healty already
@@ -813,7 +820,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
         }
 
         if (currentHp < maximumHp || critterIsCrippled(target)) {
-            presenter()->screenFadeOut();
+            presenter()->screenFadeOut(obj->netId);
 
             if (critterGetBodyType(target) != BODY_TYPE_ROBOTIC && critterIsCrippled(target)) {
                 int flags[HEALABLE_DAMAGE_FLAGS_LENGTH];
@@ -907,7 +914,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
                 successCount = 1;
                 _show_skill_use_messages(obj, skill, target, successCount, criticalChanceModifier);
                 scriptsExecMapUpdateProc();
-                presenter()->screenFadeIn();
+                presenter()->screenFadeIn(obj->netId);
 
                 giveExp = false;
             } else {
@@ -921,7 +928,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
                 presenter()->consoleMessage(text);
 
                 scriptsExecMapUpdateProc();
-                presenter()->screenFadeIn();
+                presenter()->screenFadeIn(obj->netId);
             }
         } else {
             if (obj == gDude) {
@@ -1003,7 +1010,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
             int flags[REPAIRABLE_DAMAGE_FLAGS_LENGTH];
             memcpy(flags, gRepairableDamageFlags, sizeof(gRepairableDamageFlags));
 
-            presenter()->screenFadeOut();
+            presenter()->screenFadeOut(obj->netId);
 
             for (int index = 0; index < REPAIRABLE_DAMAGE_FLAGS_LENGTH; index++) {
                 if ((target->data.critter.combat.results & flags[index]) != 0) {
@@ -1086,7 +1093,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
                 successCount = 1;
                 _show_skill_use_messages(obj, skill, target, successCount, criticalChanceModifier);
                 scriptsExecMapUpdateProc();
-                presenter()->screenFadeIn();
+                presenter()->screenFadeIn(obj->netId);
 
                 giveExp = false;
             } else {
@@ -1100,7 +1107,7 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
                 presenter()->consoleMessage(text);
 
                 scriptsExecMapUpdateProc();
-                presenter()->screenFadeIn();
+                presenter()->screenFadeIn(obj->netId);
             }
         } else {
             if (obj == gDude) {
@@ -1207,7 +1214,12 @@ int skillsPerformStealing(Object* thief, Object* target, Object* item, bool isPl
         }
 
         snprintf(text, sizeof(text), messageListItem.text, objectGetName(item));
-        presenter()->consoleMessage(text);
+        // ►► ADDRESSED, BECAUSE IT SAYS "YOU". In co-op the whole party has the
+        // steal screen open as witnesses, so a broadcast would tell four other
+        // players that THEY just stole the knife. consoleMessageFor(0) is a
+        // broadcast and the local presenter ignores the address entirely, so
+        // single-player and the goldens are unchanged.
+        presenter()->consoleMessageFor(playerActorIs(thief) ? thief->netId : 0, text);
 
         return 1;
     } else {
@@ -1219,8 +1231,7 @@ int skillsPerformStealing(Object* thief, Object* target, Object* item, bool isPl
         }
 
         snprintf(text, sizeof(text), messageListItem.text, objectGetName(item));
-        presenter()->consoleMessage(text);
-
+        presenter()->consoleMessageFor(playerActorIs(thief) ? thief->netId : 0, text); // see above
         return 0;
     }
 }

@@ -70,12 +70,37 @@ void restOptionDecode(int option, int* hours, int* minutes, int* kind);
 Object* partyMemberFindByPid(int a1);
 bool _isPotentialPartyMember(Object* object);
 bool objectIsPartyMember(Object* object);
+// ►► COMPANIONS ONLY, and it must stay that way: scripts REFUSE ENTRY on this number
+// ("leave some of your friends outside"), so counting player actors here walls a co-op
+// party out of Vault City, the Sierra doors and every escort gate. See the body.
 int _getPartyMemberCount();
+// How many of us are actually standing here — companions plus every online living
+// player. For sizing and offering things, NEVER for gating them.
+int partyGroupSize();
 bool partyHasRecruitedMembers();
 int _partyMemberPrepItemSaveAll();
 int partyMemberGetBestSkill(Object* object);
-Object* partyMemberGetBestInSkill(int skill);
+// ►► THE PARTY-SKILL READERS, WIDENED FOR CO-OP (party_member.cc has the why).
+//
+// Extra player actors are deliberately NOT in gPartyMembers — that list is saved,
+// levelled, position-synced and garbage-collected as COMPANIONS, and one of its
+// maintenance passes destroys objects. So "how good is the party at X" widens its
+// CANDIDATE SET here instead of the registry growing.
+//
+// Two scopes, because the acts differ:
+//   * `actor`-taking form = a SOLO act (a trade, a skill use). Companions plus THAT
+//     player. Another player standing nearby does not haggle for you (owner ruling
+//     2026-07-25: "BARTER is solo trade only; player barters -> his skill is taken
+//     into consideration").
+//   * no-actor form = a GROUP act (travelling, avoiding an encounter). Companions
+//     plus every ONLINE, LIVING player actor.
+// With one player both collapse to vanilla: slot 0 IS gPartyMembers[0].
+Object* partyMemberGetBestInSkill(int skill, Object* actor = nullptr);
 int partyGetBestSkillValue(int skill);
+int partyGetBestSkillValueFor(int skill, Object* actor);
+// The player actor holding the highest value of `skill` among online living players,
+// or nullptr. For crediting a group roll to whoever actually carried it.
+Object* partyGetBestSkillPlayerActor(int skill);
 void _partyMemberSaveProtos();
 bool partyMemberSupportsDisposition(Object* object, int disposition);
 bool partyMemberSupportsAreaAttackMode(Object* object, int areaAttackMode);

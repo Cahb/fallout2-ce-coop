@@ -18,10 +18,12 @@
 #include "client_present.h" // one owner for glide / attack-replay / door-slide presentation
 #include "client_barter.h"
 #include "client_dialog.h" // dialog viewer render (A3 — DIALOG_STREAMING_PLAN Stage 3)
+#include "client_steal.h" // viewer half of a server-owned steal session
 #include "worldmap_ui.h" // wmGenData + gWorldmapStreaming/gPendingWorldmapEnter/gWorldmapStateDirty
 #include "color.h" // _colorTable — float-text styling (COMBAT_CLIENT_DESIGN.md §3.e)
 #include "combat.h" // gCombatState mirror + COMBAT_STATE_* (§3.0)
 #include "combat_defs.h" // Attack / EXPLOSION_TARGET_COUNT — ATTACK_RESULT reconstruct
+#include "elevator.h" // elevatorPickLevel — the co-op elevator panel
 #include "db.h"
 #include "debug.h"
 #include "display_monitor.h" // combat message log (§3.e S2)
@@ -38,17 +40,21 @@
 #include "light.h" // lightSetAmbientIntensity — streamed global ambient-light delta
 #include "map.h"
 #include "actions.h" // actionExplodeReplay + actionPresReplayShowDeath — viewer explosion replay
+#include "automap.h" // automapSaveCurrent — a viewer records its OWN pipboy map
 #include "animation.h" // reg_anim_* / animationRegister* — the real engine the recorded stream drives
 #include "object.h"
+#include "pipboy.h" // pipboyServerHolodisk* — server-authored holodisks
 #include "perk.h" // perkPlayerActorSeedRanks — per-actor sheet rows
 #include "player_sheet.h"
 #include "pres_record.h" // PresOp / PresCallbackTag — the recorded op stream vocabulary
 #include "game_movie.h" // gameMoviePlay — the viewer owns the playback pipeline
 #include "movie.h" // _movieStop — break the blocking playback loop on a room-wide skip
 #include "msg_channel.h"
-#include "presenter.h" // ObjectDeltaField / WorldDeltaField masks
+#include "palette.h" // paletteFadeTo / gPaletteBlack — fades apply at decode, in wire order
+#include "presenter.h"
 #include "proto.h" // protoPlayerActorSheetsSeed — per-actor sheet rows
 #include "scripts.h"
+#include "state_audit.h" // StateAuditRecord / stateAuditCompare — the mirror divergence oracle
 #include "server_players.h"
 #include "settings.h" // target_highlight pref — vanilla outline gate (#8)
 #include "stat.h" // pcPlayerActorSeedStats — per-actor sheet rows
@@ -79,6 +85,12 @@ namespace fallout {
 static bool gDudeInvDirty = false;
 static std::vector<Object*> gDudeDeferredItemFrees;
 
+// Sheet slice (PLAYER_SHEET_DESIGN.md §9) — set when a player-sheet row lands off
+// the wire, drained by the character screen's loop so an open screen repaints from
+// the new row. It is the RETURN PATH for a spend: the screen sends an intent, keeps
+// no optimistic state, and shows the server's answer when this flips.
+static bool gPlayerSheetDeltaDirty = false;
+
 // Loot slice — the container/corpse the viewer's loot screen is currently open on
 // (0 = none). Set by inventoryOpenLooting; its inventory delta gets a FULL contents
 // reconcile (below) so items taken/added show live, instead of the equip-flags-only
@@ -86,6 +98,32 @@ static std::vector<Object*> gDudeDeferredItemFrees;
 // loop to repaint its panels when that reconcile lands.
 static int gViewerLootTargetNetId = 0;
 static bool gLootTargetInvDirty = false;
+
+// Steal slice — the THIEF of the open steal session (0 = none). Same job as the
+// loot target above, for the other panel: on a spectator's screen the left-hand
+// panel is another player's pack, and without this it would take the generic
+// equip-flags-only path and sit frozen while items visibly left the victim.
+// Set from EVENT_STEAL_BEGIN, cleared on END.
+//
+// ►► SAFE FOR THE SAME REASON THE LOOT TARGET IS, and only for that reason: the
+// hazard that keeps the generic critter path equip-flags-only is an in-flight
+// attack replay holding a pointer to an item being freed, and stealing is
+// out-of-combat by construction (actions.cc refuses SKILL_STEAL in combat, and
+// the verbs are refused there too). Removed items are deferred-freed while a
+// modal is open, exactly like the loot target's.
+static int gViewerStealThiefNetId = 0;
+
+// ►► AND THE VICTIM, WHICH IS THE PANEL YOU ACTUALLY STEAL FROM. The thief above
+// got this treatment and the target was overlooked, which is exactly the bug the
+// owner hit: the server DETACHES the victim's equipped weapon/armor and moves its
+// ITEM_HIDDEN gear into a hidden box before the session opens (lootTargetDetach —
+// vanilla: you cannot lift what someone is holding), but a critter that is neither
+// the dude nor a plain container takes the equip-flags-only path, so the viewer went
+// on drawing the pre-detach mirror. Every click on that phantom 10mm Pistol sent a
+// `stake` for a pid the server no longer had, and the honest answer came back as
+// "That item is gone." Reconciling the victim in full makes the right-hand panel
+// show exactly what is stealable — the same list the server is willing to move.
+static int gViewerStealTargetNetId = 0;
 
 // ── Per-client actor binding (MP_PROPOSAL.md Ch 5.6) ────────────────────────
 // On a viewer, gDude means "the actor I control" — a per-client ROLE, not a
@@ -137,6 +175,8 @@ enum : unsigned char {
     EVENT_FLOAT_TEXT = 17,
     EVENT_SFX = 18,
     EVENT_SFX_AT = 19,
+    EVENT_FADE_OUT = 20, // screen fade to black, addressed (0 = everyone)
+    EVENT_FADE_IN = 21, // screen fade back in, addressed. Watchdogged — see onScreenFade
     EVENT_MUSIC_STOP = 23, // background music: stop (emitted since fade/errorbox; decoded only now)
     EVENT_SNAPSHOT_BLOB_BEGIN = 24,
     EVENT_SNAPSHOT_BLOB_CHUNK = 25,
@@ -160,7 +200,18 @@ enum : unsigned char {
     EVENT_MOVIE_STOP = 47, // stop local movie playback (another player skipped the cutscene)
     EVENT_PLAYER_SHEET = 48, // co-op: live per-actor sheet-row delta (chem stat mod, level-up)
     EVENT_ENCOUNTER_PROMPT = 49, // random-encounter accept/decline prompt (title+body) — we answer encaccept/encdecline
-    EVENT_ENCOUNTER_CLOSE = 50, // another viewer answered — break out of our prompt box
+    EVENT_ENCOUNTER_CLOSE = 50,
+    EVENT_GVAR_DELTA = 51, // global variables that changed this beat (index/value pairs)
+    EVENT_HOLODISK_CLEAR = 52, // server-authored holodisks: drop the set, an ADD run follows
+    EVENT_HOLODISK_ADD = 53, // one server holodisk: name + body lines // another viewer answered — break out of our prompt box
+    EVENT_ELEVATOR_PROMPT = 54, // co-op: show THIS actor vanilla's elevator panel
+    EVENT_AUTOMAP_OPEN = 55, // co-op: WE used a Motion Sensor — open our own automap
+    EVENT_STEAL_BEGIN = 56, // co-op: a steal session opened — thief + victim, everyone watches
+    EVENT_STEAL_STATE = 57, // the server moved (or refused) something; deltas already applied — repaint
+    EVENT_STEAL_END = 58, // session over (closed, caught, or bailed) — close the screen
+    EVENT_LOOT_GRANT = 59, // the server opened a container FOR US — open the loot screen
+    EVENT_STATE_AUDIT = 60, // authoritative object state — diff it against our mirror
+    EVENT_UI_LOCK = 61, // scripted cutscene input lock, addressed (0 = everyone)
 };
 
 // crc32 (IEEE, reflected) — MUST match server_loop.cc's joinBlobCrc32.
@@ -298,6 +349,19 @@ private:
 // broadcast reaches us we already answered and moved on) can NEVER close an
 // unrelated modal — or the player's game — that they opened afterward. General
 // rule for any broadcast force-close: gate the ESC on "am I actually in THAT modal".
+// TEMP DIAGNOSTIC [wmenc]: every enqueueInputEvent(KEY_ESCAPE) in this file names
+// itself while a traced dialog box is open. The encounter prompt is being closed by a
+// real KEY_ESCAPE ~1 frame after it opens; these sites plus the two producers in
+// _process_bk are the complete set of ways one can arrive, so whichever line prints IS
+// the cause. Silence from all of them means the keystroke is genuinely the player's.
+static void wmencTagEscInjection(const char* site)
+{
+    const char* tag = dialogBoxTraceActiveTag();
+    if (tag != nullptr) {
+        fprintf(stderr, "[%s] ESC INJECTED by %s\n", tag, site);
+    }
+}
+
 static bool gEncounterPromptActive = false;
 
 // The decoder's live index: wire netId -> local Object*. Seeded from the loaded
@@ -337,6 +401,19 @@ public:
         kSfx, // combat sound effect (feedback)
         kMoveRelease, // release N held glide hops of a mover (in-combat move, §3.d)
         kRecordedSeq, // a recorded presentation command stream (replaces kTakeOut/kDoor/kActionAnim/kExplosionFx)
+        // ►► A STATE-LANE EVENT PARKED ONTO THIS FIFO so it applies in WIRE ORDER
+        // relative to the sequences around it, instead of at decode time
+        // (PRESENTATION_PACING_DESIGN.md §12). The wire is totally ordered, but this
+        // client historically applied state events on one clock (decode) and recorded
+        // sequences on another (pump drain) — a per-lane speed difference IS a reorder,
+        // which the never-lossy invariant forbids. It shows up as lifetime corruption
+        // for the one object whose life BOTH lanes write: a thrown weapon's flight
+        // transient, destroyed by its own pickup DISCONNECT before the flight plays.
+        // Carrying the raw payload is cheap because every event is length-prefixed and
+        // the reader is already bounded to it (see event(), below).
+        // ►► NO FEEDER YET (§12.5 step 1): nothing enqueues this today, so the path is
+        // inert and the goldens must be byte-identical. Step 2 adds the feeder.
+        kDeferredEvent,
     };
     struct PresEvent {
         PresKind kind;
@@ -346,17 +423,56 @@ public:
         int moveNetId = 0, moveHops = 0; // kMoveRelease
         std::vector<unsigned char> seqOps; // kRecordedSeq — the raw op buffer (played at pump time)
         int seqActorNetId = 0; // kRecordedSeq — actor whose approach glide must drain before play (0 = none)
+        // kRecordedSeq — the adopt netIds this sequence INCREMENTED in _pendingAdopts at
+        // decode and will decrement when it executes. Carried so that DROPPING this entry
+        // on backlog can release them: a stranded count never decrements, and then every
+        // later state event for that netId defers against it and force-applies a full cap
+        // late, forever (§12.6 trap 2, reached by a second route).
+        std::vector<int> seqAdopts;
         std::string text; // kConsole / kFloat / kSfx
         int consoleChannel = kMsgChannelDefault; // kConsole — message-log style (msg_channel.h)
+        // kDeferredEvent — the parked state event, re-dispatched verbatim at drain.
+        unsigned char defEvType = 0; // the EVENT_* type byte
+        std::vector<unsigned char> defBytes; // its length-bounded payload, copied
+        unsigned int defEntryId = 0; // wire v4 total-order id, replayed into event()
+        int defNetId = 0; // the object this event addresses — what the gate waits on
+        unsigned int defCapAt = 0; // getTicks() deadline; 0 = set on first gate check
     };
+    // ►► netId -> count of OBJ_CREATEs adopting it that have been DECODED but not yet
+    // EXECUTED (§12.2). Half of the "presentation-entangled" test the feeder uses; both
+    // teardown paths clear it (§12.6 trap 2: miss the clear and later events defer against
+    // a count that never decrements, then force-apply a full cap late, forever).
+    std::unordered_map<int, int> _pendingAdopts;
+
+    // Set while the pump (or the overflow backstop) is re-dispatching a parked event
+    // through event(). Without it the drain would re-park the same event forever: the
+    // netId is STILL entangled at that instant — draining the event is precisely what
+    // un-entangles it. Saved/restored rather than blind-cleared, because an inline
+    // overflow apply can nest inside a drain.
+    bool _applyingDeferredEvent = false;
+
+    // See everBoundToSlot().
+    bool _everBoundToSlot = false;
+
     // Backlog safety cap. The player-turn barrier bounds the queue in practice (the
     // server blocks on the claimant, who cannot act until the queue drains), so this
     // only guards a pathological run; when hit, the oldest droppable (non-turn,
     // non-exit) event is discarded so turn boundaries never desync.
     static constexpr size_t kMaxQueuedPresEvents = 1024;
 
-    explicit Decoder(const char* blobTmpPath)
-        : _blobTmpPath(blobTmpPath), _loaded(false), _tripwireOk(0), _tripwireBad(0) {}
+    // ►► Wall-clock backstop for a parked state event (§12.2). If the animation it waits
+    // on never finishes (wedged, cancelled, or the object died), the event FORCE-APPLIES
+    // rather than waiting forever: failure direction stays "play/snap, never freeze", and
+    // never "drop" — the server's event is always applied, only late. Sibling of the
+    // move-replay cap in client_present.cc.
+    static constexpr unsigned int kDeferredEventCapMs = 4000;
+
+    // A server holodisk is meant to be a page or two of text. Bounds an untrusted
+    // wire line count before anything is allocated for it.
+    static constexpr int kMaxHolodiskLines = 512;
+
+    Decoder()
+        : _loaded(false), _tripwireOk(0), _tripwireBad(0) {}
 
     int tripwireOk() const { return _tripwireOk; }
     int tripwireBad() const { return _tripwireBad; }
@@ -379,19 +495,128 @@ public:
     bool inCombat() const { return _inCombat; }
     bool myTurn() const { return _myTurn; }
 
+    // Did this client EVER appear in a player roster under its own session? False means
+    // the server never bound us to a slot — which is what a REFUSED LOGIN looks like from
+    // this side, since the wire has no per-session channel to explain a refusal over.
+    bool everBoundToSlot() const { return _everBoundToSlot; }
+
     // In-combat inventory grant (Stage 4). `take` consumes the one-shot latch set
     // by onInventoryGrant; `open` tracks whether the granted screen is currently
     // up, which is what stops the service ticker force-ESCing it (see
     // viewerServiceTicker — closing the screen the server just charged 4 AP for
     // would take the AP and give nothing back).
+    // One-shot: the container the server just opened for us, or 0.
+    int takeLootGrant()
+    {
+        int netId = _lootGrantNetId;
+        _lootGrantNetId = 0;
+        return netId;
+    }
+
     bool takeInventoryGrant()
     {
         bool granted = _invGrantPending;
         _invGrantPending = false;
         return granted;
     }
+    // ►►►► APPLIED HERE, AT DECODE, IN WIRE ORDER — and that placement is the whole
+    // point. Latching the fade for the main loop to run later meant every objectDelta
+    // in the frame (which IS applied at decode) landed BEFORE it, so the change the
+    // fade exists to hide was already on screen when the screen went black: the grave
+    // popped open, then the fade played. Order on the wire is now FADE_OUT, the
+    // change, FADE_IN (the server flushes its deltas at each boundary), and honouring
+    // that order requires applying the fade where the deltas are applied.
+    //
+    // Safe to block here, unlike a modal: paletteFadeTo spins the palette for a few
+    // hundred ms with a sound-continue callback. It reads no input, opens no window
+    // and pumps no wire, so it cannot apply later events from under its own feet —
+    // the hazard the latch rule exists for.
+    void applyFade(bool toBlack)
+    {
+        if (toBlack) {
+            paletteFadeTo(gPaletteBlack);
+            _fadeBlackSinceMs = getTicks();
+            if (_fadeBlackSinceMs == 0) _fadeBlackSinceMs = 1; // 0 = "not black"
+        } else {
+            paletteFadeTo(_cmap);
+            _fadeBlackSinceMs = 0;
+        }
+    }
+
+    // For the main loop's watchdog: when we went black, or 0.
+    unsigned int fadeBlackSince() const { return _fadeBlackSinceMs; }
+    void clearFadeBlack() { _fadeBlackSinceMs = 0; }
+
+    // Fade QUEUE, drained in order — and it must be a queue, not a latch.
+    //
+    // ►►►► "LATEST WINS" IS WHY NOBODY EVER SAW A FADE. This used to keep one pending
+    // value and let a fade-in overwrite an un-applied fade-out, reasoning that a pair
+    // arriving together meant "a sequence that already finished, don't blink". But on a
+    // dedicated server EVERY pair arrives together: the work between the two calls (dig
+    // the grave, pass the time, move the actor) is instantaneous headless, so the out and
+    // the in are emitted in the SAME beat and land in the same pump batch. The collapse
+    // therefore fired on the normal case and dropped the fade-out every single time — the
+    // screen never went black, and all the player got was the sim visibly stopping and
+    // starting again (owner: "people freeze and unfreeze a split second later, no black
+    // screen"). The freeze was the server's parked tick; the fade that was supposed to
+    // COVER it had been optimized away.
+    //
+    // Applying both in order is also what single player looks like: paletteFadeTo blocks
+    // and steps the palette, so out-then-in is a real fade down and back up, not a blink.
+    // The fade itself is applied at decode (see applyFade); all that is left for the
+    // main loop is the watchdog, because a fade-out whose matching fade-in never
+    // arrives — the script errored, the actor died mid-sequence, the connection
+    // dropped — leaves the player staring at a black screen with no way out. Fading
+    // back early costs a visual beat; staying black costs the session.
+    bool fadeWatchdogExpired(unsigned int nowMs, unsigned int maxBlackMs) const
+    {
+        return _fadeBlackSinceMs != 0 && getTicksBetween(nowMs, _fadeBlackSinceMs) > maxBlackMs;
+    }
+
+    // Automap latch (same one-shot shape, same reason — a modal screen must not be
+    // opened from inside pump()).
+    bool takeAutomapOpen(bool* usingScanner)
+    {
+        if (!_automapPending) {
+            return false;
+        }
+        _automapPending = false;
+        *usingScanner = _automapUsingScanner;
+        return true;
+    }
+
+    // Encounter accept/decline latch (same one-shot shape and the same reason as the
+    // two above — see onEncounterPrompt). Unlike those, the SERVER IS BLOCKED on the
+    // answer, so this one cannot wait for the main loop's no-modal-open point: the
+    // viewer is inside its worldmap modal when the prompt lands. viewerServiceTicker
+    // takes it, which runs in every modal loop AND the main loop, and — crucially —
+    // outside drain().
+    bool takeEncounterPrompt(std::string* title, std::string* body)
+    {
+        if (!_encPromptPending) {
+            return false;
+        }
+        _encPromptPending = false;
+        *title = _encPromptTitle;
+        *body = _encPromptBody;
+        return true;
+    }
+
+    // Elevator panel latch (same one-shot shape, same reason — see onElevatorPrompt).
+    bool takeElevatorPrompt(int* elevator, int* startLevel)
+    {
+        if (!_elevatorPending) {
+            return false;
+        }
+        _elevatorPending = false;
+        *elevator = _elevatorType;
+        *startLevel = _elevatorStartLevel;
+        return true;
+    }
+
     void setCombatModalOpen(bool open) { _combatModalOpen = open; }
     bool combatModalOpen() const { return _combatModalOpen; }
+
 
     void setInCombat(bool v) { _inCombat = v; }
 
@@ -436,6 +661,49 @@ public:
     // combat move's AP is deferred (§3.d), poll the dude's remaining glide hops: each
     // hop consumed drops the SHOWN AP one dot (clamped at auth — free-move hexes cost
     // 0), and when the glide ends (no walk left) the bar reconciles to authoritative.
+    // ►► GIVE THE AP DOTS A RE-DERIVATION PATH, which is the one thing they never had.
+    //
+    // Every other element of the interface bar is idempotently re-derived from state:
+    // interfaceBarRefresh() and interfaceBarShow() both re-render items, HP and AC and
+    // then push the window. NEITHER renders action points (interface.cc) — the dots are
+    // only ever whatever the last explicit interfaceRenderActionPoints() left in the
+    // buffer. So AP is write-only-on-event, and ANY path that changes it without
+    // painting, or paints it while the bar is covered by a modal, leaves a stale number
+    // on screen until something unrelated happens to repaint. Two such paths exist:
+    //   - the in-combat inventory SCREEN, priced by the server at open (4 AP, item.cc
+    //     inventoryApCostApply) — the delta lands around the moment the modal takes over
+    //     the frame loop (the service ticker keeps the wire pumping INSIDE that loop);
+    //   - resolveHeld (client_present.cc), which commits a HELD move AP straight onto
+    //     the object and repaints nothing.
+    // Rather than teach each site to repaint — that is whack-a-mole, and the list is
+    // open-ended — converge here, every frame, exactly as rollDudeHp does for HP two
+    // functions down. Then no caller has to remember and the whole class is closed.
+    //
+    // ►► DOWNWARD ONLY, and that is not an optimization. onObjectDelta deliberately
+    // REFUSES to paint an AP increase, because an increase is the round reset that
+    // precedes the next turn and painting it would flash a full green bar before the
+    // paced TURN_START flips the bar to the next actor (see the comment there). An
+    // unconditional converge-to-authority would reintroduce exactly that flash. Showing
+    // MORE AP than authority is the bug; showing less is either that deliberate
+    // suppression or a move mid-tick-down, and both have an owner already.
+    void tickApBar()
+    {
+        if (!clientViewerActive() || !_inCombat || !_myTurn || gDude == nullptr) {
+            return;
+        }
+        if (_dudeApDeferring) {
+            return; // a move's per-hex tick owns the shown value until it lands
+        }
+        int authoritative = gDude->data.critter.combat.ap;
+        if (_dudeApShown <= authoritative) {
+            return;
+        }
+        _dudeApShown = authoritative;
+        _dudeApAuth = authoritative;
+        interfaceRenderActionPoints(_dudeApShown, _combat_free_move);
+        interfaceBarRefresh();
+    }
+
     void tickCombatMoveAp()
     {
         if (!clientViewerActive() || !_dudeApDeferring) {
@@ -510,6 +778,7 @@ public:
             return;
         }
         tickCombatMoveAp();
+        tickApBar(); // AFTER the per-hex tick, which owns the shown value while it runs
         rollDudeHp();
         // While an animation plays, release NOTHING — not the next attack, and not
         // the next attack's leading console/float/sfx (the server emits an attack's
@@ -574,6 +843,32 @@ public:
                     break;
                 }
             }
+            // (1f) ►► A PARKED STATE EVENT waits for the object it addresses to stop
+            //      animating, so a thrown weapon's pickup DISCONNECT lands AFTER its own
+            //      flight/landing anim instead of destroying the transient mid-air
+            //      (§12.2). Keyed on the EVENT's netId, deliberately NOT the sequence
+            //      actor: the thrower's follow-through is not "the spear has landed", and
+            //      keying on the actor breaks when the thrower has been freed. A NULL
+            //      lookup can only mean "already gone" under FIFO order (its sequence
+            //      drained first), so null → apply now, do not hold.
+            if (front.kind == PresKind::kDeferredEvent) {
+                // Stamp the arrival on first sight (front is const here, so poke the queue
+                // slot), then age it with getTicksSince — the same wraparound-safe helper
+                // the glide caps use.
+                if (_presQueue.front().defCapAt == 0) {
+                    _presQueue.front().defCapAt = getTicks();
+                }
+                bool expired = getTicksSince(_presQueue.front().defCapAt) >= kDeferredEventCapMs;
+                Object* subject = lookup(front.defNetId);
+                bool busy = subject != nullptr && animationIsBusy(subject) != 0;
+                if (busy && !expired) {
+                    break;
+                }
+                if (busy && expired) {
+                    debugPrint("client_net: deferred event type=%d net=%d force-applied at cap\n",
+                        (int)front.defEvType, front.defNetId);
+                }
+            }
             // (2) A turn flip / end-of-combat waits for the OUTGOING actor to finish
             //     gliding, so the AP dots flip (and the doors close) only after the
             //     last approach/retreat plays out. In combat the only playable glides
@@ -593,6 +888,17 @@ public:
             case PresKind::kFloat: applyFloat(ev.floatNetId, ev.text); break;
             case PresKind::kSfx: applySfx(ev.text); break;
             case PresKind::kMoveRelease: clientAnimRelease(lookup(ev.moveNetId), ev.moveHops); break;
+            case PresKind::kDeferredEvent: {
+                // Re-dispatch verbatim through the SAME handler the decoder would have
+                // used. event() expects a reader bounded to exactly this payload, which
+                // is what we copied, so the handler cannot tell it was parked.
+                Reader dr(ev.defBytes.data(), ev.defBytes.size());
+                bool prevDeferring = _applyingDeferredEvent;
+                _applyingDeferredEvent = true;
+                event(ev.defEvType, dr, ev.defEntryId);
+                _applyingDeferredEvent = prevDeferring;
+                break;
+            }
             case PresKind::kRecordedSeq:
                 presPlayRecordedSeq(ev.seqOps.data(), (int)ev.seqOps.size(), true);
                 // Uniform Active marking (Fable review A5/C.2): a throw/attack/wield seq's
@@ -641,9 +947,49 @@ public:
         // rebaseline blob that follows (same beat, C.4) carries all of that
         // state; apply nothing before the world exists. Same rule covers the
         // MAP_TRANSITION→blob window (transition clears _loaded).
+        //
+        // ►►►► EXCEPT A CONSOLE LINE, WHICH ADDRESSES NO WORLD. This gate is why "you
+        // enter a random encounter and are never told what it is" survived a server-side
+        // fix that demonstrably put the line on the wire: the arrival description is
+        // emitted immediately after mapLoadById, i.e. INSIDE the MAP_TRANSITION→blob
+        // window where _loaded is false, so it was dropped here — before onConsole,
+        // silently, with no gap and no error to show for it. Measured: 20 console lines
+        // decoded in the same session, that one never arriving.
+        //
+        // The rule this gate enforces is "apply nothing that references a world which
+        // does not exist yet", and it is right for the object/state family. A console
+        // message is text for the interface bar's log; it owns no netId, touches no
+        // object, and the display monitor outlives every map. The one variant that DOES
+        // carry an address (a refusal aimed at one actor) is still safe, because
+        // onConsole drops it when gDude is null — so nothing here can act on a body that
+        // has not been rebuilt. The flood case this gate also guarded against is already
+        // handled a layer up, by mapLoad's emission-suppression window on the server.
         if (!_loaded && type != EVENT_SNAPSHOT_BLOB_BEGIN
-            && type != EVENT_SNAPSHOT_BLOB_CHUNK && type != EVENT_SNAPSHOT_BLOB_END) {
+            && type != EVENT_SNAPSHOT_BLOB_CHUNK && type != EVENT_SNAPSHOT_BLOB_END
+            && type != EVENT_CONSOLE) {
             return;
+        }
+        // ►► §12.2 FEEDER — the ONE rule: a state event addressing a presentation-
+        // entangled netId rides _presQueue in wire order instead of applying here on the
+        // decode clock. These five are the object-lifecycle/state family, i.e. the events
+        // that can write the life of a thrown weapon's flight transient; deferring them is
+        // what stops its pickup DISCONNECT from destroying it mid-air. Nothing else defers
+        // — a caption or a turn flip has no object whose animation it could outrun.
+        // ⚠ _lastEntryId was already stamped above (decoded), and the re-dispatch at drain
+        // stamps it again with the same id. Inert today; when the state-hash ack consumes
+        // it (§4 P2b) it must report APPLIED-through, so it belongs on the drain side.
+        switch (type) {
+        case EVENT_MOVE:
+        case EVENT_DESTROY:
+        case EVENT_CONNECT:
+        case EVENT_DISCONNECT:
+        case EVENT_OBJECT_DELTA:
+            if (deferStateEvent(type, r, entryId)) {
+                return;
+            }
+            break;
+        default:
+            break;
         }
         switch (type) {
         case EVENT_SNAPSHOT_BLOB_BEGIN: onBlobBegin(r); break;
@@ -671,6 +1017,9 @@ public:
         case EVENT_BARTER_BEGIN: onBarterBegin(r); break;
         case EVENT_BARTER_STATE: onBarterState(r); break;
         case EVENT_BARTER_END: onBarterEnd(r); break;
+        case EVENT_STEAL_BEGIN: onStealBegin(r); break;
+        case EVENT_STEAL_STATE: onStealState(r); break;
+        case EVENT_STEAL_END: onStealEnd(r); break;
         case EVENT_DIALOG_NODE: onDialogNode(r); break;
         case EVENT_DIALOG_END: onDialogEnd(r); break;
         case EVENT_WORLDMAP_BEGIN: onWorldmapBegin(r); break;
@@ -686,6 +1035,16 @@ public:
         case EVENT_PLAYER_SHEET: onPlayerSheet(r); break;
         case EVENT_ENCOUNTER_PROMPT: onEncounterPrompt(r); break;
         case EVENT_ENCOUNTER_CLOSE: onEncounterClose(r); break;
+        case EVENT_GVAR_DELTA: onGvarDelta(r); break;
+        case EVENT_HOLODISK_CLEAR: onHolodiskClear(r); break;
+        case EVENT_HOLODISK_ADD: onHolodiskAdd(r); break;
+        case EVENT_ELEVATOR_PROMPT: onElevatorPrompt(r); break;
+        case EVENT_AUTOMAP_OPEN: onAutomapOpen(r); break;
+        case EVENT_LOOT_GRANT: onLootGrant(r); break;
+        case EVENT_STATE_AUDIT: onStateAudit(r); break;
+        case EVENT_FADE_OUT: onScreenFade(r, true); break;
+        case EVENT_FADE_IN: onScreenFade(r, false); break;
+        case EVENT_UI_LOCK: onScreenInputLock(r); break;
         case EVENT_MUSIC_PLAY: onMusicPlay(r); break;
         case EVENT_MUSIC_STOP: onMusicStop(r); break;
         // SNAPSHOT_BEGIN/END are pure brackets; presentation cues are cosmetic and
@@ -750,6 +1109,25 @@ private:
         }
     }
 
+    // ►► AN ITEM'S pid CAN CHANGE UNDER A STABLE netId, and the mirror has to follow.
+    // Arming a charge is a pid SWAP, not a new item: explosiveActivate rewrites
+    // plastic explosives 85 -> 209 (dynamite 51 -> 206) in place, same object, same
+    // netId. matchInventorySlot binds netId FIRST — deliberately, so two stacks of one
+    // pid stop being interchangeable — which means an armed charge matched its old
+    // mirror slot and the pid write never happened: the mirror kept saying "Plastic
+    // Explosives" (unarmed) forever, and every pid-addressed verb it sent named an
+    // item the server no longer had ("That item is gone" on the steal screen's plant).
+    // Rewrite pid AND fid: the inventory sprite comes from the proto's inventory fid,
+    // captured at create time, so a pid written alone leaves the old art on screen.
+    static void applyWireItemPid(Object* item, int pid)
+    {
+        if (item == nullptr || pid < 0 || item->pid == pid) return;
+        Proto* proto;
+        if (protoGetProto(pid, &proto) == -1) return;
+        item->pid = pid;
+        item->fid = proto->fid;
+    }
+
     // Append a combat-presentation event, enforcing the safety cap. On overflow drop
     // the oldest DROPPABLE event (never a turn-start / exit, so turn boundaries and
     // the fight's end stay intact) — its state already rode the deltas; only a
@@ -761,18 +1139,131 @@ private:
             return;
         }
         for (auto it = _presQueue.begin(); it != _presQueue.end(); ++it) {
+            // ►►►► NEVER DROP A PARKED STATE EVENT (§12.6 trap 1). Dropping one is not a
+            // lost caption — it is a lost DESTROY, i.e. a permanently phantom object: the
+            // exact bug §12 exists to fix, reintroduced under backlog. It is also a
+            // never-lossy violation (the wire said the object dies; we would silently
+            // decide otherwise). Skipped here and force-applied below instead.
+            if (it->kind == PresKind::kDeferredEvent) {
+                continue;
+            }
             if (it->kind != PresKind::kTurnStart && it->kind != PresKind::kExit) {
                 if (it->kind == PresKind::kMoveRelease) {
                     // Its held glide must not outlive its release: snap the mover to
                     // its (already authoritative) position instead of stranding it.
                     clientAnimCancel(lookup(it->moveNetId));
                 }
+                if (it->kind == PresKind::kRecordedSeq) {
+                    // This sequence will never execute, so the mints it promised at decode
+                    // will never happen — release them, or the netIds stay entangled with
+                    // nothing left to un-entangle them and every later event for them waits
+                    // out the full cap. The state is unaffected (the pickup DISCONNECT still
+                    // drains and the CONNECT self-heal materializes the real item); only the
+                    // flight visual is lost, which is what dropping a sequence has always
+                    // meant.
+                    for (int adoptNetId : it->seqAdopts) {
+                        releasePendingAdopt(adoptNetId);
+                    }
+                }
                 _presQueue.erase(it);
                 debugPrint("client_net: combat presentation backlog, dropped an event\n");
                 return;
             }
         }
+        // Nothing droppable left. If a parked state event is holding the line, APPLY it
+        // now (do not merely skip it: with the queue at cap and no droppable entries, the
+        // gate would never be reached and the event would starve behind its own cap).
+        for (auto it = _presQueue.begin(); it != _presQueue.end(); ++it) {
+            if (it->kind == PresKind::kDeferredEvent) {
+                PresEvent forced = *it;
+                _presQueue.erase(it);
+                debugPrint("client_net: presentation backlog at cap — deferred event type=%d "
+                           "net=%d applied inline\n",
+                    (int)forced.defEvType, forced.defNetId);
+                Reader dr(forced.defBytes.data(), forced.defBytes.size());
+                bool prevDeferring = _applyingDeferredEvent;
+                _applyingDeferredEvent = true;
+                event(forced.defEvType, dr, forced.defEntryId);
+                _applyingDeferredEvent = prevDeferring;
+                return;
+            }
+        }
         _presQueue.pop_front(); // all turn/exit (degenerate) — drop the oldest anyway
+    }
+
+    // One promised OBJ_CREATE for this netId has been fulfilled (executed) or cancelled
+    // (its sequence was dropped). Erase at zero so `count()` stays a clean predicate.
+    void releasePendingAdopt(int netId)
+    {
+        auto it = _pendingAdopts.find(netId);
+        if (it == _pendingAdopts.end()) {
+            return;
+        }
+        if (--it->second <= 0) {
+            _pendingAdopts.erase(it);
+        }
+    }
+
+    // ►► IS THIS netId'S PRESENTATION STILL OWED TO THE VIEWER? (§12.2) Two states, and
+    // together they cover the whole life of an adopt transient with no gap:
+    //   _pendingAdopts   — an OBJ_CREATE adopting it was DECODED but has not EXECUTED yet
+    //                      (the sequence is still sitting on the pump);
+    //   _adoptTransients — it HAS executed, the transient exists, and its flight/landing
+    //                      is playing or queued.
+    // The gap between those two is exactly the window the old decode-mint existed to
+    // paper over. Note the ordering property this buys for free: once ONE event for netId
+    // X defers, X is entangled for as long as the FIFO holds it, so every LATER event for
+    // X defers too — per-netId wire order is preserved end to end by construction, not by
+    // a sort.
+    bool presEntangled(int netId) const
+    {
+        if (netId <= 0) {
+            return false;
+        }
+        return _pendingAdopts.count(netId) != 0 || _adoptTransients.count(netId) != 0;
+    }
+
+    // Park a state event onto _presQueue when the object it addresses is presentation-
+    // entangled, so it applies in wire order relative to the sequences around it instead
+    // of on the decode clock (§12.2). Returns true when parked — the caller must then NOT
+    // apply it. The handlers' own guards are not bypassed, only postponed: they run
+    // unchanged when the drain re-dispatches through event() (§12.6 trap 3).
+    bool deferStateEvent(unsigned char type, Reader& r, unsigned int entryId)
+    {
+        if (_applyingDeferredEvent) {
+            return false; // the drain itself — apply for real this time
+        }
+        // Headless is already inert (onPresSeq returns before the dry pass when the viewer
+        // is off, so neither map is ever fed), but say so structurally: no future feeder
+        // can move a golden through this path.
+        if (!clientViewerActive()) {
+            return false;
+        }
+        // Every deferrable event carries netId as its FIRST field — MOVE, DESTROY,
+        // CONNECT, DISCONNECT, OBJECT_DELTA — which is why this check can live once at
+        // the dispatcher instead of five times inside the handlers. Peek it on a copy so
+        // the caller's reader is untouched when we decline.
+        const unsigned char* payload = r.here();
+        size_t len = r.remaining();
+        Reader peek(payload, len);
+        int netId = peek.i32();
+        if (peek.overflow() || !presEntangled(netId)) {
+            return false;
+        }
+        PresEvent e;
+        e.kind = PresKind::kDeferredEvent;
+        e.defEvType = type;
+        e.defBytes.assign(payload, payload + len); // length-prefixed, so this is the whole event
+        e.defEntryId = entryId;
+        e.defNetId = netId;
+        if (getenv("F2_TRACE_EVENTS") != nullptr) {
+            fprintf(stderr, "[adopt] PARK type=%d net=%d bytes=%d pendingMints=%d live=%d queued=%d\n",
+                (int)type, netId, (int)len,
+                _pendingAdopts.count(netId) != 0 ? _pendingAdopts[netId] : 0,
+                _adoptTransients.count(netId) != 0 ? 1 : 0, (int)_presQueue.size());
+        }
+        enqueue(e);
+        return true;
     }
 
     void onBlobBegin(Reader& r)
@@ -848,6 +1339,7 @@ private:
             return;
         }
         _combatModalOpen = false;
+        wmencTagEscInjection("onInventoryRevoke");
         enqueueInputEvent(KEY_ESCAPE);
     }
 
@@ -910,6 +1402,10 @@ private:
                 mySlot = row.slot;
                 break;
             }
+        }
+
+        if (mySlot >= 0) {
+            _everBoundToSlot = true; // we appeared in a roster under our own session
         }
 
         Object* mine = mySlot >= 0 ? playerActorAt(mySlot) : nullptr;
@@ -1023,6 +1519,7 @@ private:
         // seedNetMap below is now populate-only.
         _net.clear();
         _adoptTransients.clear(); // adopt transients die with the old world (Fable review A3)
+        _pendingAdopts.clear(); // ...and so do pending adopt mints (§12.6 trap 2)
 
         // Drop the previous blob's actor registrations BEFORE mapLoad frees the
         // objects they point at (MP_PROPOSAL.md Ch 5.3). Same reasoning as
@@ -1135,9 +1632,23 @@ private:
                 actorPidObjects++;
             }
         }
-        if (actorPidObjects != playerActorCount()) {
-            debugPrint("client_net: ACTOR LEAK — %d actor-pid objects in the world, %d registered\n",
-                actorPidObjects, playerActorCount());
+        // ►► COMPARE AGAINST THE *PLACED* ACTORS, NOT ALL REGISTERED ONES. A slot whose
+        // owner is offline is PARKED at tile -1 (the presence model: "slot N body parked"),
+        // and a parked body is not in any tile list — so the walk above cannot see it and
+        // the count can NEVER match while anyone is away. The result was a LEAK warning on
+        // literally every join of a session with an absent player, which is the worst thing
+        // a leak detector can do: cry wolf so reliably that a real leak reads as normal.
+        int placedActors = 0;
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            Object* a = playerActorAt(slot);
+            if (a != nullptr && a->tile != -1) {
+                placedActors++;
+            }
+        }
+        if (actorPidObjects != placedActors) {
+            debugPrint("client_net: ACTOR LEAK — %d actor-pid objects in the world, %d placed "
+                       "(%d registered incl. parked)\n",
+                actorPidObjects, placedActors, playerActorCount());
         }
 
         if (getenv("F2_TRACE_EVENTS") != nullptr) {
@@ -1193,6 +1704,10 @@ private:
                 }
             }
             _presQueue.clear();
+            // Parked state events die with the queue here, which is CORRECT — the blob is
+            // truth for the new world, so a deferred DISCONNECT addressing the old one has
+            // nothing left to destroy. The matching _pendingAdopts.clear() rides the
+            // adopt-transient clear above; both must go together (§12.6 trap 2).
             _pendingDudeTick = 0;
             _dudeApDeferring = false;
             if (exitPending) {
@@ -1422,6 +1937,26 @@ private:
                 mapSetElevation(toElev);
                 tileSetCenter(toTile, TILE_SET_CENTER_REFRESH_WINDOW);
             }
+            // ►► MY actor TELEPORTED on the same floor → follow it too. In single-player
+            // the recenter for a scripted relocation lives inside opMoveTo's
+            // `object == gDude` branch (interpreter_extra.cc), which on a dedicated server
+            // runs server-side where there is no camera, and is never streamed.
+            // objectSetLocation only recenters on an ELEVATION change (object.cc), and the
+            // branch above mirrors exactly that — so a same-floor script teleport left the
+            // camera on the old spot with the player off-screen.
+            //
+            // Re-derived here rather than pushed as an event on purpose: every relocation
+            // path (script move_to, critter_attempt_placement, the co-op fan-out that
+            // places OTHER players, exit grids, elevators) arrives as a position change, so
+            // one condition covers them all and each viewer times it off its own actor. An
+            // emit per relocation site would be the whack-a-mole this replaces.
+            //
+            // Gated on a non-adjacent jump so ordinary walking is untouched: a walk is a
+            // sequence of 1-tile hops and already scrolls the camera by its own machinery.
+            else if (clientViewerActive() && obj == gDude
+                && tileDistanceBetween(fromTile, toTile) > 1) {
+                tileSetCenter(toTile, TILE_SET_CENTER_REFRESH_WINDOW);
+            }
             // State first, always (authoritative, never lags the wire); the
             // presentation layer then decides whether the RENDERING glides
             // (durMs>0 hop) or stays snapped. No-op unless the viewer enabled it.
@@ -1512,6 +2047,7 @@ private:
                 _net.erase(netId);
                 gViewerLootTargetNetId = 0; // stop full-reconciling a target about to be freed
                 gDudeDeferredItemFrees.push_back(obj); // freed on modal close, not now
+                wmencTagEscInjection("loot screen close");
                 enqueueInputEvent(KEY_ESCAPE); // close the loot screen at its top-of-loop check
                 return;
             }
@@ -1638,9 +2174,38 @@ private:
                 // drop every reference — no leak, no dangling _net / _adoptTransients / freed
                 // node to crash teardown (Fable review A2/B). The viewer's inventory mirror is
                 // rebuilt from OBJECT_DELTA, so nothing references the transient afterward.
+                //
+                // ►►►► DESTROY THE TRANSIENT WE RECORDED, NOT WHATEVER netId RESOLVES TO NOW,
+                // and this is a crash, not a nicety. `_net[netId]` is not stable across the
+                // throw: pick the weapon back up and the server moves that SAME netId into
+                // the dude's pockets, so the inventory reconcile mints a mirror item and
+                // adoptItemNetId REBINDS the netId to it — legitimately, it is the real
+                // object now. This handler then looked the netId up, got the ITEM, and freed
+                // an object still linked in gDude's inventory. Nothing noticed until the next
+                // walk of that inventory: open the pack and inventoryRenderSummary reads a
+                // freed proto (owner-reported SIGSEGV in itemGetWeight, throw a rock → pick
+                // it up → 'I'). The bridge already holds the pointer; use it.
+                Object* transient = it->second;
                 _adoptTransients.erase(it);
-                _net.erase(netId);
-                objectDestroy(obj, nullptr);
+                if (transient != nullptr) {
+                    // Only surrender the netId if it is still OURS. Rebound to a real
+                    // object, the entry belongs to that object and erasing it would
+                    // un-address a live item.
+                    auto netIt = _net.find(netId);
+                    if (netIt != _net.end() && netIt->second == transient) {
+                        _net.erase(netIt);
+                    }
+                    presForgetObject(transient);
+                    // Belt, the same one onDestroy wears: a carried object must leave its
+                    // owner's inventory before it is freed. A transient should never BE
+                    // carried — but that was equally true of the object this used to free.
+                    unlinkFromAnyInventory(transient);
+                    objectDestroy(transient, nullptr);
+                }
+                // `obj` is the netId's CURRENT owner. If that is no longer the transient it
+                // is a real object (the picked-up item), and a flight object's disconnect
+                // says nothing about it — it is not in the world to be disconnected from.
+                return;
             } else {
                 // ►► REPAINT THE VACATED TILE. _obj_disconnect only unlinks the
                 // object; it does not redraw anything. Passing nullptr for the Rect
@@ -1712,9 +2277,40 @@ private:
         int lightDistance = 0, lightIntensity = 0;
         bool hasLight = (mask & OBJECT_DELTA_LIGHT) != 0;
         if (hasLight) { lightDistance = r.i32(); lightIntensity = r.i32(); }
+        // PID (bit 11), last — matches the writer.
+        int newPid = -1;
+        bool hasPid = (mask & OBJECT_DELTA_PID) != 0;
+        if (hasPid) newPid = r.i32();
 
+        if (hasFid && getenv("F2_TRACE_EVENTS") != nullptr) {
+            Object* traced = lookup(netId);
+            // The other half of the wield question: the server can say "armed", but what
+            // matters on screen is the fid this viewer settles on. Nibble 0 = unarmed body,
+            // so a server-armed critter arriving here with nibble 0 is a REPLICATION gap,
+            // while one arriving armed that still shows no weapon is a RENDER gap. Logging
+            // both sides is what separates them.
+            fprintf(stderr, "[fid] net=%d %s 0x%x -> 0x%x (weapAnimNibble %d -> %d)\n", netId,
+                traced != nullptr ? "apply" : "DROP(no object)",
+                traced != nullptr ? traced->fid : 0, fid,
+                traced != nullptr ? ((traced->fid & 0xF000) >> 12) : -1,
+                (fid & 0xF000) >> 12);
+        }
         Object* obj = lookup(netId);
-        if (obj == nullptr) return;
+        if (obj == nullptr) {
+            // ►► SAY SO. A delta for a netId this viewer has no object for used to vanish
+            // here without a word, which makes a whole bug class invisible: the server is
+            // healthy, the wire is healthy, and the player simply never sees the object or
+            // any change to it. That is exactly how the car-trunk hunt burned an evening —
+            // the trunk was fine server-side and the viewer had nothing to apply it to.
+            // Once per netId, so a genuinely absent object cannot flood the log.
+            static std::unordered_set<int> warned;
+            if (warned.insert(netId).second) {
+                debugPrint("client_net: objectDelta for UNKNOWN netId=%d (mask 0x%x) dropped — "
+                           "this viewer has no such object\n",
+                    netId, mask);
+            }
+            return;
+        }
         int prevAp = obj->data.critter.combat.ap; // for the dude AP-flash guard below
         // S4 deferred-final-state (§3.c): while obj is an attack participant (reserved
         // at decode, or under active replay) HOLD its fid/flags AND rotation so the
@@ -1749,6 +2345,18 @@ private:
                     objectSetRotation(obj, rot, nullptr);
                 }
             }
+        }
+        // PID: the object became a different KIND of thing (see OBJECT_DELTA_PID). Applied
+        // BEFORE the frame/light writes below, because every proto-derived answer — the
+        // name, the item type, can-use, and objectSetFrame's own frame-count validation —
+        // resolves through it, and applying the new art against the old proto is precisely
+        // the mismatch this field exists to end. No re-creation: identity (netId, tile,
+        // inventory, script binding) belongs to the object, not to its proto.
+        if (hasPid && newPid >= 0 && obj->pid != newPid) {
+            if (getenv("F2_TRACE_EVENTS") != nullptr) {
+                fprintf(stderr, "[pid] net=%d pid %d -> %d\n", netId, obj->pid, newPid);
+            }
+            obj->pid = newPid;
         }
         // FRAME: scripted art-frame swaps (dug graves, opened doors/containers, levers)
         // that never streamed before — only fixed on a map reload. Apply to non-critters
@@ -1800,7 +2408,13 @@ private:
         if (hasInventory && obj != gDude
             && clientViewerActive()
             && (plainContainer
-                || (gViewerLootTargetNetId != 0 && obj->netId == gViewerLootTargetNetId))) {
+                || (gViewerLootTargetNetId != 0 && obj->netId == gViewerLootTargetNetId)
+                // The thief of an open steal session: another player's pack, drawn
+                // in the left panel of everyone's screen. See the declaration.
+                || (gViewerStealThiefNetId != 0 && obj->netId == gViewerStealThiefNetId)
+                // The victim of an open steal session: the right panel, minus the
+                // gear the server detached. See the declaration.
+                || (gViewerStealTargetNetId != 0 && obj->netId == gViewerStealTargetNetId))) {
             // The container/corpse the viewer is actively LOOTING: reconcile its FULL
             // top-level contents (qty + ADD + REMOVE), so items taken out disappear and
             // items put in appear live in the right-hand panel. This is the dude
@@ -1967,6 +2581,9 @@ private:
                     claimed[m] = 1;
                     inv->items[m].quantity = qty;
                     inv->items[m].item->flags |= equip;
+                    // A netId match can still be a DIFFERENT kind of thing now (an
+                    // explosive that was armed) — see applyWireItemPid.
+                    applyWireItemPid(inv->items[m].item, wi.pid);
                     applyWireItemAmmo(inv->items[m].item, wi.ammoQuantity, wi.ammoTypePid);
                     // Adopt the authoritative netId: a stack the mirror created locally on
                     // an earlier delta has none until the next rebaseline, which would keep
@@ -1996,7 +2613,17 @@ private:
             // inventory handler holds across its inner pump (the drag / ctx-menu locals), so
             // while a modal is open we DEFER the free (flushed after the screen closes) and
             // only unlink now. With no modal open, free immediately.
-            if (!_inCombat) {
+            //
+            // ►►►► UNLINKING AND FREEING ARE DIFFERENT RISKS, AND THIS USED TO SKIP BOTH IN
+            // COMBAT. The reg_anim hazard is about FREEING an item an in-flight attack
+            // replay still points at; unlinking one from the mirror's item list endangers
+            // nothing (the animation holds an Object*, not an inventory slot). Skipping the
+            // whole block in combat left every mid-fight removal as a PHANTOM the player can
+            // still see and click — throw your only rock, and the mirror goes on listing it.
+            // The server then refuses the verb aimed at it ("You don't have that item.")
+            // while the screen insists otherwise, which reads as the equip being broken.
+            // So: always unlink; defer the FREE while in combat, exactly as for a modal.
+            {
                 std::vector<Object*> toRemove;
                 std::vector<int> toRemoveQty;
                 for (int i = 0; i < origLen; i++) {
@@ -2008,7 +2635,7 @@ private:
                 for (size_t k = 0; k < toRemove.size(); k++) {
                     itemRemove(obj, toRemove[k], toRemoveQty[k]);
                     forgetObjectRefs(toRemove[k]); // see the container path above
-                    if (anyModalOpen) {
+                    if (anyModalOpen || _inCombat) {
                         gDudeDeferredItemFrees.push_back(toRemove[k]);
                     } else {
                         objectDestroy(toRemove[k], nullptr);
@@ -2091,6 +2718,15 @@ private:
         // Non-animated renders (the animated variants block on their own loop).
         if (clientViewerActive() && obj == gDude) {
             bool touched = false;
+            // TEMP DIAGNOSTIC (inventory-AP-not-repainted): print the AP gate's INPUTS,
+            // so a run says which term rejected the repaint instead of leaving a guess.
+            if (hasAp && getenv("F2_TRACE_EVENTS") != nullptr) {
+                fprintf(stderr, "[apgate] wireAp=%d prevAp=%d objAp=%d deferred=%d myTurn=%d"
+                                " animActive=%d hops=%d shown=%d auth=%d deferring=%d\n",
+                    ap, prevAp, obj->data.critter.combat.ap, apDeferred ? 1 : 0, _myTurn ? 1 : 0,
+                    clientAnimActiveFor(gDude) ? 1 : 0, clientAnimHopsRemaining(gDude),
+                    _dudeApShown, _dudeApAuth, _dudeApDeferring ? 1 : 0);
+            }
             if (hasHp && !dudeCombatHp) { interfaceRenderHitPoints(false); touched = true; }
             // Only reflect AP being SPENT (a decrease) during my turn. An AP INCREASE
             // is the round reset-to-max that precedes the next turn; painting it green
@@ -2116,6 +2752,66 @@ private:
                 touched = true;
             }
             if (touched) interfaceBarRefresh();
+        }
+    }
+
+    // ►► APPLY STREAMED GLOBAL VARIABLES. Before this channel existed a viewer's gvars
+    // were frozen at its last baseline, so everything the CLIENT renders from a gvar went
+    // stale the moment the server changed it — the pipboy's holodisk list and quest list,
+    // the character screen's karma/reputation/addictions. Picking up a holodisk mid-session
+    // simply never showed up.
+    //
+    // Applied unconditionally (headless included, no clientViewerActive gate): these are
+    // authoritative sim values, not presentation, and the headless probe's own state dump
+    // reports gvars — a viewer-only gate would make the reconstruction diverge from the
+    // server for exactly the state this event exists to carry.
+    // Server-authored holodisks (pipboy.h). CLEAR-then-ADD, so a rebaseline
+    // re-announcement replaces the set instead of duplicating it.
+    void onHolodiskClear(Reader&)
+    {
+        if (!clientViewerActive()) return;
+        pipboyServerHolodiskClear();
+    }
+
+    void onHolodiskAdd(Reader& r)
+    {
+        std::string name = r.str();
+        int lineCount = (int)r.u16();
+        // Bound the line count before allocating: it is untrusted wire data, and a disk
+        // is meant to be a page or two of text, not a memory-exhaustion vector.
+        if (lineCount < 0 || lineCount > kMaxHolodiskLines) {
+            debugPrint("client_net: holodisk '%s' line count %d out of range — dropped\n",
+                name.c_str(), lineCount);
+            return;
+        }
+        std::vector<std::string> lines;
+        std::vector<const char*> linePtrs;
+        lines.reserve((size_t)lineCount);
+        for (int i = 0; i < lineCount; i++) {
+            lines.push_back(r.str());
+        }
+        if (r.overflow() || !clientViewerActive()) return;
+        for (const std::string& line : lines) {
+            linePtrs.push_back(line.c_str());
+        }
+        pipboyServerHolodiskAdd(name.c_str(), linePtrs.data(), (int)linePtrs.size());
+    }
+
+    void onGvarDelta(Reader& r)
+    {
+        int count = (int)r.u16();
+        for (int i = 0; i < count && !r.overflow(); i++) {
+            int index = r.i32();
+            int value = r.i32();
+            // The index is UNTRUSTED wire data indexing a heap array — validate every
+            // one. A wild index here is an arbitrary write, and the array's length is
+            // whatever the loaded world happens to define.
+            if (gGameGlobalVars == nullptr || index < 0 || index >= gGameGlobalVarsLength) {
+                debugPrint("client_net: gvar delta out of range index=%d (len=%d) dropped\n",
+                    index, gGameGlobalVarsLength);
+                continue;
+            }
+            gGameGlobalVars[index] = value;
         }
     }
 
@@ -2165,11 +2861,27 @@ private:
     {
         r.i32(); // mapIndex
         r.i32(); // elevation
+
+        // ►► RECORD THE MAP WE ARE LEAVING FOR OUR OWN PIPBOY. The automap is
+        // viewer-local by design — the server keeps none, and both of vanilla's
+        // recording hooks (automapSaveCurrent on a map save, automapSetDisplayMap from
+        // the worldmap) are deliberate no-ops on the core-only server. But nothing told a
+        // VIEWER to record its own either, so the pipboy's MAPS tab had no entries for
+        // any map and reading it did nothing at all.
+        //
+        // Vanilla records at map EXIT, when the explored state is complete, which is
+        // exactly here: the world is about to be replaced. Best-effort and result-
+        // ignored — a failed write costs a map in the pipboy list, never the transition.
+        if (clientViewerActive() && _loaded) {
+            automapSaveCurrent();
+        }
+
         // v1: a fresh blob + baseline always follows (§C.4). Drop the index; the
         // next BLOB_BEGIN rebuilds the world. (Full mid-run transition = S3+.)
         presReset();
         _net.clear();
         _adoptTransients.clear(); // adopt transients die with the old world (Fable review A3)
+        _pendingAdopts.clear(); // ...and so do pending adopt mints (§12.6 trap 2)
         _loaded = false;
         setInCombat(false); // a transition ends any local combat framing
         _myTurn = false;
@@ -2456,12 +3168,29 @@ private:
     // ref encoding: >0 = live netId (decoder map, resolved at PLAY time so a freed
     // participant drops its ops); <0 = a stream-scoped transient handle minted by
     // OBJ_CREATE this replay; 0 = null.
+    // Per-sequence tallies for the [preplay] line below: how much of a recorded
+    // sequence actually found something to act on. Every op is `if (o) register...`,
+    // so an unresolvable ref is silently skipped — which is precisely how a throw can
+    // animate the thrower while nothing flies.
+    int _seqRefsOk = 0;
+    int _seqRefsDropped = 0;
+    int _seqTransients = 0;
+    // Adopt netIds the DRY pass just promised (§12.2). Read by onPresSeq straight after
+    // the pass and carried on the queued entry, so a dropped sequence can release them.
+    std::vector<int> _seqAdoptIds;
+
     Object* resolveSeqRef(int ref, std::unordered_map<int, Object*>& handles)
     {
-        if (ref > 0) return lookup(ref);
+        if (ref > 0) {
+            Object* o = lookup(ref);
+            (o != nullptr ? _seqRefsOk : _seqRefsDropped)++;
+            return o;
+        }
         if (ref < 0) {
             auto it = handles.find(ref);
-            return it != handles.end() ? it->second : nullptr;
+            Object* o = it != handles.end() ? it->second : nullptr;
+            (o != nullptr ? _seqRefsOk : _seqRefsDropped)++;
+            return o;
         }
         return nullptr;
     }
@@ -2489,6 +3218,10 @@ private:
         if (version != kPresStreamVersion) {
             return; // unknown stream version -> drop (presentation is skippable)
         }
+        _seqRefsOk = 0;
+        _seqRefsDropped = 0;
+        _seqTransients = 0;
+        _seqAdoptIds.clear();
         std::unordered_map<int, Object*> handles; // stream handle -> local transient
         for (int i = 0; i < opCount && !r.overflow(); i++) {
             unsigned char op = r.u8();
@@ -2518,6 +3251,7 @@ private:
                 auto spawnTransient = [&]() -> Object* {
                     Object* obj = nullptr;
                     if (objectCreateWithFidPid(&obj, fid, -1) == 0 && obj != nullptr) {
+                        _seqTransients++;
                         objectHide(obj, nullptr); // born hidden — the ANIMATE/MOVE ops reveal it
                         obj->flags |= OBJECT_NO_SAVE;
                         objectSetLocation(obj, tile, elev, nullptr);
@@ -2526,36 +3260,66 @@ private:
                     return obj;
                 };
                 if (adoptNetId > 0) {
-                    // A thrown weapon's flight transient IS its ground item. Create it at the
-                    // DECODE (dry) pass and register it under the real netId NOW, so the
-                    // STATE-lane DISCONNECT (pickup) — which can arrive turns before this seq
-                    // drains off the pump — resolves to it and removes it. Play-time creation
-                    // was the "phantom spear survives pickup" bug when the pickup gesture
-                    // backed up the pump. The object stays NO_SAVE/local; the netId is just a
-                    // handle for the disconnect that follows on the state lane.
+                    // ►► A thrown weapon's flight transient IS its ground item: it adopts the
+                    // real netId, so it is the one object whose LIFETIME both the state lane
+                    // and the record lane write. It therefore mints on ONE clock — EXECUTE,
+                    // the same clock that flies it (§12.2).
+                    //
+                    // This deliberately REVERSES the earlier decode-minting fix. That fix was
+                    // right about the disease (the pickup DISCONNECT arriving while the
+                    // sequence still sat on the pump, resolving to nothing and leaving a
+                    // phantom spear) and wrong about the cure: moving creation to the fast
+                    // clock just put destruction on the wrong side of it, so the spear
+                    // vanished mid-flight instead. The seesaw existed only because creation
+                    // and destruction sat on DIFFERENT clocks. Now the DISCONNECT rides this
+                    // same FIFO behind the sequence (see deferStateEvent), so it cannot
+                    // outrun a creation that no longer needs to run early.
                     if (!execute) {
-                        if (_adoptTransients.find(adoptNetId) == _adoptTransients.end()) {
+                        // DRY: mint nothing, just promise it. From this instant the netId is
+                        // presentation-entangled, so every state event for it parks — which
+                        // is what makes "the DISCONNECT arrives before the sequence plays"
+                        // an ordering fact rather than a lifetime bug.
+                        _pendingAdopts[adoptNetId]++;
+                        _seqAdoptIds.push_back(adoptNetId);
+                    } else {
+                        releasePendingAdopt(adoptNetId); // promise kept (or the mint failed)
+                        auto it = _adoptTransients.find(adoptNetId);
+                        // Snapshot the answer: inserting below can REHASH the map, which
+                        // invalidates `it` (comparing a stale iterator against a fresh end()
+                        // is UB, even in a trace).
+                        bool reused = it != _adoptTransients.end();
+                        if (reused) {
+                            // Already live under this netId. Reuse it rather than minting a
+                            // second: ONE object per netId is a teardown invariant (a rebind
+                            // strands the old one in the world list and _net erases by
+                            // pointer). Reachable when a sequence replays the same adopt
+                            // twice; a throw→pickup→re-throw burst does NOT reach it, because
+                            // the pickup DISCONNECT is parked BETWEEN the two sequences and so
+                            // destroys the first transient before the second executes.
+                            handles[handle] = it->second;
+                        } else {
                             Object* obj = spawnTransient();
                             if (obj != nullptr) {
                                 obj->netId = adoptNetId;
                                 _net[adoptNetId] = obj;
                                 _adoptTransients[adoptNetId] = obj;
+                                handles[handle] = obj;
                             }
+                            // Mint failure leaves the handle unset, so the flight ops
+                            // harmlessly no-op instead of dangling. State still converges:
+                            // the parked CONNECT finds no transient and self-heals the real
+                            // ground item.
                         }
-                    } else {
-                        // Reuse the decode-created transient so the flight ops animate the
-                        // SAME object the disconnect can find. Missing = disconnected in the
-                        // decode->execute window (guarded below); leave the handle unset so
-                        // the flight ops harmlessly no-op rather than dangle.
-                        auto it = _adoptTransients.find(adoptNetId);
-                        if (it != _adoptTransients.end()) {
-                            handles[handle] = it->second;
-                            // Do NOT erase the bridge here: onConnect/onDisconnect/onDestroy
-                            // consult _adoptTransients to recognize this netId as a viewer-
-                            // local adopt transient and OWN its lifecycle against the state
-                            // lane (skip the redundant CONNECT that would double-node it;
-                            // objectDestroy it on DISCONNECT instead of leaking it). The
-                            // entry is erased there, when the object actually leaves.
+                        // Do NOT erase the bridge here: onConnect/onDisconnect/onDestroy
+                        // consult _adoptTransients to recognize this netId as a viewer-local
+                        // adopt transient and OWN its lifecycle against the state lane (skip
+                        // the redundant CONNECT that would double-node it; objectDestroy it on
+                        // DISCONNECT instead of leaking it). The entry is erased there, when
+                        // the object actually leaves.
+                        if (getenv("F2_TRACE_EVENTS") != nullptr) {
+                            Object* t = handles.count(handle) != 0 ? handles[handle] : nullptr;
+                            fprintf(stderr, "[adopt] MINT net=%d fid=0x%X tile=%d reused=%d obj=%s\n",
+                                adoptNetId, fid, tile, reused ? 1 : 0, t != nullptr ? "ok" : "FAILED");
                         }
                     }
                 } else if (execute) {
@@ -2649,12 +3413,27 @@ private:
                         // recorded dest when no position is held.
                         int heldTile = clientCombatAnimHeldMoveTile(o);
                         int walkTile = heldTile >= 0 ? heldTile : tile;
+                        // ►► KEEP THE REGISTRATION RESULT. It used to be discarded, which made
+                        // the most common way a recorded walk fails INVISIBLE: every register
+                        // below can refuse (no free sequence slot, the actor already owns a live
+                        // description, zero AP, or — the one that bites — `_anim_preload`'s
+                        // artLock returning null because the critter HAS NO ART for this anim),
+                        // and on refusal `_anim_cleanup` throws the whole stream away. We then
+                        // called clientCombatAnimMarkActive unconditionally, so the entry went
+                        // Active with nothing playing, animationIsBusy said 0 on the very next
+                        // advanceReplays, and the reap snapped the sprite to the held tile. The
+                        // only symptom was `[cmove-drift]` with walkedTo == curTile — a teleport
+                        // that looked identical to a missing hold frame, which is a completely
+                        // different bug. rc=-1 here separates the two in one live run.
+                        // heldTile is logged for the same reason: heldTile=-1 means walkTile is
+                        // the recorded INTENT dest, so a dist far above ap is the other cause.
+                        int walkRc = (anim == ANIM_RUNNING)
+                            ? animationRegisterRunToTile(o, walkTile, elev, ap, delay)
+                            : animationRegisterMoveToTile(o, walkTile, elev, ap, delay);
                         if (getenv("F2_TRACE_EVENTS") != nullptr) {
-                            fprintf(stderr, "[cmove-play] net=%d curTile=%d destTile=%d walkTile=%d dist=%d anim=%d ap=%d preAp=%d\n",
-                                o->netId, o->tile, tile, walkTile, tileDistanceBetween(o->tile, walkTile), anim, ap, preWalkAp);
+                            fprintf(stderr, "[cmove-play] net=%d curTile=%d destTile=%d walkTile=%d dist=%d anim=%d ap=%d preAp=%d heldTile=%d rc=%d\n",
+                                o->netId, o->tile, tile, walkTile, tileDistanceBetween(o->tile, walkTile), anim, ap, preWalkAp, heldTile, walkRc);
                         }
-                        if (anim == ANIM_RUNNING) animationRegisterRunToTile(o, walkTile, elev, ap, delay);
-                        else animationRegisterMoveToTile(o, walkTile, elev, ap, delay);
                         clientCombatAnimMarkActive(o, kMoveReplayCapMs, /*ownsMoveFrame=*/true);
                     }
                 } else {
@@ -2751,7 +3530,17 @@ private:
                 return;
             }
         }
-    }
+    
+        // ►► ONE LINE THAT ANSWERS "why did nothing happen?". Every recorded op is
+        // `if (o) animationRegister...`, so an unresolvable ref is skipped in silence:
+        // a throw whose flight transient does not resolve animates the THROWER and
+        // nothing else — no projectile, exactly the owner's symptom. refsDropped>0 on a
+        // throw means the viewer could not find what the sequence wanted to move.
+        if (execute && getenv("F2_TRACE_EVENTS") != nullptr) {
+            fprintf(stderr, "[preplay] ops=%d refsOk=%d refsDROPPED=%d transientsMinted=%d\n",
+                (int)opCount, _seqRefsOk, _seqRefsDropped, _seqTransients);
+        }
+}
 
     // Decode EVENT_PRES_SEQ: buffer the ops, reserve live participants NOW (decode
     // time), then play immediately (out of combat) or queue in wire order (in combat,
@@ -2768,8 +3557,13 @@ private:
         if (getenv("F2_TRACE_EVENTS") != nullptr) {
             fprintf(stderr, "[presseq] RECV bytes=%d actor=%d inCombat=%d\n", (int)ops.size(), actorNetId, _inCombat ? 1 : 0);
         }
-        // DRY pass: reserve every live participant before this beat's death-fid deltas land.
+        // DRY pass: reserve every live participant before this beat's death-fid deltas land
+        // (§12.6 trap 6 — reserve/move-hold arming STAYS at decode; only OBJ_CREATE minting
+        // moved to execute, or the same-beat corpse-fid leak regresses for every attack).
+        // It also PROMISES this sequence's adopt mints, which entangles those netIds from
+        // here on — the parking rule for everything that follows on the state lane.
         presPlayRecordedSeq(ops.data(), (int)ops.size(), false);
+        std::vector<int> promisedAdopts = _seqAdoptIds;
         // In combat: always ride the pump (turn-serial ordering). Out of combat: an
         // ACTORED sequence (gesture/door) rides the pump too so it waits out that
         // actor's approach glide (pump gate 1d); an actor-less sequence (explosion)
@@ -2779,8 +3573,10 @@ private:
             e.kind = PresKind::kRecordedSeq;
             e.seqOps = std::move(ops);
             e.seqActorNetId = actorNetId;
+            e.seqAdopts = std::move(promisedAdopts);
             enqueue(e);
         } else {
+            // Plays now, so the promise is kept immediately (the execute pass releases it).
             presPlayRecordedSeq(ops.data(), (int)ops.size(), true);
         }
     }
@@ -3004,6 +3800,18 @@ private:
         // spam-clicking. Releasing it behind a long combat replay would deliver the
         // explanation seconds after the confusion it was meant to prevent, and would
         // caption whatever animation happened to be playing when it drained.
+        // TEMP DIAGNOSTIC [cons]: "I entered several random encounters and never got the
+        // line saying what they were." The line is PROVEN on the wire (teed headless
+        // run), so it dies on this side, and there are exactly two doors out of here.
+        // The paced door is the suspect: a queued console event is discarded outright by
+        // clearCombatMirror()'s _presQueue.clear() on the next world (re)load — and
+        // arriving in a random encounter IS a world load, one that also flips combat on.
+        // So a line that lands while the viewer's combat MIRROR is still true (e.g. left
+        // over from the fight we just walked out of) is enqueued and then thrown away.
+        fprintf(stderr, "[cons] rx inCombat=%d channel=%d -> %s: \"%.60s\"\n",
+            _inCombat ? 1 : 0, channel,
+            (_inCombat && channel != kMsgChannelRefusal) ? "QUEUED (paced)" : "shown now",
+            text.c_str());
         if (_inCombat && channel != kMsgChannelRefusal) {
             PresEvent e;
             e.kind = PresKind::kConsole;
@@ -3074,31 +3882,30 @@ private:
         std::string body = r.str();
         if (!clientViewerActive()) return;
 
-        // Same blocking YES/NO widget the single-player path uses. showDialogBox spins
-        // inputGetInput, which still services our socket — so if another viewer answers
-        // first the server's EVENT_ENCOUNTER_CLOSE lands mid-wait and injects ESC
-        // (onEncounterClose), returning 0 here. FIRST ANSWER WINS: whichever verb we
-        // send, a late one (after the barrier freed) is ignored server-side.
-        const char* bodyPtr = body.c_str();
-        gEncounterPromptActive = true;
-        // ►► FLUSH QUEUED INPUT FIRST, or the box answers ITSELF. This prompt opens
-        // unannounced, from inside the wire decoder, on top of a screen the player is
-        // actively clicking — the worldmap. Anything still sitting in the queue (the
-        // travel click's residue, a keypress) is consumed by showDialogBox's very first
-        // inputGetInput, and an ESC-equivalent returns 0 = DECLINE. Owner-observed as
-        // "the prompt appeared for a single frame and cancelled on its own", and
-        // BY CAR is exactly where it bites: car travel covers 4-8 tiles per tick
-        // (worldmapTravelStep), so an encounter can fire within a beat or two of the
-        // click that started the trip, while on foot the queue has long drained.
-        // keyboardReset + inputEventQueueReset is the same pairing main.cc uses before
-        // its own blocking prompt.
-        keyboardReset();
-        inputEventQueueReset();
-        int rc = showDialogBox(title.c_str(), &bodyPtr, 1, 169, 116,
-            _colorTable[32328], nullptr, _colorTable[32328],
-            DIALOG_BOX_LARGE | DIALOG_BOX_YES_NO);
-        gEncounterPromptActive = false;
-        clientViewerEncounterAnswer(rc != 0);
+        // ►►►► LATCH, DO NOT OPEN — the third handler to need this rule and the one
+        // that ignored it. onElevatorPrompt and onAutomapOpen both say it in full: we
+        // are standing INSIDE pump() -> drain(), and a blocking screen opened here runs
+        // an input loop whose service ticker calls pump() again. That re-entry is not
+        // merely untidy, it is fatal, and this is the "the prompt appears for one frame
+        // and declines itself" bug in its entirety:
+        //
+        //   drain() is mid-frame. It has already done _expectSeq++ but not yet
+        //   _pos += 18 + payloadLen, so the frame is still at the head of _buf. The
+        //   nested drain() re-parses that SAME frame, sees seq == _expectSeq - 1,
+        //   reports "frame seq gap" and returns FALSE. pump() propagates the false, and
+        //   viewerServiceTicker reads it as "server gone" and injects KEY_ESCAPE —
+        //   which lands in the box we just opened. rc = 0 = decline, ~16 ms, every
+        //   single time. Owner trace: `[wmenc] ESC INJECTED by ticker: pump() failed /
+        //   server gone` immediately followed by `keyCode=27`, with the server merrily
+        //   streaming state on either side of it.
+        //
+        // So the box moves out of the decoder. The server is BLOCKED on the answer, so
+        // unlike the elevator this cannot wait for the main loop's no-modal-open point
+        // (the viewer is inside its worldmap modal here) — viewerServiceTicker takes the
+        // latch instead, one frame later, outside drain().
+        _encPromptPending = true;
+        _encPromptTitle = title;
+        _encPromptBody = body;
     }
 
     void onEncounterClose(Reader& r)
@@ -3110,6 +3917,7 @@ private:
         // The re-entrant socket poll runs inside showDialogBox's inputGetInput, so when
         // the box is open this flag is set and the ESC lands in that box's loop.
         if (gEncounterPromptActive) {
+            wmencTagEscInjection("onEncounterClose");
             enqueueInputEvent(KEY_ESCAPE);
         }
     }
@@ -3176,10 +3984,130 @@ private:
         if (stream == nullptr) {
             return;
         }
-        if (playerSheetBlockRead(stream) == -1) {
+        int applyRc = playerSheetBlockRead(stream);
+        // TEMP DIAGNOSTIC [psht]: the other two cuts of "only shows up if I reconnect".
+        // Paired with the server's [psht] emit line: a server emit with NO line here
+        // means the event never reached the decoder; rc=-1 here means the row arrived
+        // and was REFUSED; rc=0 means it was applied and the remaining suspect is the
+        // repaint (the open character screen polls clientViewerConsumeSheetDirty).
+        // f2_server drops debugPrint, so this goes to stderr deliberately.
+        fprintf(stderr, "[psht] apply slot=%d len=%d rc=%d mySlot=%d\n",
+            slot, len, applyRc, gDude != nullptr ? playerActorSlotOf(gDude) : -1);
+        if (applyRc == -1) {
             debugPrint("client_net: player-sheet delta apply failed (slot %d)\n", slot);
+        } else {
+            gPlayerSheetDeltaDirty = true;
+            // ►► RE-DERIVE THE INDICATOR BAR from the row that just arrived. SNEAK,
+            // LEVEL and ADDICT are read straight out of this proto row by
+            // indicatorBarRefresh, and nothing else on a viewer would repaint them —
+            // so without this the server flipping our sneak state (or granting a
+            // level-up badge) is invisible until some unrelated repaint happens to
+            // run. Only for OUR row: another player's flags are not on our bar.
+            // [[no-re-derivation-path-bug-class]]
+            if (gDude != nullptr && slot == playerActorSlotOf(gDude)) {
+                indicatorBarRefresh();
+            }
         }
         fileClose(stream);
+    }
+
+    // ELEVATORS (docs/COOP_COVERAGE.md — this was one of the silent holes). The
+    // server owns the destination table and has no screen; we own the screen and know
+    // nothing about destinations. So: show vanilla's panel, send back the BUTTON, and
+    // let the server ride us. Addressed — every other viewer drops it.
+    void onElevatorPrompt(Reader& r)
+    {
+        int actorNetId = r.i32();
+        int elevator = r.i32();
+        int startLevel = r.i32();
+        if (r.overflow() || !clientViewerActive() || gDude == nullptr) {
+            return;
+        }
+        if (actorNetId != gDude->netId) {
+            return; // somebody else is in the elevator
+        }
+
+        // ►► LATCH, DO NOT OPEN. We are inside pump(): the panel runs its own
+        // blocking input loop, and that loop's service ticker pumps the wire, so
+        // opening it here would re-enter the decoder we are standing in. Exactly the
+        // hazard the in-combat inventory grant documents ("the screen runs a blocking
+        // loop and must not be entered from inside pump()"). The main loop opens it at
+        // its no-modal-open point.
+        _elevatorPending = true;
+        _elevatorType = elevator;
+        _elevatorStartLevel = startLevel;
+    }
+
+    // THE MOTION SENSOR. Using it consumed a charge server-side; the effect is entirely
+    // our screen (the automap is viewer-local — the server keeps no automap at all), so
+    // the server just tells the user's client to open it. Addressed: every other viewer
+    // drops it. Same LATCH-DO-NOT-OPEN rule as the elevator panel above — automapShow
+    // runs a blocking input loop and we are standing inside pump().
+    void onAutomapOpen(Reader& r)
+    {
+        int actorNetId = r.i32();
+        bool usingScanner = r.i32() != 0;
+        if (r.overflow() || !clientViewerActive() || gDude == nullptr) {
+            return;
+        }
+        if (actorNetId != gDude->netId) {
+            return; // somebody else waved the scanner around
+        }
+
+        _automapPending = true;
+        _automapUsingScanner = usingScanner;
+    }
+
+    // SCREEN FADES — emitted since the beginning and, until now, DROPPED ON THE FLOOR:
+    // there was no case for them in this switch, so a script's gfade_out/gfade_in (grave
+    // digging, a book, a Doctor session) did nothing at all on a viewer.
+    //
+    // Addressed: 0 means everyone, otherwise only the actor it names. Latched rather
+    // than applied here — paletteFadeTo animates over frames, and pump() must not sit
+    // inside a visual loop.
+    void onScreenFade(Reader& r, bool toBlack)
+    {
+        int actorNetId = r.i32();
+        if (r.overflow() || !clientViewerActive()) {
+            return;
+        }
+        if (actorNetId != 0 && (gDude == nullptr || actorNetId != gDude->netId)) {
+            return; // somebody else's time is passing
+        }
+
+        // Collapse CONSECUTIVE duplicates only (black over black, in over in): those
+        // are genuinely redundant, and a repeat fade-to-black is a few hundred wasted
+        // milliseconds the player reads as a stall. An out followed by an in is NOT
+        // redundant — it IS the fade, and collapsing that pair was the bug where fades
+        // never appeared at all.
+        if (toBlack == (_fadeBlackSinceMs != 0)) {
+            return;
+        }
+        applyFade(toBlack);
+    }
+
+    // Scripted cutscene input lock. Addressed exactly like onScreenFade — the script
+    // issues the two together, so they must agree on who is watching.
+    //
+    // gameUiDisable/Enable are idempotent (both early-out on gGameUiDisabled), so a
+    // duplicate or a lock we somehow never paired is not cumulative. That matters:
+    // this is the one event that can take the player's hands away, so the failure
+    // direction has to be "unlock wins".
+    void onScreenInputLock(Reader& r)
+    {
+        bool locked = r.i32() != 0;
+        int actorNetId = r.i32();
+        if (r.overflow() || !clientViewerActive()) {
+            return;
+        }
+        if (actorNetId != 0 && (gDude == nullptr || actorNetId != gDude->netId)) {
+            return; // somebody else's cutscene
+        }
+        if (locked) {
+            gameUiDisable(0);
+        } else {
+            gameUiEnable();
+        }
     }
 
     void onMovieSeenState(Reader& r)
@@ -3294,6 +4222,106 @@ private:
         clientBarterOnEnd();
     }
 
+    // ---- Steal / pickpocket / plant -----------------------------------------
+    // The screen itself is opened from the MAIN loop off clientStealActive(), not
+    // here: this runs inside the wire pump, and a blocking modal entered from the
+    // pump applies later events from under its own feet.
+    // The server fired a loot interaction for THIS actor and opened the container.
+    // Latched, never acted on here: the loot screen is a blocking modal and the
+    // decoder runs inside the pump (opening one here would apply later events from
+    // under its own feet — the same rule the steal/elevator/automap latches follow).
+    // ►► THE ANSWER TO "IT LOOKS FINE ON MY SCREEN". A chunk of the server's own
+    // per-object state; accumulate until the final one, then diff the whole thing
+    // against this mirror and print every field that disagrees. The comparison runs
+    // HERE, inside the pump, deliberately: it is pure reads (no modal, no allocation
+    // the world depends on), and doing it at decode means the mirror it judges is the
+    // one the audit was built against, not one several beats further on.
+    void onStateAudit(Reader& r)
+    {
+        int isFinal = r.u8();
+        int count = (int)r.u16();
+        if (count < 0 || count > 4096) return;
+        for (int i = 0; i < count; i++) {
+            StateAuditRecord rec {};
+            rec.netId = r.i32();
+            rec.pid = r.i32();
+            rec.tile = r.i32();
+            rec.elevation = r.i32();
+            rec.fid = r.i32();
+            rec.frame = r.i32();
+            rec.rotation = r.i32();
+            rec.flags = (unsigned int)r.i32();
+            rec.lightDistance = r.i32();
+            rec.lightIntensity = r.i32();
+            rec.hp = r.i32();
+            rec.radiation = r.i32();
+            rec.poison = r.i32();
+            rec.ap = r.i32();
+            rec.combatResults = r.i32();
+            rec.inventoryCount = r.i32();
+            rec.inventoryHash = (unsigned int)r.i32();
+            _auditRecords.push_back(rec);
+        }
+        if (r.overflow()) {
+            // A short read means the accumulated set is not the server's set; comparing
+            // it would invent divergences. Drop the whole audit and say so.
+            fprintf(stderr, "[audit] ABORTED — truncated chunk, %d records discarded\n",
+                (int)_auditRecords.size());
+            _auditRecords.clear();
+            return;
+        }
+        if (isFinal == 0) {
+            return;
+        }
+        int divergences = stateAuditCompare(_auditRecords, stderr);
+        _auditRecords.clear();
+        (void)divergences;
+    }
+
+    void onLootGrant(Reader& r)
+    {
+        int actorNetId = r.i32();
+        int containerNetId = r.i32();
+        if (r.overflow() || !clientViewerActive()) {
+            return;
+        }
+        if (gDude == nullptr || actorNetId != gDude->netId) {
+            return; // somebody else's container
+        }
+        _lootGrantNetId = containerNetId;
+    }
+
+    void onStealBegin(Reader& r)
+    {
+        int thiefNetId = r.i32();
+        int targetNetId = r.i32();
+        if (!clientViewerActive() || r.overflow()) return;
+        // The thief's pack is the LEFT panel on every screen, including the
+        // spectators' — so their mirror of it must be reconciled in full, not
+        // left on the equip-flags-only path every other critter takes. See the
+        // gate in the inventory delta below.
+        gViewerStealThiefNetId = thiefNetId;
+        gViewerStealTargetNetId = targetNetId;
+        clientStealOnBegin(thiefNetId, targetNetId);
+    }
+
+    void onStealState(Reader&)
+    {
+        // Payload-free by design: the item movement arrived as ordinary inventory
+        // deltas in this very frame (the server scans and then emits this to
+        // flush them out of a parked tick). Just repaint.
+        if (!clientViewerActive()) return;
+        clientStealOnState();
+    }
+
+    void onStealEnd(Reader&)
+    {
+        if (!clientViewerActive()) return;
+        gViewerStealThiefNetId = 0;
+        gViewerStealTargetNetId = 0;
+        clientStealOnEnd();
+    }
+
     void onDialogNode(Reader& r)
     {
         int speakerNetId = r.i32();
@@ -3306,13 +4334,16 @@ private:
         if (optionCount < 0 || optionCount > 64 || r.overflow()) return;
         const char* optionPtrs[64];
         std::string optionStorage[64];
+        int optionReactions[64];
         for (int i = 0; i < optionCount; i++) {
             optionStorage[i] = r.str();
             optionPtrs[i] = optionStorage[i].c_str();
+            optionReactions[i] = r.i32(); // per-option reaction — the Empathy colours
         }
         if (!clientViewerActive() || r.overflow()) return;
         clientDialogOnNode(speakerNetId, driverNetId, reaction,
-            reply.c_str(), optionPtrs, optionCount, audioFileName.c_str(), headFid);
+            reply.c_str(), optionPtrs, optionCount, audioFileName.c_str(), headFid,
+            optionReactions);
     }
 
     void onDialogEnd(Reader& r)
@@ -3333,6 +4364,12 @@ private:
     {
         if (!clientViewerActive()) return;
         debugPrint("client_net: onWorldmapEnd — exiting\n");
+        // [wmend] on stderr, not debugPrint: this is the line that says whether the
+        // viewer ever learned the trip ended. Its ABSENCE next to a server-side
+        // `[wmsrv] driver exit` is the whole diagnosis — the end never decoded (a
+        // stalled pump; alt-tab is one way) rather than the loop failing to act on it.
+        fprintf(stderr, "[wmend] decoded worldmapEnd: streaming=%d mode=0x%X\n",
+            gWorldmapStreaming ? 1 : 0, GameMode::getCurrentGameMode());
         gWorldmapStreaming = false;
         gWorldmapStateDirty = false;
         // Clear a still-pending enter: on an aborted/instant trip (server bails with
@@ -3361,8 +4398,30 @@ private:
         wmGenData.carFuel = r.i32();
         wmGenData.currentAreaId = r.i32();
         wmGenData.isInCar = r.u8() != 0;
-        debugPrint("client_net: onWorldmapState pos=%d,%d dst=%d,%d walk=%d dist=%d area=%d\n",
-            posX, posY, destX, destY, walking ? 1 : 0, walkDist, wmGenData.currentAreaId);
+        int visitedState = r.i32();
+        unsigned int entranceMask = (unsigned int)r.i32();
+        if (r.overflow()) return;
+
+        // ►► ADOPT THE AUTHORITY'S VIEW OF THIS CITY. Our own CityInfo holds whatever
+        // worldmap.txt started with, which is not what the party has discovered — so the
+        // town map either would not open at all or would offer gates nobody has found.
+        // Only the area underfoot is touched, and only while streaming: this is a mirror
+        // of server state, not local progress.
+        if (wmGenData.currentAreaId != -1) {
+            CityInfo* city = &(wmAreaInfoList[wmGenData.currentAreaId]);
+            city->visitedState = visitedState;
+            int count = city->entrancesLength;
+            if (count > 32) {
+                count = 32;
+            }
+            for (int index = 0; index < count; index++) {
+                city->entrances[index].state = (entranceMask & (1u << index)) != 0 ? 1 : 0;
+            }
+        }
+
+        debugPrint("client_net: onWorldmapState pos=%d,%d dst=%d,%d walk=%d dist=%d area=%d visited=%d entrances=0x%X\n",
+            posX, posY, destX, destY, walking ? 1 : 0, walkDist, wmGenData.currentAreaId,
+            visitedState, entranceMask);
         gWorldmapStateDirty = true;
     }
 
@@ -3402,7 +4461,6 @@ private:
         soundPlayFile(name.c_str());
     }
 
-    const char* _blobTmpPath;
     bool _blobDeferred = false; // rebaseline buffered while a modal was open (apply on close)
     bool _loaded;
     int _loadCount = 0;
@@ -3410,6 +4468,21 @@ private:
     std::string _musicTrack; // currently-playing background track, for MUSIC_PLAY dedupe
     bool _myTurn = false;
     bool _invGrantPending = false; // server granted an in-combat inventory; main loop opens it
+    bool _encPromptPending = false; // encounter prompt latched out of the decoder
+    std::string _encPromptTitle;
+    std::string _encPromptBody;
+    bool _elevatorPending = false;
+    // When the screen went black (0 = not black). The fade is applied at decode; this
+    // is only the watchdog's clock.
+    unsigned int _fadeBlackSinceMs = 0;
+    // Audit chunks accumulated so far (cleared after each completed comparison).
+    std::vector<StateAuditRecord> _auditRecords;
+    // Container netId the server opened for this actor (0 = none pending).
+    int _lootGrantNetId = 0;
+    bool _automapPending = false;
+    bool _automapUsingScanner = false;
+    int _elevatorType = -1;
+    int _elevatorStartLevel = 0;
     bool _combatModalOpen = false; // that granted screen is up right now
     int _combatActorNetId = 0; // whose turn it is — drives the acting-critter outline (#8)
     int _dudeHpAuth = 0; // authoritative dude HP; the shown gDude->hp eases toward it (rollDudeHp)
@@ -3460,8 +4533,8 @@ private:
 // owns the Decoder, so the file (S2) and socket (S3) paths share one decode path.
 class IncrementalStream {
 public:
-    explicit IncrementalStream(const char* blobTmpPath)
-        : _decoder(blobTmpPath)
+    IncrementalStream()
+        : _decoder()
     {
     }
 
@@ -3578,10 +4651,18 @@ public:
     bool myTurn() const { return _decoder.myTurn(); }
     void presentationPump() { _decoder.presentationPump(); }
     void recomputeCombatOutlines() { _decoder.recomputeCombatOutlines(); }
+    bool everBoundToSlot() const { return _decoder.everBoundToSlot(); }
     bool combatPresentationBusy() const { return _decoder.combatPresentationBusy(); }
     bool blobDeferred() const { return _decoder.blobDeferred(); }
     void applyDeferredBlob() { _decoder.applyDeferredBlob(); }
     bool takeInventoryGrant() { return _decoder.takeInventoryGrant(); }
+    int takeLootGrant() { return _decoder.takeLootGrant(); }
+    bool takeEncounterPrompt(std::string* title, std::string* body) { return _decoder.takeEncounterPrompt(title, body); }
+    bool takeElevatorPrompt(int* elevator, int* startLevel) { return _decoder.takeElevatorPrompt(elevator, startLevel); }
+    bool takeAutomapOpen(bool* usingScanner) { return _decoder.takeAutomapOpen(usingScanner); }
+    bool fadeWatchdogExpired(unsigned int nowMs, unsigned int maxBlackMs) const
+    { return _decoder.fadeWatchdogExpired(nowMs, maxBlackMs); }
+    void clearFadeBlack() { _decoder.clearFadeBlack(); }
     void setCombatModalOpen(bool open) { _decoder.setCombatModalOpen(open); }
     bool combatModalOpen() const { return _decoder.combatModalOpen(); }
     int frames() const { return _frames; }
@@ -3666,7 +4747,7 @@ NetSocket clientSocketConnect(const char* host, int port)
 // ---------------------------------------------------------------------------
 // S2 file path — feed the whole file to the shared walker.
 // ---------------------------------------------------------------------------
-bool clientApplyStreamFile(const char* path, const char* blobTmpPath)
+bool clientApplyStreamFile(const char* path)
 {
     FILE* f = fopen(path, "rb");
     if (f == nullptr) {
@@ -3687,7 +4768,7 @@ bool clientApplyStreamFile(const char* path, const char* blobTmpPath)
         return false;
     }
 
-    IncrementalStream stream(blobTmpPath);
+    IncrementalStream stream;
     stream.feed(buf.data(), buf.size());
     if (!stream.drain()) {
         return false;
@@ -3718,7 +4799,7 @@ ClientConnection::~ClientConnection()
     delete _impl;
 }
 
-bool ClientConnection::connect(const char* host, int port, const char* blobTmpPath)
+bool ClientConnection::connect(const char* host, int port)
 {
     close();
     NetSocket fd = clientSocketConnect(host, port);
@@ -3726,7 +4807,7 @@ bool ClientConnection::connect(const char* host, int port, const char* blobTmpPa
         return false;
     }
     _impl->fd = fd;
-    _impl->stream = new IncrementalStream(blobTmpPath);
+    _impl->stream = new IncrementalStream();
     return true;
 }
 
@@ -3823,6 +4904,11 @@ bool ClientConnection::myTurn() const
     return _impl->stream != nullptr && _impl->stream->myTurn();
 }
 
+bool ClientConnection::everBoundToSlot() const
+{
+    return _impl->stream != nullptr && _impl->stream->everBoundToSlot();
+}
+
 void ClientConnection::presentationTick()
 {
     if (_impl->stream != nullptr) {
@@ -3850,6 +4936,36 @@ bool ClientConnection::blobDeferred() const
 bool ClientConnection::takeInventoryGrant()
 {
     return _impl->stream != nullptr && _impl->stream->takeInventoryGrant();
+}
+
+int ClientConnection::takeLootGrant()
+{
+    return _impl->stream != nullptr ? _impl->stream->takeLootGrant() : 0;
+}
+
+bool ClientConnection::takeEncounterPrompt(std::string* title, std::string* body)
+{
+    return _impl->stream != nullptr && _impl->stream->takeEncounterPrompt(title, body);
+}
+
+bool ClientConnection::takeElevatorPrompt(int* elevator, int* startLevel)
+{
+    return _impl->stream != nullptr && _impl->stream->takeElevatorPrompt(elevator, startLevel);
+}
+
+bool ClientConnection::takeAutomapOpen(bool* usingScanner)
+{
+    return _impl->stream != nullptr && _impl->stream->takeAutomapOpen(usingScanner);
+}
+
+bool ClientConnection::fadeWatchdogExpired(unsigned int nowMs, unsigned int maxBlackMs) const
+{
+    return _impl->stream != nullptr && _impl->stream->fadeWatchdogExpired(nowMs, maxBlackMs);
+}
+
+void ClientConnection::clearFadeBlack()
+{
+    if (_impl->stream != nullptr) _impl->stream->clearFadeBlack();
 }
 
 void ClientConnection::setCombatModalOpen(bool open)
@@ -3913,19 +5029,100 @@ void clientViewerSetConnection(ClientConnection* conn)
 // every such loop AND the main loop, but it self-gates to modal-only. On combat entry (or
 // a deferred rebaseline, or disconnect) it enqueues ESC so the modal force-closes at its
 // next top-of-loop check — vanilla closes UI on combat entry.
+// Open the latched random-encounter prompt, if one is waiting, and answer the server.
+// Called ONLY from viewerServiceTicker — never from the decoder (see onEncounterPrompt).
+static void showPendingEncounterPrompt()
+{
+    if (gViewerConn == nullptr || !clientViewerActive() || gEncounterPromptActive) {
+        return; // re-entry guard: our own box's ticker runs this again every frame
+    }
+
+    std::string title;
+    std::string body;
+    if (!gViewerConn->takeEncounterPrompt(&title, &body)) {
+        return;
+    }
+
+    // Same blocking YES/NO widget the single-player path uses. showDialogBox spins
+    // inputGetInput, which still services our socket — so if another viewer answers
+    // first the server's EVENT_ENCOUNTER_CLOSE lands mid-wait and injects ESC
+    // (onEncounterClose), returning 0 here. FIRST ANSWER WINS: whichever verb we
+    // send, a late one (after the barrier freed) is ignored server-side.
+    const char* bodyPtr = body.c_str();
+    gEncounterPromptActive = true;
+    // ►► FLUSH QUEUED INPUT FIRST. The prompt opens unannounced on top of a screen the
+    // player is actively clicking — the worldmap — and anything still queued is eaten by
+    // showDialogBox's first inputGetInput, where an ESC-equivalent reads as DECLINE.
+    // This is NOT what caused the self-decline (that was the re-entrant drain above),
+    // but it is a real hazard on its own and costs nothing: by car an encounter can fire
+    // a beat or two after the click that started the trip. keyboardReset +
+    // inputEventQueueReset is the pairing main.cc uses before its own blocking prompt.
+    keyboardReset();
+    inputEventQueueReset();
+    // TEMP DIAGNOSTIC [wmenc]: kept until this has a live-play run behind it. An answer
+    // in a few ms is still the box answering ITSELF, and dialogBoxTraceNext names the
+    // input that did it.
+    unsigned int openedAt = getTicks();
+    fprintf(stderr, "[wmenc] prompt box OPEN: \"%s\"\n", title.c_str());
+    dialogBoxTraceNext("wmenc");
+    int rc = showDialogBox(title.c_str(), &bodyPtr, 1, 169, 116,
+        _colorTable[32328], nullptr, _colorTable[32328],
+        DIALOG_BOX_LARGE | DIALOG_BOX_YES_NO);
+    fprintf(stderr, "[wmenc] prompt box CLOSED after %ums: rc=%d -> %s\n",
+        getTicksSince(openedAt), rc, rc != 0 ? "encaccept" : "encdecline");
+    gEncounterPromptActive = false;
+    clientViewerEncounterAnswer(rc != 0);
+}
+
 static void viewerServiceTicker()
 {
     if (gViewerConn == nullptr) {
         return;
     }
+    // ►►►► THE ENCOUNTER PROMPT OPENS HERE, ABOVE THE MODAL GATE, AND NOWHERE ELSE.
+    // Above the gate because the prompt can land whether or not a modal is up (during
+    // travel the worldmap is open; on a spectator it may not be) and this ticker runs in
+    // the main loop as well. HERE rather than in the decoder because opening it inside
+    // pump() re-enters drain(), and the nested call reports a phantom "frame seq gap"
+    // that the branch below then reads as "server gone" and answers with an ESC — see
+    // onEncounterPrompt for the whole chain. By this point the outer drain() has
+    // returned, so the box's own service ticker re-enters a quiescent stream.
+    //
+    // The server is BLOCKED in its barrier until somebody answers, so this must not be
+    // gated on anything that can stay false: no combat test, no claim test, no modal
+    // test. showPendingEncounterPrompt guards its own re-entry.
+    showPendingEncounterPrompt();
     if ((GameMode::getCurrentGameMode() & kViewerModalMask) == 0) {
         return; // not in a modal — the main loop pumps the wire itself
     }
     if (!gViewerConn->pump()) {
+        wmencTagEscInjection("ticker: pump() failed / server gone");
         enqueueInputEvent(KEY_ESCAPE); // server gone — close the modal, main loop handles it
         return;
     }
     if (gViewerConn->blobDeferred()) {
+        // ►►►► THE THIRD DOOR ON A CLASS WE HAVE ALREADY SHUT TWICE. The two branches
+        // below both carefully exclude the worldmap — ESC there is not a local close,
+        // it is the `wmesc` INTENT that cancels the authority's travel session. This
+        // one did not, and it is the branch that fires on the one event that always
+        // follows a trip: the server loads the destination map and ships a rebaseline,
+        // kWorldmap is in kViewerModalMask so the blob DEFERS, and this line then
+        // injects ESC every frame for as long as it stays deferred.
+        //
+        // That is self-sustaining, which is why it reads as a hard softlock rather
+        // than a glitch: the blob cannot apply until the modal closes, the modal will
+        // not close because ESC only sends an intent, and the server discards the
+        // intent because it has no worldmap session any more. Observed as `wmesc
+        // ignored (no active worldmap)` spamming with nobody touching a key.
+        //
+        // A deferred blob MEANS the server has loaded a different map, so the trip is
+        // definitionally over — the honest action is the local close, not a keystroke
+        // that means something else to the authority.
+        if ((GameMode::getCurrentGameMode() & GameMode::kWorldmap) != 0) {
+            gWorldmapStreaming = false; // the loop's own exit test; no keystroke involved
+            return;
+        }
+        wmencTagEscInjection("ticker: blobDeferred (non-worldmap modal)");
         enqueueInputEvent(KEY_ESCAPE); // mapLoad must not free gDude under an open modal
         return;
     }
@@ -3937,6 +5134,7 @@ static void viewerServiceTicker()
         // syncing only once P2 closed it). gPendingWorldmapEnter is consumed only in the
         // main loop, so it stays set while this modal blocks — same treatment as combat
         // entry below. Excludes the worldmap's own modal, which must not ESC itself.
+        wmencTagEscInjection("ticker: gPendingWorldmapEnter");
         enqueueInputEvent(KEY_ESCAPE);
         return;
     }
@@ -3949,9 +5147,72 @@ static void viewerServiceTicker()
         int mode = GameMode::getCurrentGameMode() & kViewerModalMask;
         bool sanctioned = gViewerConn->combatModalOpen()
             && (mode == GameMode::kInventory || mode == GameMode::kLoot);
-        if (!sanctioned) {
-            enqueueInputEvent(KEY_ESCAPE);
+        // ►►►► AND NEVER THE WORLDMAP, for the same reason the gPendingWorldmapEnter
+        // branch above already excludes it: ESC there is NOT a local close. The worldmap
+        // is a SERVER-DRIVEN modal, and its ESC handler sends the `wmesc` INTENT
+        // (worldmap_ui.cc), which cancels the authority's travel session. Force-closing a
+        // local screen costs nothing; cancelling the server's worldmap is a state change
+        // made on the viewer's behalf without anyone asking.
+        //
+        // And the flag that drives it is a MIRROR that is legitimately stale here. Leaving
+        // a map mid-fight ends combat and opens the worldmap in the same server beat, so
+        // the viewer can still be holding inCombat()==true from before the COMBAT_EXIT it
+        // has not decoded yet. Result, reproduced with scripts/exitgrid_smoke.sh: four
+        // `wmesc` with NOBODY TOUCHING A KEY, the driver exiting `areaId=-1 map=-1`
+        // immediately, and the trip silently cancelled — read as "the worldmap appears and
+        // then nothing works". It also fed the far worse failure, because until the
+        // server_worldmap fix that map==-1 exit dismantled the map it left behind.
+        //
+        // Safe to skip: the server owns this screen in both directions. Its own worldmap
+        // pump bails on isInCombat(), so a fight that is genuinely still running closes the
+        // modal from the authority side via worldmapEnd — which is where that decision
+        // belongs.
+        if (mode == GameMode::kWorldmap) {
+            sanctioned = true;
         }
+        if (!sanctioned) {
+            wmencTagEscInjection("ticker: inCombat() force-close");
+            enqueueInputEvent(KEY_ESCAPE);
+            return; // closing anyway — don't animate a world we are about to leave
+        }
+    }
+
+    // ►► KEEP PRESENTING WHILE THE MODAL IS UP. Restores a property VANILLA HAD and our
+    // own port removed: isoEnable registered _object_animate as a TICKER, and tickers run
+    // inside every modal loop (inputGetInput -> _process_bk), so vanilla's world animated
+    // behind an open inventory. Commit 7dffbaf moved that registration into
+    // Presenter::worldEnable, and the viewer then strips it outright (main.cc:1160) because
+    // local animation fights authoritative wire state — leaving presAdvance() called from
+    // the MAIN frame loop only. Inside a modal, therefore, the wire kept delivering (pump()
+    // above) while animation and redraw stood still.
+    //
+    // That is not cosmetic on a dedicated server, because THE SIM NEVER BLOCKS: the whole
+    // world keeps resolving while one player browses their inventory. State raced ahead,
+    // presentation froze, and everything landed at once on close — the warp/jitter. Worse,
+    // a frozen pump with a live wire grows _presQueue toward kMaxQueuedPresEvents, and past
+    // it enqueue() DROPS events: a real never-lossy violation, and after §12 a dropped
+    // deferred event is a phantom object. Draining here is what keeps a long browse in a
+    // busy map from desyncing rather than merely snapping.
+    //
+    // No full-screen redraw is needed and none is done: advanceGlides (client_present.cc
+    // :402) and _object_animate (animation.cc) refresh their OWN dirty rects, which is
+    // exactly how vanilla's ticker animated the world with no main-loop help. The modal's
+    // window composites above those rects. Kill switch F2_NO_MODAL_PRESENT=1.
+    if (getenv("F2_NO_MODAL_PRESENT") != nullptr) {
+        return;
+    }
+    // Only when the isometric world is actually up: the worldmap modal disables it, and
+    // stepping glides for a map nobody is looking at is pure waste.
+    if (isoIsDisabled()) {
+        return;
+    }
+    gViewerConn->presentationTick(); // start/advance queued replays, drain the queue
+    presAdvance(); // glides, reg_anim sequences, reaping — each refreshing its own rects
+    // Reap items unlinked mid-fight once nothing can still be pointing at them. Every
+    // other flush point is a modal CLOSE, and a fight has none — without this the queue
+    // would sit until teardown. The flush re-checks the replay gate itself.
+    if ((GameMode::getCurrentGameMode() & kViewerModalMask) == 0) {
+        clientViewerFlushDeferredItemFrees();
     }
 }
 
@@ -4031,6 +5292,25 @@ void clientViewerEncounterAnswer(bool accept)
         return;
     }
     gViewerConn->sendLine(accept ? "encaccept" : "encdecline");
+}
+
+// Player chat. The text is sanitised HERE as well as on the server: a newline would
+// split one chat line into two forged verbs on the control channel, so the client must
+// never put one on the wire even though the server also refuses it. Length is capped by
+// the caller (client_say.cc) well inside the server's line buffer.
+void clientViewerSay(const char* text)
+{
+    if (gViewerConn == nullptr || text == nullptr || text[0] == '\0') {
+        return;
+    }
+    char cmd[192];
+    snprintf(cmd, sizeof(cmd), "say %s", text);
+    for (char* p = cmd; *p != '\0'; p++) {
+        if (*p == '\r' || *p == '\n') {
+            *p = ' ';
+        }
+    }
+    gViewerConn->sendLine(cmd);
 }
 
 void clientViewerUnwield(int hand)
@@ -4164,6 +5444,25 @@ void clientViewerLootTakeAll(int containerNetId)
     gViewerConn->sendLine(cmd);
 }
 
+// Steal-screen verbs. Deliberately WITHOUT a netId: the server's session already
+// knows whose pockets these are, and letting the client name the victim would
+// turn `stake` into "reach into any critter in the world" (see the verb block in
+// server_control.cc). Only the thief's client sends these; a spectator's clicks
+// never reach here.
+void clientViewerStealVerb(const char* verb, int pid, int quantity)
+{
+    if (gViewerConn == nullptr || verb == nullptr) {
+        return;
+    }
+    char cmd[64];
+    if (pid < 0) {
+        snprintf(cmd, sizeof(cmd), "%s", verb); // sdone takes no arguments
+    } else {
+        snprintf(cmd, sizeof(cmd), "%s %d %d", verb, pid, quantity);
+    }
+    gViewerConn->sendLine(cmd);
+}
+
 void clientViewerBarterVerb(const char* verb, int pid, int quantity)
 {
     if (gViewerConn == nullptr || verb == nullptr) {
@@ -4185,6 +5484,90 @@ bool clientViewerConsumeDudeInvDirty()
     bool dirty = gDudeInvDirty;
     gDudeInvDirty = false;
     return dirty;
+}
+
+bool clientViewerConsumeSheetDirty()
+{
+    bool dirty = gPlayerSheetDeltaDirty;
+    gPlayerSheetDeltaDirty = false;
+    return dirty;
+}
+
+// ── Character-sheet edit intents (PLAYER_SHEET_DESIGN.md §9.5) ────────────────
+// One line each, no local mutation anywhere: the server rules on the spend and the
+// authoritative row comes back on EVENT_PLAYER_SHEET. A refusal arrives as a console
+// line on the refusal channel and the row simply does not change.
+static void clientViewerSheetSend(const char* cmd)
+{
+    if (gViewerConn == nullptr) {
+        return;
+    }
+    gViewerConn->sendLine(cmd);
+}
+
+void clientViewerRest(int option)
+{
+    if (gViewerConn == nullptr) {
+        return;
+    }
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "restopt %d", option);
+    gViewerConn->sendLine(cmd);
+}
+
+void clientViewerElevatorRide(int level)
+{
+    if (gViewerConn == nullptr) {
+        return;
+    }
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "elev %d", level);
+    gViewerConn->sendLine(cmd);
+}
+
+void clientViewerSheetOpen()
+{
+    clientViewerSheetSend("sheetopen");
+}
+
+void clientViewerSheetClose()
+{
+    clientViewerSheetSend("sheetclose");
+}
+
+void clientViewerSkillUp(int skill)
+{
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "skillup %d", skill);
+    clientViewerSheetSend(cmd);
+}
+
+void clientViewerSkillDown(int skill)
+{
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "skilldown %d", skill);
+    clientViewerSheetSend(cmd);
+}
+
+void clientViewerPerkPick(int perk)
+{
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "perkpick %d", perk);
+    clientViewerSheetSend(cmd);
+}
+
+void clientViewerTagPick(int skill)
+{
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "tagpick %d", skill);
+    clientViewerSheetSend(cmd);
+}
+
+void clientViewerMutatePick(int dropTrait, int gainTrait)
+{
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "mutpick %d %d", dropTrait, gainTrait);
+    clientViewerSheetSend(cmd);
 }
 
 void clientViewerSetLootTarget(int netId)
@@ -4240,6 +5623,19 @@ void clientViewerWmEnter()
     gViewerConn->sendLine("wmenter");
 }
 
+// Same verb, plus the town-map entrance we picked. We send an INDEX and nothing else —
+// the server owns the entrance table and resolves where it leads (worldmap.cc
+// wmAreaResolveEntrance).
+void clientViewerWmEnterEntrance(int entranceIndex)
+{
+    if (gViewerConn == nullptr) {
+        return;
+    }
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "wmenter %d", entranceIndex);
+    gViewerConn->sendLine(cmd);
+}
+
 void clientViewerWmEscape()
 {
     if (gViewerConn == nullptr) {
@@ -4254,6 +5650,16 @@ void clientViewerFlushDeferredItemFrees()
     // inventory Object* anymore) and at ticker teardown. The parked equipped items
     // are re-added by equipmentApply on close and are never in this list, so freeing
     // here only reaps items the server dropped/consumed while the screen was up.
+    //
+    // ►► AND NOT WHILE A COMBAT REPLAY IS RUNNING. Now that a mid-fight removal unlinks
+    // immediately and only defers the free, this list can hold a weapon an in-flight
+    // attack's reg_anim still references — the exact double-free the old blanket
+    // in-combat skip was avoiding. Closing a screen mid-fight is not proof that the
+    // animation is done, so hold them: the queue is drained by the service ticker the
+    // moment the presentation goes idle, and by teardown regardless.
+    if (gViewerConn != nullptr && gViewerConn->combatPresentationBusy()) {
+        return;
+    }
     for (Object* item : gDudeDeferredItemFrees) {
         objectDestroy(item, nullptr);
     }
