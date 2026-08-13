@@ -10,6 +10,9 @@
 *.userosscache
 *.sln.docstates
 
+# Local Docker Compose paths, identity, and optional server token.
+.env
+
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 

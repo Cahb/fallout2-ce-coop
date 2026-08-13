@@ -998,7 +998,9 @@ int pcAddExperienceWithOptions(int xp, bool a2, int* xpGained, Object* subject)
 
     // The level-up award is the EARNER's: hit points land on the actor that did
     // the killing, not on whoever happens to be gDude.
-    bool isHost = earner == gDude;
+    // gDude is rebound by ServerActorScope, so pointer equality with it means
+    // "current acting player", not host. Slot 0 is the stable host identity.
+    bool isHost = playerActorSlotOf(earner) == 0;
 
     while (row[PC_STAT_LEVEL] < PC_LEVEL_MAX) {
         if (newXp < pcGetExperienceForNextLevel(earner)) {
@@ -1125,7 +1127,7 @@ int pcSetExperience(int xp, Object* subject)
     // pcAddExperienceWithOptions, and gated the same way: the HP is taken off the
     // earner whoever it is, and the badge clears on the earner's own row; only the
     // interface repaint is the host's.
-    bool isHost = earner == gDude;
+    bool isHost = playerActorSlotOf(earner) == 0;
     dudeDisableState(DUDE_STATE_LEVEL_UP_AVAILABLE, earner);
 
     // NOTE: Uninline.

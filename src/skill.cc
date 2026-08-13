@@ -26,6 +26,7 @@
 #include "random.h"
 #include "scripts.h"
 #include "player_sheet.h" // playerSheetMarkDirty — stream book/quest skill bumps
+#include "server_loop.h" // serverDedicatedActive — co-op player revival policy
 #include "server_players.h" // playerActorIs — the N-actor "is this the PC" predicate
 #include "settings.h"
 #include "stat.h"
@@ -708,6 +709,34 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
         }
 
         if (critterIsDead(target)) {
+            // Dedicated co-op: a passed medical skill check can revive a dead PLAYER,
+            // matching the healing-item revive seam. This belongs here rather than in
+            // the wire handler: skillUse is the authoritative roll and therefore keeps
+            // the ordinary skill value, critical chance, daily-use slot, XP and time
+            // rules. NPC corpses and single-player retain vanilla's refusal below.
+            if (serverDedicatedActive() && playerActorIs(target)) {
+                int roll = critterGetBodyType(target) == BODY_TYPE_ROBOTIC
+                    ? ROLL_FAILURE
+                    : skillRoll(obj, skill, criticalChance, &hpToHeal);
+                if ((roll == ROLL_SUCCESS || roll == ROLL_CRITICAL_SUCCESS)
+                    && critterRevive(target)) {
+                    skillUpdateLastUse(SKILL_FIRST_AID);
+                    successCount = 1;
+                    char line[128];
+                    snprintf(line, sizeof(line), "%s revived %s with First Aid.",
+                        critterGetName(obj), critterGetName(target));
+                    presenter()->consoleMessageStyled(target->netId, kMsgChannelSystem, line);
+                } else {
+                    messageListItem.num = 503; // You fail to do any healing.
+                    if (messageListGetItem(&gSkillsMessageList, &messageListItem)) {
+                        presenter()->consoleMessage(messageListItem.text);
+                    }
+                }
+                if (playerActorIs(obj)) {
+                    gameTimeAddSeconds(1800);
+                }
+                break;
+            }
             // 512: You can't heal the dead.
             // 513: Let the dead rest in peace.
             // 514: It's dead, get over it.
@@ -809,6 +838,34 @@ int skillUse(Object* obj, Object* target, int skill, int criticalChanceModifier)
         }
 
         if (critterIsDead(target)) {
+            // Same co-op policy as First Aid, but use Doctor's own vanilla roll shape
+            // and one-hour time cost. A successful check revives at exactly 1 HP; it
+            // does not also perform the normal Doctor heal/limb-repair pass.
+            if (serverDedicatedActive() && playerActorIs(target)) {
+                int roll = ROLL_FAILURE;
+                if (critterGetBodyType(target) != BODY_TYPE_ROBOTIC) {
+                    int skillValue = skillGetValue(obj, skill);
+                    roll = randomRoll(skillValue, criticalChance, &hpToHeal);
+                }
+                if ((roll == ROLL_SUCCESS || roll == ROLL_CRITICAL_SUCCESS)
+                    && critterRevive(target)) {
+                    skillUpdateLastUse(SKILL_DOCTOR);
+                    successCount = 1;
+                    char line[128];
+                    snprintf(line, sizeof(line), "%s revived %s with Doctor.",
+                        critterGetName(obj), critterGetName(target));
+                    presenter()->consoleMessageStyled(target->netId, kMsgChannelSystem, line);
+                } else {
+                    messageListItem.num = 503; // You fail to do any healing.
+                    if (messageListGetItem(&gSkillsMessageList, &messageListItem)) {
+                        presenter()->consoleMessage(messageListItem.text);
+                    }
+                }
+                if (playerActorIs(obj)) {
+                    gameTimeAddSeconds(3600);
+                }
+                break;
+            }
             // 512: You can't heal the dead.
             // 513: Let the dead rest in peace.
             // 514: It's dead, get over it.

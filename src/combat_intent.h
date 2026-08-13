@@ -89,6 +89,7 @@ void combatIntentPushVerb(int kind, int verb, int arg, int verbArg, int actorSlo
 bool combatIntentPeekForSlot(int slot, CombatIntent* out);
 void combatIntentPopForSlot(int slot);
 bool combatIntentPendingForSlot(int slot);
+bool combatIntentHasKindForSlot(int slot, int kind);
 
 // Discard everything queued for one slot — the disconnect path (MP_PROPOSAL
 // Ch 6.3): a player who drops must not have their stale orders executed when

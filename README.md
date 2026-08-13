@@ -92,6 +92,10 @@ cmake --build build-win --target f2_server                 # Windows cross (ming
 You need [SDL2](https://libsdl.org/download-2.0.php) for the client (`apt install libsdl2-2.0-0`
 on Debian/Ubuntu). `build/f2_server` and `build/fallout2-ce` are what the launch scripts expect.
 
+For a compact, persistent, single-service Docker Compose deployment, see
+[`DOCKER.md`](DOCKER.md). The final image contains only the static dedicated-server binary;
+you provide your licensed Fallout 2 installation as a bind mount.
+
 ## Game assets
 
 All binaries must run with their working directory set to the Fallout 2 game folder — they read

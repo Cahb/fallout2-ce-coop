@@ -39,6 +39,7 @@
 #include "random.h"
 #include "script_request_handler.h"
 #include "scripts.h"
+#include "server_loop.h"
 #include "server_players.h"
 #include "settings.h"
 #include "svga.h"
@@ -1090,13 +1091,16 @@ int _map_target_load_area()
 // the script's effects intact (an extra still trips the trap, just does not
 // travel). MP_PROPOSAL Ch 14.2.
 static bool gMapTransitionSuppressed = false;
+static int gMapTransitionInitiatorSlot = -1;
+static unsigned int gMapTransitionParticipantMask = 0;
+static unsigned int gMapActiveTransitionXpAudienceMask = 0;
 
 void mapSetTransitionSuppressed(bool suppressed)
 {
     gMapTransitionSuppressed = suppressed;
 }
 
-int mapSetTransition(MapTransition* transition)
+static int mapSetTransitionImpl(MapTransition* transition, Object* explicitActor)
 {
     if (transition == nullptr) {
         return -1;
@@ -1109,6 +1113,21 @@ int mapSetTransition(MapTransition* transition)
 
     memcpy(&gMapTransition, transition, sizeof(gMapTransition));
 
+    // Preserve the action context across the beat-tail transition. map_enter runs
+    // inside mapLoad, after the spatial/elevator scope that requested travel has
+    // already unwound. Slot ids survive the wholesale map object replacement.
+    gMapTransitionInitiatorSlot = -1;
+    gMapTransitionParticipantMask = 0;
+    if (serverDedicatedActive()) {
+        Object* initiator = explicitActor != nullptr ? explicitActor : scriptContextDude(nullptr);
+        gMapTransitionInitiatorSlot = playerActorSlotOf(initiator);
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            if (playerActorAt(slot) != nullptr && playerActorOnline(slot)) {
+                gMapTransitionParticipantMask |= 1u << slot;
+            }
+        }
+    }
+
     if (gMapTransition.map == 0) {
         gMapTransition.map = -2;
     }
@@ -1118,6 +1137,21 @@ int mapSetTransition(MapTransition* transition)
     }
 
     return 0;
+}
+
+int mapSetTransition(MapTransition* transition)
+{
+    return mapSetTransitionImpl(transition, nullptr);
+}
+
+int mapSetTransitionForActor(MapTransition* transition, Object* actor)
+{
+    return mapSetTransitionImpl(transition, actor);
+}
+
+unsigned int mapTransitionXpAudienceMask()
+{
+    return gMapActiveTransitionXpAudienceMask;
 }
 
 // Is a map transition latched and waiting for the beat tail? mapSetTransition
@@ -1159,7 +1193,17 @@ int mapHandleTransition()
                 // SFALL: Remove text floaters after moving to another map.
                 textObjectsReset();
 
+                // Destination map-enter is part of the group transition, not a
+                // scope-less passive heartbeat. Give its ordinary `dude_obj` reads
+                // the actual initiator, and expose the captured participant audience
+                // only for give_exp_points while these procs execute.
+                Object* initiator = gMapTransitionInitiatorSlot >= 0
+                    ? playerActorAt(gMapTransitionInitiatorSlot)
+                    : nullptr;
+                ServerActorScope transitionScope(initiator);
+                gMapActiveTransitionXpAudienceMask = gMapTransitionParticipantMask;
                 mapLoadById(gMapTransition.map);
+                gMapActiveTransitionXpAudienceMask = 0;
             }
 
             if (gMapTransition.tile != -1 && gMapTransition.tile != 0

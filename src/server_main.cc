@@ -236,6 +236,7 @@ int main(int argc, char** argv)
         // Bridge the player-initiated combat-start latch (cstart verb) into f2_core so
         // the server loop's idle tick can enter combat on the claimant's request.
         serverSetCombatStartConsumer(serverControlConsumePendingCombatStart);
+        combatSetEnterHook(serverControlCancelPendingForCombat);
 
         // F2_SERVER_TICKS: safety cap on the number of beats. ►► DEFAULT IS NOW
         // UNLIMITED — a real dedicated server that never closes is the common case,

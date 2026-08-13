@@ -1,0 +1,10 @@
+# The server build only needs these sources. Keeping everything else out avoids
+# sending game installers, release archives, screenshots, and local builds to
+# the Docker daemon.
+**
+!CMakeLists.txt
+!src
+!src/**
+!third_party
+!third_party/fpattern
+!third_party/fpattern/CMakeLists.txt

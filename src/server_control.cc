@@ -581,7 +581,14 @@ static void interactionFire(int verb, Object* actor, Object* target, int arg)
             if (serverDedicatedActive() && playerActorIs(target) && critterIsDead(target)
                 && itemIsHealing(item->pid)) {
                 if (critterRevive(target)) {
-                    itemRemove(actor, item, 1); // consume one unit; do NOT touch `item` after
+                    // Consume exactly one authoritative unit. itemRemove peels one object
+                    // off a stack but deliberately does not destroy that detached object;
+                    // normal drug/item use finishes the same lifecycle with _obj_destroy.
+                    // Destroy it here too so there is no leaked duplicate identity that a
+                    // later inventory reconcile can mistake for a second consumed powder.
+                    if (itemRemove(actor, item, 1) == 0) {
+                        objectDestroy(item, nullptr);
+                    }
                     fprintf(stderr, "f2_server: control useitemon REVIVE net=%d\n", target->netId);
                     char line[128];
                     snprintf(line, sizeof(line), "%s revived %s.", critterGetName(actor), critterGetName(target));
@@ -887,6 +894,14 @@ static void serverControlArmInteraction(int sessionId, Object* actor, int verb, 
         if (actorSlot < 0) {
             actorSlot = 0; // the debug CMD port has no session and drives the host
         }
+        // Do not park stale actions for a later turn. Reject immediately and send
+        // the current checkpoint so a desynchronized viewer repairs itself.
+        if (_combat_whose_turn() != actor) {
+            fprintf(stderr, "f2_server: control interact verb=%d dropped (not actor's turn)\n", verb);
+            serverControlRefuse(sessionId, "It isn't your turn.");
+            combatEmitCurrentTurnCheckpoint();
+            return;
+        }
         combatIntentPushVerb(COMBAT_INTENT_INTERACT, verb, target->netId, arg, actorSlot);
         fprintf(stderr, "f2_server: control interact verb=%d netId=%d queued (combat, slot=%d)\n",
             verb, target->netId, actorSlot);
@@ -935,6 +950,16 @@ void serverControlDropPendingFor(int sessionId)
     gPendingBySession.erase(sessionId);
 }
 
+void serverControlCancelPendingForCombat()
+{
+    if (gPendingBySession.empty()) {
+        return;
+    }
+    fprintf(stderr, "f2_server: interact latches CLEARED (%zu) — combat entered\n",
+        gPendingBySession.size());
+    gPendingBySession.clear();
+}
+
 void serverControlAdvancePending()
 {
     // ►► MAP-GENERATION BOOKKEEPING RUNS FIRST, BEFORE THE EMPTY EARLY-RETURN.
@@ -964,9 +989,7 @@ void serverControlAdvancePending()
     // Combat entry cancels EVERY session's intent (vanilla animationStop clears
     // walks on combat start, combat.cc). The in-combat verbs take over from here.
     if (isInCombat()) {
-        fprintf(stderr, "f2_server: interact latches CLEARED (%zu) — combat started\n",
-            gPendingBySession.size());
-        gPendingBySession.clear();
+        serverControlCancelPendingForCombat();
         return;
     }
 
@@ -1111,6 +1134,7 @@ static void serverControlMove(Object* actor, int tile, bool run)
         // Saying it out loud turns a silent stalemate into a report — and tells
         // the player which of the two views of the world they are looking at.
         serverControlRefuseActor(actor, "You are in combat.");
+        combatEmitCurrentTurnCheckpoint();
         return;
     }
 
@@ -2549,6 +2573,7 @@ void serverControlLine(int sessionId, const char* line)
     bool isInteractVerb = strcmp(verb, "use") == 0
         || strcmp(verb, "usedoor") == 0
         || strcmp(verb, "get") == 0
+        || strcmp(verb, "gethere") == 0
         || strcmp(verb, "look") == 0
         || strcmp(verb, "push") == 0
         || strcmp(verb, "rot") == 0
@@ -2589,6 +2614,39 @@ void serverControlLine(int sessionId, const char* line)
             Rect rect;
             objectRotateClockwise(gDude, &rect);
             fprintf(stderr, "f2_server: control rot\n");
+            return;
+        }
+
+        // gethere: pick ONE loose item from the actor's authoritative current tile.
+        // This is intentionally targetless on the wire: its purpose is to work when
+        // bushes/scenery make pixel selection awkward, and trusting a client-supplied
+        // tile would also reintroduce the free-roam/combat position-desync class here.
+        // Feed the chosen object through the ordinary GET choke point so scripts,
+        // carry capacity, the pickup gesture, combat AP and object/inventory streaming
+        // remain exactly the same as a mouse-picked item. Containers stay on the loot
+        // path; hidden objects and unreplicated presentation transients are ineligible.
+        if (strcmp(verb, "gethere") == 0) {
+            Object* target = objectFindFirstAtLocation(actor->elevation, actor->tile);
+            while (target != nullptr) {
+                if (target->netId > 0
+                    && (target->flags & OBJECT_HIDDEN) == 0
+                    && PID_TYPE(target->pid) == OBJ_TYPE_ITEM
+                    && itemGetType(target) != ITEM_TYPE_CONTAINER) {
+                    break;
+                }
+                target = objectFindNextAtLocation();
+            }
+
+            if (target == nullptr) {
+                fprintf(stderr, "f2_server: control gethere no item tile=%d elev=%d\n",
+                    actor->tile, actor->elevation);
+                serverControlRefuse(sessionId, "There is nothing to pick up here.");
+                return;
+            }
+
+            fprintf(stderr, "f2_server: control gethere tile=%d elev=%d -> netId=%d pid=%d\n",
+                actor->tile, actor->elevation, target->netId, target->pid);
+            serverControlArmInteraction(sessionId, actor, kInteractGet, target, 0);
             return;
         }
 
@@ -3693,9 +3751,9 @@ void serverControlLine(int sessionId, const char* line)
     // barrier (combat.cc combatSessionAdvance) drains the queue on the dude's turn
     // via combatServerPumpIntents — the exact same entry points the debug CMD port
     // and the AI use. They are claimant-only and in-combat-only (out of combat the
-    // click path uses mv); an intent queued during an AI turn simply waits for the
-    // dude's barrier (pre-input, like the debug harness). This is the whole of the
-    // wire→barrier binding: the barrier already waits on serverControlHasClaimant.
+    // click path uses mv), and authority accepts them only from the actor whose turn
+    // is current. This is the whole of the wire→barrier binding: the barrier already
+    // waits on serverControlHasClaimant.
     bool isCombatVerb = strcmp(verb, "cattack") == 0
         || strcmp(verb, "cmove") == 0
         || strcmp(verb, "cendturn") == 0
@@ -3707,6 +3765,7 @@ void serverControlLine(int sessionId, const char* line)
             // same desync: a client that believes it is still fighting sends combat
             // verbs at a server that has left combat. Both directions now speak.
             serverControlRefuse(sessionId, "You are not in combat.");
+            presenter()->combatExit();
             return;
         }
 
@@ -3718,6 +3777,17 @@ void serverControlLine(int sessionId, const char* line)
         int actorSlot = serverControlSlotForSession(sessionId);
         if (actorSlot < 0) {
             actorSlot = 0;
+        }
+
+        // Authority filters turn ownership at receipt. Previously a command sent
+        // during an AI/other-player turn waited in this slot's queue and executed a
+        // round later, so relaxing client-side gates made stale SPACE/clicks dangerous.
+        if (_combat_whose_turn() != actor) {
+            fprintf(stderr, "f2_server: control %s dropped (not actor's turn, slot=%d)\n",
+                verb, actorSlot);
+            serverControlRefuse(sessionId, "It isn't your turn.");
+            combatEmitCurrentTurnCheckpoint();
+            return;
         }
 
         if (strcmp(verb, "cattack") == 0) {
@@ -3758,12 +3828,17 @@ void serverControlLine(int sessionId, const char* line)
         } else if (strcmp(verb, "cendcombat") == 0) {
             // Vanilla RETURN: attempt to end combat (drain calls combatAttemptEnd,
             // which refuses with a streamed console message if hostiles remain).
-            combatIntentPush(COMBAT_INTENT_END_COMBAT, 0, HIT_LOCATION_UNCALLED, false,
-                COMBAT_INTENT_HITMODE_AUTO, actorSlot);
+            if (!combatIntentHasKindForSlot(actorSlot, COMBAT_INTENT_END_COMBAT)) {
+                combatIntentPush(COMBAT_INTENT_END_COMBAT, 0, HIT_LOCATION_UNCALLED, false,
+                    COMBAT_INTENT_HITMODE_AUTO, actorSlot);
+            }
             fprintf(stderr, "f2_server: control cendcombat slot=%d\n", actorSlot);
         } else { // cendturn
-            combatIntentPush(COMBAT_INTENT_END_TURN, 0, HIT_LOCATION_UNCALLED, false,
-                COMBAT_INTENT_HITMODE_AUTO, actorSlot);
+            // Keyboard repeat cannot bank a second end-turn for this slot's next round.
+            if (!combatIntentHasKindForSlot(actorSlot, COMBAT_INTENT_END_TURN)) {
+                combatIntentPush(COMBAT_INTENT_END_TURN, 0, HIT_LOCATION_UNCALLED, false,
+                    COMBAT_INTENT_HITMODE_AUTO, actorSlot);
+            }
             fprintf(stderr, "f2_server: control cendturn slot=%d\n", actorSlot);
         }
         return;

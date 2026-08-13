@@ -49,6 +49,52 @@ namespace fallout {
 static const int kServerObjWidth = 640;
 static const int kServerObjHeight = 480;
 
+// Dedicated-server difficulty is simulation authority. The client Preferences
+// screen remains useful for local options (autorun, volume, brightness, etc.),
+// but its two difficulty knobs must not change AI/damage for the whole party.
+// Apply these overrides once after fallout2.cfg is read and again after loading
+// a save, whose preferences block otherwise restores the saved difficulty.
+static bool serverApplyDifficultyOverrides()
+{
+    struct DifficultyOverride {
+        const char* envName;
+        int* setting;
+    } overrides[] = {
+        { "F2_GAME_DIFFICULTY", &settings.preferences.game_difficulty },
+        { "F2_COMBAT_DIFFICULTY", &settings.preferences.combat_difficulty },
+    };
+
+    for (const DifficultyOverride& override : overrides) {
+        const char* value = getenv(override.envName);
+        if (value == nullptr || *value == '\0') {
+            continue;
+        }
+
+        char* end = nullptr;
+        long parsed = strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 0 || parsed > 2) {
+            fprintf(stderr,
+                "f2_server: invalid %s='%s' (expected 0=easy/wimpy, 1=normal, 2=hard/rough)\n",
+                override.envName, value);
+            return false;
+        }
+
+        *override.setting = static_cast<int>(parsed);
+    }
+
+    static const char* gameNames[] = { "Easy", "Normal", "Hard" };
+    static const char* combatNames[] = { "Wimpy", "Normal", "Rough" };
+    int gameDifficulty = settings.preferences.game_difficulty;
+    int combatDifficulty = settings.preferences.combat_difficulty;
+    fprintf(stderr, "f2_server: difficulty game=%d (%s), combat=%d (%s)\n",
+        gameDifficulty,
+        gameDifficulty >= 0 && gameDifficulty <= 2 ? gameNames[gameDifficulty] : "invalid",
+        combatDifficulty,
+        combatDifficulty >= 0 && combatDifficulty <= 2 ? combatNames[combatDifficulty] : "invalid");
+
+    return true;
+}
+
 // Headless tile-window refresh: presentation only (the client repaints the dirty
 // iso rect). The server never blits, so this is a no-op.
 static void serverTileRefreshNoop(Rect* rect)
@@ -78,6 +124,9 @@ static int serverInitSubsystems(int argc, char** argv)
     // settings — both parse INI files (core file I/O), no SDL.
     sfallConfigInit(argc, argv);
     settingsInit(false, argc, argv);
+    if (!serverApplyDifficultyOverrides()) {
+        return -1;
+    }
 
     // Mount master.dat / patches / the data tree — the asset backing for every
     // proto/map/script/message load below.
@@ -479,6 +528,12 @@ int serverBootLoadSlot(int slot)
         fprintf(stderr, "f2_server: load slot %d FAILED (ls_error_code=%d%s)\n",
             slot + 1, code,
             code == 1 ? " = save made by an incompatible version" : "");
+        return -1;
+    }
+
+    // A save carries a vanilla preferences block, including both difficulty
+    // values. Dedicated-server env overrides remain authoritative across loads.
+    if (!serverApplyDifficultyOverrides()) {
         return -1;
     }
 

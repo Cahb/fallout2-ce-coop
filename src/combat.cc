@@ -3738,10 +3738,32 @@ struct CombatSession {
 };
 
 static CombatSession gCombatSession;
+static void (*gCombatEnterHook)() = nullptr;
 
 bool combatSessionActive()
 {
     return gCombatSession.active;
+}
+
+void combatSetEnterHook(void (*hook)())
+{
+    gCombatEnterHook = hook;
+}
+
+void combatEmitCurrentTurnCheckpoint()
+{
+    if (!isInCombat()) {
+        return;
+    }
+    Object* actor = _combat_whose_turn();
+    if (actor == nullptr) {
+        return; // combat entry/round bookkeeping has not selected an actor yet
+    }
+    int deadlineMs = gCombatSession.active && playerActorIs(actor)
+        ? gCombatSession.idleBudgetMs
+        : 0;
+    presenter()->turnStart(actor, playerActorIs(actor),
+        actor->data.critter.combat.ap, deadlineMs);
 }
 
 void combatSessionRearmIdleTimer()
@@ -4051,6 +4073,10 @@ static void combatSessionBegin(CombatStartData* csd)
     CombatRound& round = s.round;
     round.wasInCombat = (gCombatState & 0x01) != 0;
 
+    if (!round.wasInCombat && gCombatEnterHook != nullptr) {
+        gCombatEnterHook();
+    }
+
     _combat_begin(nullptr);
     presenter()->combatEnter(csd != nullptr ? csd->attacker : nullptr);
 
@@ -4225,6 +4251,10 @@ void _combat(CombatStartData* csd)
     if (guardOpen) {
         CombatRound round;
         round.wasInCombat = (gCombatState & 0x01) != 0;
+
+        if (!round.wasInCombat && gCombatEnterHook != nullptr) {
+            gCombatEnterHook();
+        }
 
         _combat_begin(nullptr);
 
@@ -6306,7 +6336,10 @@ bool _combat_to_hit(Object* target, int* accuracy)
         return false;
     }
 
-    if (_combat_check_bad_shot(gDude, target, hitMode, aiming) != COMBAT_BAD_SHOT_OK) {
+    // Viewer values are a possibly-lagging mirror. Keep the hover preview useful,
+    // but never suppress it because local AP/range/ammo disagrees with authority.
+    if (!clientViewerActive()
+        && _combat_check_bad_shot(gDude, target, hitMode, aiming) != COMBAT_BAD_SHOT_OK) {
         return false;
     }
 
@@ -6352,7 +6385,13 @@ void _combat_attack_this(Object* target)
     char formattedText[80];
     const char* sfx;
 
-    int rc = _combat_check_bad_shot(gDude, target, hitMode, aiming);
+    // On a wire viewer all mutable-state checks are advisory. In particular, stale
+    // AP or a free-roam position offset used to return here without sending cattack,
+    // leaving the server no opportunity to accept the real action or explain its
+    // authoritative rejection. Preserve vanilla validation everywhere else.
+    int rc = clientViewerActive()
+        ? COMBAT_BAD_SHOT_OK
+        : _combat_check_bad_shot(gDude, target, hitMode, aiming);
     switch (rc) {
     case COMBAT_BAD_SHOT_NO_AMMO:
         item = critterGetWeaponForHitMode(gDude, hitMode);

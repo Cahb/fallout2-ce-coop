@@ -5094,6 +5094,9 @@ void inventoryOpenTrade(int win, Object* barterer, Object* playerTable, Object* 
     }
 
     bool isoWasEnabled = false;
+    Object* serverPlayerLeft = nullptr;
+    Object* serverPlayerRight = nullptr;
+    Object* serverPlayerArmor = nullptr;
     if (serverLoopActive()) {
         // Headless: skip the trade window, its slot buttons, and all rendering.
         // The UI setup is NOT headless-safe — _setup_inventory() calls exit(1)
@@ -5105,6 +5108,15 @@ void inventoryOpenTrade(int win, Object* barterer, Object* playerTable, Object* 
         // _pud for parity with the interactive COMMIT path.
         _inven_dude = gDude;
         _pud = &(_inven_dude->data.inventory);
+
+        // _setup_inventory does this on the interactive path: equipped gear is
+        // staged outside the inventory while barter is open, so it cannot be sold.
+        // The headless path used to skip that SIM half together with the window
+        // setup. As a result a viewer could offer the currently wielded spear; the
+        // item moved to the table while its in-hand flag and the actor's armed fid
+        // stayed behind. Mirror the vanilla staging explicitly and restore it in
+        // the common teardown below.
+        equipmentDetach(_inven_dude, &serverPlayerLeft, &serverPlayerRight, &serverPlayerArmor);
 
         // ►► DIAGNOSTIC (F2_TRACE_BARTER): whose inventory does this trade mutate?
         // The server barter drain moves items OUT OF _inven_dude on every offer, so
@@ -5599,7 +5611,13 @@ void inventoryOpenTrade(int win, Object* barterer, Object* playerTable, Object* 
 
     // Headless never created the trade window or disabled iso (see the setup
     // guard above), so skip _exit_inventory (window destroy + iso re-enable).
-    if (!serverLoopActive()) {
+    if (serverLoopActive()) {
+        equipmentApply(_inven_dude, serverPlayerLeft, serverPlayerRight, serverPlayerArmor);
+        // equipmentApply restores the in-hand flags; make the sprite a direct
+        // post-condition too, so a pre-existing stale fid is repaired as trade
+        // closes and the ordinary object delta streams it to every viewer.
+        invenRederiveWeaponFid(_inven_dude);
+    } else {
         _exit_inventory(isoWasEnabled);
     }
 

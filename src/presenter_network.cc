@@ -683,6 +683,26 @@ public:
         if (presenterEmissionsSuppressed()) return;
         beginEvent(EVENT_COMBAT_ENTER, EVENT_FLAG_STATE);
         putI32(netIdOf(initiator)); // may legitimately be absent (scripted start)
+        // Combat-entry position fence. Free-roam glides are presentation and may lag
+        // the authoritative server tile when somebody else/NPC/script starts combat.
+        // Snapshot EVERY replicated critter on the elevation, not `_combat_list`:
+        // pressing A with no target legitimately enters combat with zero combatants,
+        // yet the next melee target still needs the same range geometry on both ends.
+        std::vector<Object*> critters;
+        for (Object* obj = objectFindFirstAtElevation(gElevation);
+             obj != nullptr;
+             obj = objectFindNextAtElevation()) {
+            if (obj->netId > 0 && FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER) {
+                critters.push_back(obj);
+            }
+        }
+        putU16((unsigned short)critters.size());
+        for (Object* obj : critters) {
+            putI32(obj->netId);
+            putI32(obj->tile);
+            putI32(obj->elevation);
+            putI32(obj->rotation);
+        }
         endEvent();
     }
 

@@ -409,7 +409,7 @@ void elevatorRideApply(Object* rider, int map, int elevation, int tile)
         transition.elevation = elevation;
         transition.tile = tile;
         transition.rotation = ROTATION_SE;
-        mapSetTransition(&transition);
+        mapSetTransitionForActor(&transition, rider);
         return;
     }
 

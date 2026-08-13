@@ -5,8 +5,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "animation.h"
+#include "critter.h"
 #include "debug.h"
 #include "game.h"
+#include "inventory.h"
 #include "light.h" // lightGetAmbientIntensity — global ambient-light worldDelta
 #include "map.h"
 #include "object.h"
@@ -248,10 +251,25 @@ void objectDeltaScan()
     Object* obj = objectFindFirst();
     while (obj != nullptr) {
         if (objectIsSyncable(obj)) {
+            // Equipment flags and the critter fid are one authoritative state. Repair
+            // the latter before taking the beat snapshot so throw/pickup/re-equip and
+            // other inventory-only paths cannot leave a player holding stale art.
+            if (serverDedicatedActive() && objectIsCritter(obj) && playerActorIs(obj)
+                && !critterIsDead(obj) && FID_ANIM_TYPE(obj->fid) == ANIM_STAND) {
+                invenRederiveWeaponFid(obj);
+            }
             ObjectShadow current = objectCaptureShadow(obj);
             auto it = gShadow.find(obj);
             if (it != gShadow.end()) {
                 unsigned int mask = objectDiffShadow(it->second, current, objectIsCritter(obj));
+                // A player's inventory reconcile can replace/remove the exact weapon
+                // object while the visible weapon code happens to compare equal. Send a
+                // pose checkpoint with every equipment delta anyway: it repairs a client
+                // whose previous fid was held behind a skipped throw replay, and resets a
+                // frame index that is invalid for the armed stand art.
+                if ((mask & OBJECT_DELTA_INVENTORY) != 0 && playerActorIs(obj)) {
+                    mask |= OBJECT_DELTA_FID | OBJECT_DELTA_FRAME;
+                }
                 if (mask != 0) {
                     if ((mask & OBJECT_DELTA_INVENTORY) != 0 && getenv("F2_TRACE_EVENTS") != nullptr) {
                         fprintf(stderr, "[inv] DELTA net=%d invBit=1 (hash %u->%u)\n",

@@ -118,6 +118,9 @@ void serverControlDrainPresence();
 // its action this same beat (outcome events wire-ordered after the final MOVE hop).
 // No-op when no interaction is pending.
 void serverControlAdvancePending();
+// Fresh combat is a hard phase boundary: discard every unfinished free-roam
+// walk-then-act latch immediately, even if the fight drains inside one server beat.
+void serverControlCancelPendingForCombat();
 
 // True while a wire client holds the control claim. Bridged into f2_core via
 // serverSetClaimantQuery so the resumable-combat turn barrier can wait for a

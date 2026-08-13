@@ -1500,6 +1500,14 @@ static int mainClientViewer(const char* connectSpec)
             // Save/Load — the server owns the state. Confirming sets
             // _game_user_wants_to_quit, which the loop condition picks up next iteration.
             showQuitConfirmationDialog();
+        } else if (keyCode == KEY_LOWERCASE_O || keyCode == KEY_UPPERCASE_O) {
+            // The HUD Options button posts O. Save/Load belong to the dedicated
+            // server, so do not expose vanilla's outer Options menu; open its
+            // Preferences page directly instead. This keeps client-local controls
+            // such as autorun, sound, brightness, text speed, and mouse sensitivity.
+            // kPreferences is in kViewerModalMask, so the wire continues pumping
+            // inside this blocking vanilla dialog and combat/map changes can close it.
+            doPreferences(false);
         }
 
         if (!clientDialogActive()) {
@@ -1513,18 +1521,20 @@ static int mainClientViewer(const char* connectSpec)
         // animation plays or before the last is answered — vanilla blocks input for the
         // whole attack (this also stops spamming AP away in a blink, §3.c).
         if (conn.inCombat()) {
-            if (conn.myTurn() && !combatBusy) {
-                if (keyCode == KEY_SPACE) {
-                    conn.sendLine("cendturn"); // 32: end-turn button / SPACE
-                    actionPending = true;
-                    actionPendingSince = getTicks();
-                } else if (keyCode == KEY_RETURN) {
-                    // 13: end-combat button / RETURN — vanilla "attempt to end combat"
-                    // (the server refuses with a console message if hostiles remain).
-                    conn.sendLine("cendcombat");
-                    actionPending = true;
-                    actionPendingSince = getTicks();
-                }
+            // END intents are escape hatches and must not depend on presentation state.
+            // A stale `_myTurn` or wedged replay is exactly when SPACE is needed most;
+            // the server now accepts only the actual current actor and de-duplicates
+            // key repeat, so sending is safe even when the mirror is wrong.
+            if (keyCode == KEY_SPACE) {
+                conn.sendLine("cendturn"); // 32: end-turn button / SPACE
+                actionPending = true;
+                actionPendingSince = getTicks();
+            } else if (keyCode == KEY_RETURN) {
+                // 13: end-combat button / RETURN — vanilla "attempt to end combat"
+                // (the server refuses with a console message if hostiles remain).
+                conn.sendLine("cendcombat");
+                actionPending = true;
+                actionPendingSince = getTicks();
             }
         } else if (keyCode == KEY_LOWERCASE_A || keyCode == KEY_UPPERCASE_A) {
             // Out of combat, vanilla 'A' toggles combat (game_ui.cc → _combat(nullptr)).
@@ -1572,6 +1582,21 @@ static int mainClientViewer(const char* connectSpec)
                     handSwitchPending = true;
                     handSwitchSince = getTicks();
                     clientViewerTakeRefusal(); // clear any stale refusal edge before we wait
+                }
+            }
+        } else if (keyCode == KEY_LOWERCASE_G || keyCode == KEY_UPPERCASE_G) {
+            // Co-op ground-item convenience: ask the authoritative server to pick one
+            // eligible loose item from the tile OUR actor currently occupies. The client
+            // deliberately sends no tile or netId — either can be stale while a streamed
+            // walk is still catching up visually, and the feature exists specifically to
+            // avoid having to pixel-pick an obscured object. One item per press preserves
+            // the normal pickup gesture/AP/carry-cap semantics; repeated G clears a pile.
+            bool busy = conn.inCombat() ? combatBusy : oocBusy;
+            if (!busy && (!conn.inCombat() || conn.myTurn())) {
+                conn.sendLine("gethere");
+                if (conn.inCombat()) {
+                    actionPending = true;
+                    actionPendingSince = getTicks();
                 }
             }
         } else if (keyCode == -20) {

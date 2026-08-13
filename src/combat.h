@@ -76,6 +76,16 @@ CombatPumpOutcome combatServerPumpIntents(int actorSlot = 0);
 // a time. combatSessionActive() is false on every gate-off/client/golden path.
 bool combatSessionActive();
 
+// Dedicated-server lifecycle hook: invoked exactly when a fresh combat begins,
+// before the combat roster/turn machine runs. The server control plane uses it
+// to cancel free-roam walk-then-act latches at the actual phase boundary.
+void combatSetEnterHook(void (*hook)());
+
+// Re-emit the authoritative current-turn checkpoint. Used when the control plane
+// catches a client on the wrong side of the combat/free-roam boundary; TURN_START
+// is idempotent and repairs combat mode, owner and AP on every viewer.
+void combatEmitCurrentTurnCheckpoint();
+
 // Rearm the resumable-combat player-turn idle timer. For player activity that
 // does NOT arrive as a combat intent and so never reaches the pump that normally
 // rearms it — today: OPENING the in-combat inventory screen, so the player gets

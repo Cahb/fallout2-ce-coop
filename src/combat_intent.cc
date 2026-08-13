@@ -62,6 +62,16 @@ bool combatIntentPendingForSlot(int slot)
     return combatIntentPeekForSlot(slot, &ignored);
 }
 
+bool combatIntentHasKindForSlot(int slot, int kind)
+{
+    for (const CombatIntent& intent : gCombatIntents) {
+        if (intent.actorSlot == slot && intent.kind == kind) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void combatIntentDropForSlot(int slot)
 {
     for (auto it = gCombatIntents.begin(); it != gCombatIntents.end();) {

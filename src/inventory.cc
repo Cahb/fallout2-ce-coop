@@ -576,8 +576,8 @@ int _inven_unwield(Object* critter_obj, int hand)
 // agreement is exactly what broke the first attempt at this fix: the client's interface said
 // LEFT while the server registry's default said RIGHT, so `activeHand == hand` failed and the
 // re-derive never ran. A post-condition ("nothing armed, so show nothing") has no such
-// dependency. Deliberately does NOT guess when both hands hold weapons — there the active
-// hand genuinely decides, and this function has no business inventing an answer.
+// dependency. When both hands hold weapons the server registry supplies the active hand;
+// elsewhere an already-matching fid is preserved, so this remains a safe post-condition.
 void invenRederiveWeaponFid(Object* critter)
 {
     if (critter == nullptr || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
@@ -595,7 +595,19 @@ void invenRederiveWeaponFid(Object* critter)
     } else if (leftIsWeapon != rightIsWeapon) {
         weaponAnimationCode = weaponGetAnimationCode(leftIsWeapon ? leftItem : rightItem);
     } else {
-        return; // both hands armed — the active hand decides, and it is not knowable here
+        int currentCode = (critter->fid & 0xF000) >> 12;
+        int leftCode = weaponGetAnimationCode(leftItem);
+        int rightCode = weaponGetAnimationCode(rightItem);
+        if (currentCode == leftCode || currentCode == rightCode) {
+            return;
+        }
+        if (serverDedicatedActive() && playerActorIs(critter)) {
+            weaponAnimationCode = serverActorActiveHand(playerActorSlotOf(critter)) == HAND_LEFT
+                ? leftCode
+                : rightCode;
+        } else {
+            return;
+        }
     }
 
     if (((critter->fid & 0xF000) >> 12) == weaponAnimationCode) {

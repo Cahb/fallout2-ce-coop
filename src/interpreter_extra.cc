@@ -469,6 +469,28 @@ static void opGiveExpPoints(Program* program)
 {
     int xp = programStackPopInteger(program);
 
+    // A destination map-enter is the completion edge for a group transition: all
+    // players captured as making that transition receive the authored story XP.
+    // This audience exists only during mapLoad's map-enter procs; dialog, skill,
+    // object-use and every other bare opcode retain their single acting subject.
+    unsigned int audience = mapTransitionXpAudienceMask();
+    if (audience != 0) {
+        bool failed = false;
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            if ((audience & (1u << slot)) == 0) {
+                continue;
+            }
+            Object* actor = playerActorAt(slot);
+            if (actor != nullptr && pcAddExperience(xp, nullptr, actor) != 0) {
+                failed = true;
+            }
+        }
+        if (failed) {
+            scriptError("\nScript Error: %s: op_give_exp_points: stat_pc_set failed");
+        }
+        return;
+    }
+
     // THE one legitimate scriptContextDude site for XP (PLAYER_SHEET_DESIGN.md
     // §4). A bare opcode has no object in scope, so "who did this" genuinely has
     // to be the script's notion of the player — unlike the kill / skill-use /
@@ -5008,7 +5030,10 @@ static void opGetPcStat(Program* program)
 {
     int data = programStackPopInteger(program);
 
-    int value = pcGetStat(data);
+    // Read the same actor this program would award through give_exp_points. A
+    // passive or transition script must not test host level and then credit an
+    // extra (or the reverse) because its two implicit-player opcodes disagreed.
+    int value = pcGetStat(data, scriptContextDude(program));
     programStackPushInteger(program, value);
 }
 

@@ -233,7 +233,8 @@ unsigned int crc32Of(const unsigned char* data, int length)
 // rebaselines must defer) on combat/world-rebuild. See viewerServiceTicker().
 static const int kViewerModalMask = GameMode::kInventory | GameMode::kSkilldex
     | GameMode::kEditor | GameMode::kPipboy | GameMode::kLoot | GameMode::kUseOn
-    | GameMode::kDialog | GameMode::kWorldmap | GameMode::kBarter;
+    | GameMode::kDialog | GameMode::kWorldmap | GameMode::kBarter
+    | GameMode::kPreferences;
 
 // ─── Combat outlines on the wire viewer (COMBAT_CLIENT_DESIGN #8) ────────────
 // Vanilla draws colored critter outlines in combat (red=hostile / green=friendly by
@@ -2399,15 +2400,21 @@ private:
         // "take all" nonetheless worked (the transfer is server-authoritative — the
         // data was right, only the mirror was wrong).
         //
-        // Safe for the same reason the loot-target path is safe, minus the timing
-        // caveat: the double-free hazard that keeps the generic path equip-flags-only
-        // is a CRITTER problem — an in-flight attack replay holding a pointer to the
-        // weapon being reconciled. A footlocker has no attack animation. CORPSES are
-        // critters and keep the old gating, so that hazard is untouched.
+        // A newly-dead corpse is also reconciled in full immediately. Death scripts
+        // commonly CREATE loot at the death edge (radscorpions add PID 92, the tail).
+        // Waiting until the corpse is already an open loot target loses that one-shot
+        // delta: the later window opens empty, while Take All still succeeds because
+        // the server inventory was correct. Removal remains lifetime-safe below by
+        // unlinking now and deferring the actual free while combat replay is busy.
         bool plainContainer = obj != gDude && PID_TYPE(obj->pid) != OBJ_TYPE_CRITTER;
+        bool deadCritter = obj != gDude && PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER
+            && (critterIsDead(obj)
+                || (hasResults && (results & DAM_DEAD) != 0)
+                || (hasHp && hp <= 0));
         if (hasInventory && obj != gDude
             && clientViewerActive()
             && (plainContainer
+                || deadCritter
                 || (gViewerLootTargetNetId != 0 && obj->netId == gViewerLootTargetNetId)
                 // The thief of an open steal session: another player's pack, drawn
                 // in the left panel of everyone's screen. See the declaration.
@@ -2468,7 +2475,7 @@ private:
                 // now or is deferred, because a deferred item is already unlinked and
                 // must not be reachable by netId in the meantime either.
                 forgetObjectRefs(toRemove[k]);
-                if (anyModalOpen) {
+                if (anyModalOpen || _inCombat) {
                     gDudeDeferredItemFrees.push_back(toRemove[k]);
                 } else {
                     objectDestroy(toRemove[k], nullptr);
@@ -2925,6 +2932,20 @@ private:
     void onCombatEnter(Reader& r)
     {
         r.i32(); // initiator netId (may be 0 for a scripted start) — unused v1
+        struct CombatPosition {
+            int netId;
+            int tile;
+            int elevation;
+            int rotation;
+        };
+        std::vector<CombatPosition> positions;
+        if (r.remaining() >= 2) {
+            int count = r.u16();
+            positions.reserve(count);
+            for (int i = 0; i < count && r.remaining() >= 16; i++) {
+                positions.push_back({ r.i32(), r.i32(), r.i32(), r.i32() });
+            }
+        }
         if (clientViewerActive() && _inCombat) {
             // Already in combat: this is the server re-emitting combatEnter after a
             // forced mid-fight rebaseline (another client joined). We kept our framing
@@ -2947,6 +2968,22 @@ private:
             // bare clear: a wholesale drop would leave a critter caught mid-glide
             // frozen wearing its running fid (run -> combat-enter must show STAND).
             presStandDownAll();
+            // The stand-down lands the last locally decoded glide endpoint. The combat
+            // fence then wins with the server's exact tile/elevation for every critter,
+            // closing free-roam→combat range/position disagreement even when the target
+            // was not a combatant when A was pressed.
+            for (const CombatPosition& pos : positions) {
+                Object* obj = lookup(pos.netId);
+                if (obj == nullptr) {
+                    continue;
+                }
+                objectSetLocation(obj, pos.tile, pos.elevation, nullptr);
+                objectSetRotation(obj, pos.rotation, nullptr);
+                if (obj == gDude && pos.elevation != gElevation) {
+                    mapSetElevation(pos.elevation);
+                    tileSetCenter(pos.tile, TILE_SET_CENTER_REFRESH_WINDOW);
+                }
+            }
             // 0x01 = in combat; 0x02 (free to act) stays clear until our TURN_START.
             gCombatState |= COMBAT_STATE_0x01;
             gCombatState &= ~COMBAT_STATE_0x02;
@@ -2972,7 +3009,20 @@ private:
 
     void onCombatExit(Reader&)
     {
+        // Combat truth is STATE, not presentation. Stop routing combat verbs now;
+        // only the animated button-door close remains queued behind death/attack
+        // playback. This also makes a duplicate COMBAT_EXIT an idempotent repair.
+        bool wasInCombat = _inCombat;
+        setInCombat(false);
+        _myTurn = false;
         if (clientViewerActive()) {
+            gCombatState &= ~(COMBAT_STATE_0x01 | COMBAT_STATE_0x02);
+            gCombatState |= COMBAT_STATE_0x02;
+        }
+        if (clientViewerActive()) {
+            if (!wasInCombat) {
+                return;
+            }
             // Queue the end-of-combat chrome behind everything still pending, so a
             // killing blow's death animation (and any trailing attacks) play out
             // BEFORE combat visibly ends (§3.c ordering). The routing bools stay
@@ -2984,8 +3034,6 @@ private:
             debugPrint("client_net: COMBAT EXIT (queued behind replay)\n");
             return;
         }
-        setInCombat(false);
-        _myTurn = false;
         debugPrint("client_net: COMBAT EXIT\n");
     }
 
@@ -3019,27 +3067,26 @@ private:
         int ap = r.i32();
         int deadline = r.i32(); // deadlineMs — a turn-timer HUD cue, unused by v1 routing
         int freeMove = r.i32(); // bonus-move budget (§3.a); appended field, see producer
-        // A TURN_START implies we are in combat — set the routing bool immediately so
-        // a mid-fight joiner/rebaseline that missed COMBAT_ENTER still gates input
-        // (§3.0). Whose turn it is (and the AP dots) is DEFERRED through the queue so
-        // it flips only when the animations reach this point (see PresEvent).
+        // TURN_START is a complete authoritative checkpoint, not a presentation cue.
+        // It must be sufficient to repair a missed/late COMBAT_ENTER and must never sit
+        // behind a stuck glide/replay: routing, turn ownership and AP are needed to send
+        // the very input that lets the server progress the turn.
+        bool wasInCombat = _inCombat;
         setInCombat(true);
         if (!clientViewerActive()) {
             // Headless routing: apply _myTurn inline, byte-identical to before.
             _myTurn = isPlayer != 0 && gDude != nullptr && netId == gDude->netId;
             return;
         }
-        PresEvent e;
-        e.kind = PresKind::kTurnStart;
-        e.tsNetId = netId;
-        e.tsIsPlayer = isPlayer;
-        e.tsAp = ap;
-        e.tsDeadline = deadline;
-        e.tsFreeMove = freeMove;
-        enqueue(e);
+        if (!wasInCombat) {
+            // A mid-fight join/recovery may have missed COMBAT_ENTER entirely. Clear
+            // free-roam motion before establishing combat chrome, exactly as enter does.
+            presStandDownAll();
+        }
+        applyTurnStart(netId, isPlayer, ap, deadline, freeMove);
     }
 
-    // Apply a queued TURN_START: flip _myTurn and paint the AP dots / lights. Run by
+    // Apply TURN_START: flip _myTurn and paint the AP dots / lights. Run by
     // presentationPump in lockstep with the animations, so "my turn" green appears
     // only after the previous actor's attacks have visibly played out.
     void applyTurnStart(int netId, int isPlayer, int ap, int deadline, int freeMove)
@@ -3065,6 +3112,10 @@ private:
             // preview reads the right move budget. Derived state only — the viewer
             // never advances combat, so this can only change under decode.
             _combat_free_move = freeMove;
+            // TURN_START's AP is the authority. OBJECT_DELTA normally converges the
+            // object first, but a lost/deferred delta must not leave the input checks or
+            // bar reading stale AP until the player spends one point and triggers redraw.
+            gDude->data.critter.combat.ap = ap;
             // A fresh turn resets the AP baseline; any half-ticked move deferral from
             // the previous turn is void (per-hex AP).
             _dudeApShown = ap;

@@ -1,0 +1,41 @@
+name: fallout2
+
+services:
+  fo2-dedicated-server:
+    image: fo2-dedicated-server:${F2_IMAGE_TAG:-latest}
+    build:
+      context: "${F2_SOURCE_PATH:-.}"
+      dockerfile: Dockerfile
+      target: fo2-dedicated-server
+    init: true
+    restart: unless-stopped
+    read_only: true
+    user: "${F2_UID:-1000}:${F2_GID:-1000}"
+    working_dir: /game
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Container ports stay fixed; the corresponding host ports are configurable below.
+      F2_SERVER_NET: "9200"
+      F2_SERVER_CMD: "9201"
+      F2_SERVER_KEEPALIVE: "1"
+      F2_SERVER_PACE_MS: "${F2_SERVER_PACE_MS:-100}"
+      F2_AUTOSAVE_SECS: "${F2_AUTOSAVE_SECS:-300}"
+      # 0=Easy/Wimpy, 1=Normal, 2=Hard/Rough. Dedicated Compose defaults hardest.
+      F2_GAME_DIFFICULTY: "${F2_GAME_DIFFICULTY:-2}"
+      F2_COMBAT_DIFFICULTY: "${F2_COMBAT_DIFFICULTY:-2}"
+    ports:
+      - "${F2_SERVER_NET_BIND:-0.0.0.0}:${F2_SERVER_NET_PORT:-9200}:9200/tcp"
+      # The admin channel is unrestricted, so expose it on localhost by default.
+      - "${F2_SERVER_CMD_BIND:-127.0.0.1}:${F2_SERVER_CMD_PORT:-9201}:9201/tcp"
+    volumes:
+      # The server reads the licensed assets and persists data/SAVEGAME + data/MAPS here.
+      - type: bind
+        source: "${F2_GAME_PATH:?Set F2_GAME_PATH to the absolute path of your Fallout 2 installation}"
+        target: /game
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s

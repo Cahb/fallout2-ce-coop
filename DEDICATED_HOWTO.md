@@ -154,6 +154,8 @@ enabled. `=0` disables. Any other value also enables, so `=1` is harmless and ex
 ### 2.5 Pacing, timing, persistence
 | var | default | meaning |
 |-----|---------|---------|
+| `F2_GAME_DIFFICULTY` | Compose: `2` | server-authoritative game difficulty: `0` Easy, `1` Normal, `2` Hard |
+| `F2_COMBAT_DIFFICULTY` | Compose: `2` | server-authoritative combat difficulty: `0` Wimpy, `1` Normal, `2` Rough |
 | `F2_SERVER_PACE_MS` | `0` (full speed) | ms wall-clock per beat; `100` ≈ real time. Use `100` for play, lower to fast-forward |
 | `F2_SERVER_TICKS` | `0` = **unlimited** | serve forever. A positive value is a safety cap for runs that must terminate |
 | `F2_SERVER_KEEPALIVE` | on if `CMD` set | persistent server: don't quit when the last player leaves; idle **frozen** and accept reconnects. `=0` restores exit-on-empty |
@@ -213,6 +215,7 @@ The client sends its OS in the handshake, so joins are announced as
 | key | effect |
 |-----|--------|
 | `Left Alt` | toggle the **highlight-lootables** overlay: ground items, corpses, containers (including scenery lockers/safes/desks), and exits — doors, stairs, ladders, elevators. Purely local, never saved |
+| `G` | pick up one loose ground item from your character's current tile; press repeatedly to clear a pile. The server chooses from its authoritative tile, so no pixel-perfect click is needed |
 | `B` | swap active weapon hand (costs no AP, plays the put-away/take-out animation) |
 | `1` | toggle **sneak** (per-player: your roll, your Silent Running / Silent Death — not the host's) |
 | `3` | **Steal** — the skilldex entry, on a living critter opens the server-owned steal session |

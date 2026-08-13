@@ -136,6 +136,12 @@ void _map_fix_critter_combat_data();
 void mapSetViewerLoad(bool viewerLoad);
 int _map_target_load_area();
 int mapSetTransition(MapTransition* transition);
+// Same transition latch with an explicit player initiator. Elevator requests are
+// drained after their ServerActorScope has ended, so they must carry the rider here.
+int mapSetTransitionForActor(MapTransition* transition, Object* actor);
+// Non-zero only while destination map-enter procs are executing for a co-op
+// transition. Bits are stable player slots and form the audience for story XP.
+unsigned int mapTransitionXpAudienceMask();
 void mapSetTransitionSuppressed(bool suppressed);
 bool mapTransitionPending();
 int mapHandleTransition();
