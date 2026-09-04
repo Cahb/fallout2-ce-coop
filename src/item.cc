@@ -1,5 +1,9 @@
 #include "item.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
+
 #include <assert.h>
 #include <string.h>
 
@@ -329,12 +333,26 @@ int itemAttemptAdd(Object* owner, Object* itemToAdd, int quantity)
 
 // item_add_force
 // 0x4772B8
+static const bool kWorldTrace = getenv("F2_TRACE_WORLD") != nullptr; // [world] diagnostics (doors, containers, map state)
+
+static void worldTraceContainer(Object* owner, const char* what, Object* item, int quantity)
+{
+    if (!kWorldTrace || owner == nullptr || PID_TYPE(owner->pid) != OBJ_TYPE_ITEM
+        || itemGetType(owner) != ITEM_TYPE_CONTAINER) {
+        return;
+    }
+    fprintf(stderr, "[world] container netId=%d tile=%d %s pid=0x%X x%d (had %d stacks)\n",
+        owner->netId, owner->tile, what, item != nullptr ? item->pid : 0, quantity,
+        owner->data.inventory.length);
+}
+
 int itemAdd(Object* owner, Object* itemToAdd, int quantity)
 {
     if (quantity < 1) {
         return -1;
     }
 
+    worldTraceContainer(owner, "ADD", itemToAdd, quantity);
     Inventory* inventory = &(owner->data.inventory);
 
     int index;
@@ -408,6 +426,7 @@ int itemAdd(Object* owner, Object* itemToAdd, int quantity)
 // 0x477490
 int itemRemove(Object* owner, Object* itemToRemove, int quantity)
 {
+    worldTraceContainer(owner, "REMOVE", itemToRemove, quantity);
     Inventory* inventory = &(owner->data.inventory);
     Object* item1 = critterGetItem1(owner);
     Object* item2 = critterGetItem2(owner);

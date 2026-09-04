@@ -240,6 +240,7 @@ enum EventType : unsigned char {
     EVENT_LOOT_GRANT = 59, // co-op: the server opened a container for THIS actor — show the screen
     EVENT_STATE_AUDIT = 60, // authoritative per-object state, for mirror divergence checking
     EVENT_UI_LOCK = 61, // scripted cutscene input lock (op_game_ui_disable/_enable), addressed
+    EVENT_WORLDMAP_AREAS = 62, // worldmap city table: known/visited/entrances for every area
 };
 
 // Event flag bits.
@@ -928,7 +929,7 @@ public:
     void dialogNode(Object* speaker, Object* driver, int reaction,
         const char* reply, const char* const* options, int optionCount,
         const char* audioFileName = nullptr, int headFid = -1,
-        const int* optionReactions = nullptr) override
+        const int* optionReactions = nullptr, bool speakerIsPartyMember = false) override
     {
         if (presenterEmissionsSuppressed()) return;
         if (eventTraceEnabled()) fprintf(stderr, "[dialog] SEND node speaker=%d driver=%d reaction=%d headFid=0x%X audio=%s opts=%d\n",
@@ -950,6 +951,11 @@ public:
             // of step, and so a truncated list truncates both halves together.
             putI32(optionReactions != nullptr ? optionReactions[i] : GAME_DIALOG_REACTION_NEUTRAL);
         }
+        // TRAILING: the viewer has no party list (that is full-save state), so it
+        // cannot tell a companion from an NPC and never built the party-member
+        // dialog window (the one with the Combat Control button). Older readers
+        // stop before this byte and are unaffected.
+        putU8(speakerIsPartyMember ? 1 : 0);
         endEvent();
         // Modal: the server tick is BLOCKED in the dialog barrier for the whole
         // conversation, so no beatEnd will flush this. Ship it now (mirrors
@@ -1177,6 +1183,21 @@ public:
         putI32((int)currentAreaEntranceMask);
         endEvent();
         flushFrame();
+    }
+
+    void worldmapAreas(const int* states, const int* visited, const unsigned int* entranceMasks, int count) override
+    {
+        if (presenterEmissionsSuppressed()) return;
+        if (count <= 0 || states == nullptr || visited == nullptr || entranceMasks == nullptr) return;
+        if (eventTraceEnabled()) fprintf(stderr, "[worldmap] SEND areas n=%d\n", count);
+        beginEvent(EVENT_WORLDMAP_AREAS, 0);
+        putU16((unsigned short)count);
+        for (int i = 0; i < count; i++) {
+            putU8((unsigned char)states[i]);
+            putU8((unsigned char)visited[i]);
+            putI32((int)entranceMasks[i]);
+        }
+        endEvent();
     }
 
     void worldmapSubtiles(const unsigned char* states, int count) override

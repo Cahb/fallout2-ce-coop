@@ -2657,7 +2657,10 @@ bool actionCheckPush(Object* a1, Object* a2)
     }
 
     // Can only push critters that have push handler.
-    if (!scriptHasProc(a2->sid, SCRIPT_PROC_PUSH)) {
+    // The wire viewer never loads script procedure tables (scripts are not
+    // executed there), so this test hid Push for every companion in co-op.
+    // The server re-runs this check with real scripts before it pushes.
+    if (!clientViewerActive() && !scriptHasProc(a2->sid, SCRIPT_PROC_PUSH)) {
         return false;
     }
 

@@ -2374,10 +2374,11 @@ static int _ai_move_steps_closer(Object* critter, Object* target, int actionPoin
     }
 
     if (distance == DISTANCE_STAY_CLOSE) {
-        if (target != gDude) {
-            int currentDistance = objectGetDistanceBetween(critter, gDude);
+        Object* leader = objectIsPartyMember(critter) ? partyMemberLeader(critter) : gDude;
+        if (target != leader) {
+            int currentDistance = objectGetDistanceBetween(critter, leader);
             if (currentDistance > 5
-                && objectGetDistanceBetween(target, gDude) > 5
+                && objectGetDistanceBetween(target, leader) > 5
                 && currentDistance + actionPoints > 5) {
                 return -1;
             }
@@ -3004,14 +3005,16 @@ int _cai_perform_distance_prefs(Object* a1, Object* a2)
     }
 
     switch (distance) {
-    case DISTANCE_STAY_CLOSE:
-        if (a1->data.critter.combat.whoHitMe != gDude) {
-            int distance = objectGetDistanceBetween(a1, gDude);
+    case DISTANCE_STAY_CLOSE: {
+        Object* leader = objectIsPartyMember(a1) ? partyMemberLeader(a1) : gDude;
+        if (a1->data.critter.combat.whoHitMe != leader) {
+            int distance = objectGetDistanceBetween(a1, leader);
             if (distance > 5) {
-                _ai_move_steps_closer(a1, gDude, distance - 5, false);
+                _ai_move_steps_closer(a1, leader, distance - 5, false);
             }
         }
         break;
+    }
     case DISTANCE_CHARGE:
         if (a2 != nullptr) {
             // NOTE: Uninline.
@@ -3166,7 +3169,7 @@ void _combat_ai(Object* a1, Object* a2)
     if (a1->data.critter.combat.team != 0) {
         nearestTeammate = _ai_find_nearest_team_in_combat(a1, a1, 1);
     } else {
-        nearestTeammate = gDude;
+        nearestTeammate = objectIsPartyMember(a1) ? partyMemberLeader(a1) : gDude;
         if (objectIsPartyMember(a1)) {
             // NOTE: Uninline
             int distance = aiGetDistance(a1);

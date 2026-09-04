@@ -536,7 +536,7 @@ public:
     virtual void dialogNode(Object* speaker, Object* driver, int reaction,
         const char* reply, const char* const* options, int optionCount,
         const char* audioFileName = nullptr, int headFid = -1,
-        const int* optionReactions = nullptr) {}
+        const int* optionReactions = nullptr, bool speakerIsPartyMember = false) {}
 
     // The conversation ended (every _gdProcess exit: normal end, ESC/dend, or a bail
     // on disconnect/combat/quit). Every viewer tears down its dialog window —
@@ -681,6 +681,9 @@ public:
     // only ~840 bytes for FO2's 20 tiles, so it ships whole rather than as
     // per-subtile deltas; the server suppresses it unless something changed.
     virtual void worldmapSubtiles(const unsigned char* states, int count) {}
+    // Whole city table: per area its map state (known/unknown), visited state and
+    // an entrance-state bitmask. Full-save state the viewer never receives.
+    virtual void worldmapAreas(const int* states, const int* visited, const unsigned int* entranceMasks, int count) {}
 
     // World view invalidation (legacy tileWindowRefresh / ...Rect).
     virtual void worldInvalidate() {}

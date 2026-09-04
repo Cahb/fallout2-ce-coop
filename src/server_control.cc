@@ -229,6 +229,11 @@ void serverControlEndDialogDrive()
     gPendingDialogRequesterSlot = -1;
 }
 
+bool serverControlDialogDriveActive()
+{
+    return gDialogDriverSlot >= 0;
+}
+
 bool serverControlDialogDriverPresent()
 {
     if (gDialogDriverSlot < 0) {
@@ -470,6 +475,12 @@ static void interactionFire(int verb, Object* actor, Object* target, int arg)
     int rc = 0;
     switch (verb) {
     case kInteractUse:
+        // Scenery with a use_p_proc that opens a conversation (the Gecko power
+        // plant terminals, consoles) never passes through the TALK request, so
+        // the drive stayed unowned (host-only) and every non-host dsay/dend was
+        // refused: the terminal printed its description and went dead. Attribute
+        // a conversation the script opens to this player, exactly as TALK does.
+        serverControlSetPendingDialogRequester(playerActorSlotOf(actor));
         rc = _action_use_an_object(actor, target); // scenery: routes doors/ladders/stairs
         fprintf(stderr, "f2_server: interact FIRE use netId=%d rc=%d actorTile=%d targetTile=%d\n",
             target->netId, rc, actor->tile, target->tile);
@@ -2189,7 +2200,8 @@ void serverControlLine(int sessionId, const char* line)
             || strcmp(verb, "invclose") == 0
             || strcmp(verb, "look") == 0
             || serverControlIsSheetVerb(verb) // sheet bookkeeping, no world footprint
-            || strcmp(verb, "cancel") == 0; // aborting your own pending walk is not an action
+            || strcmp(verb, "cancel") == 0 // aborting your own pending walk is not an action
+            || strcmp(verb, "selfrevive") == 0; // the one thing a dead player may do
         // (`claim` needs no entry — it is answered above, before an actor is resolved.)
         if (!readOnlyVerb) {
             fprintf(stderr, "f2_server: control %s dropped (actor is dead, session %d)\n",
@@ -2197,6 +2209,21 @@ void serverControlLine(int sessionId, const char* line)
             serverControlRefuse(sessionId, "You are dead.");
             return;
         }
+    }
+
+    if (strcmp(verb, "selfrevive") == 0) {
+        // Self-revive. Always the calling session's OWN actor, never a slot
+        // argument, so it cannot land on anyone else; same body as the
+        // operator's `revive` verb (server_admin.cc). Up at 1 HP where you fell.
+        if (!critterIsDead(actor)) {
+            serverControlRefuse(sessionId, "You are not dead.");
+            return;
+        }
+        critterRevive(actor);
+        char line[128];
+        snprintf(line, sizeof(line), "%s got back up.", critterGetName(actor));
+        presenter()->consoleMessageStyled(0, kMsgChannelSystem, line);
+        return;
     }
 
     // A BUSY player actor's next MUTATING verb is refused until its action animation
@@ -2341,7 +2368,8 @@ void serverControlLine(int sessionId, const char* line)
     //     never hardcode "viewer 0 drives"). A spectator's dsay must no-op.
     // Fully DORMANT today: no viewer sends these yet (TALK→LOOK until A3) and no
     // pump runs by default, so the gate short-circuits at _gdialogActive().
-    if (strcmp(verb, "dsay") == 0 || strcmp(verb, "dend") == 0 || strcmp(verb, "dbarter") == 0) {
+    if (strcmp(verb, "dsay") == 0 || strcmp(verb, "dend") == 0 || strcmp(verb, "dbarter") == 0
+        || strcmp(verb, "dparty") == 0) {
         // WHOEVER STARTED IT ANSWERS IT (owner ruling 2026-07-21). The stderr text
         // keeps the "host-only screen" wording it has always had — scripts grep it,
         // and it is still accurate for the NPC-initiated fallback.
@@ -2380,7 +2408,12 @@ void serverControlLine(int sessionId, const char* line)
             serverControlRefuse(sessionId, "That conversation is no longer open.");
             return;
         }
-        if (strcmp(verb, "dbarter") == 0) {
+        if (strcmp(verb, "dparty") == 0) {
+            // The on-screen Combat Control button on a party member, routed:
+            // the server serves the combat-orders node (serverDialogPartyOrders).
+            dialogIntentPush(DIALOG_INTENT_PARTY, 0);
+            fprintf(stderr, "f2_server: control dparty\n");
+        } else if (strcmp(verb, "dbarter") == 0) {
             // The on-screen Barter button, routed. Whether this speaker WILL
             // barter is the server's call (CRITTER_BARTER), made in the drain.
             dialogIntentPush(DIALOG_INTENT_BARTER, 0);
@@ -3429,8 +3462,25 @@ void serverControlLine(int sessionId, const char* line)
                 seconds = 180;
             }
             seconds -= seconds % 10;
-            _obj_arm_explosive(item, seconds);
-            fprintf(stderr, "f2_server: control useitem_armexplosive pid=%d seconds=%d\n", pid, seconds);
+            // Arm ONE unit, not the stack. A stack is a single object whose pid
+            // explosiveActivate() rewrites, so arming five plastic explosives
+            // armed all five and every drop peeled one unit off a live fuse.
+            // Split a single unit off first: a partial itemRemove leaves a
+            // fresh copy in the inventory holding the remainder and detaches
+            // THIS object as the removed unit, which is then armed and re-added
+            // as its own stack (the armed pid never merges with the unarmed one).
+            if (stackQty > 1) {
+                if (itemRemove(gDude, item, 1) != 0) {
+                    fprintf(stderr, "f2_server: control useitem_armexplosive pid=%d could not split the stack\n", pid);
+                    serverControlRefuse(sessionId, "Couldn't separate one from the stack.");
+                    return;
+                }
+                _obj_arm_explosive(item, seconds);
+                itemAdd(gDude, item, 1);
+            } else {
+                _obj_arm_explosive(item, seconds);
+            }
+            fprintf(stderr, "f2_server: control useitem_armexplosive pid=%d seconds=%d (one unit of %d)\n", pid, seconds, stackQty);
             return;
         }
 
@@ -3510,11 +3560,12 @@ void serverControlLine(int sessionId, const char* line)
             // _adjust_ac(critter, oldArmor, newArmor). Harmless for non-armor (guarded).
             Object* oldArmor = critterGetArmor(gDude);
             _inven_wield(gDude, item, hand);
-            // A genuine two-handed weapon occupies BOTH hand slots (the UI represents that
-            // as leftHand==rightHand); _inven_wield only sets one flag, so pair them here.
-            if (itemGetType(item) == ITEM_TYPE_WEAPON && weaponIsTwoHanded(item)) {
-                item->flags |= (OBJECT_IN_LEFT_HAND | OBJECT_IN_RIGHT_HAND);
-            }
+            // NOTE: a two-handed weapon does NOT occupy both hand slots. Vanilla keeps
+            // the two slots independent (a rifle in one hand and a pistol in the
+            // other is normal play); "two-handed" is only a to-hit modifier. An
+            // earlier version set both hand flags here, which made rifles and
+            // shotguns show up in both inventory slots and confused every later
+            // wield/unwield of the other hand.
             if (itemGetType(item) == ITEM_TYPE_ARMOR) {
                 _adjust_ac(gDude, oldArmor, item);
                 // Server-authoritative APPEARANCE, the armor twin of the weapon block

@@ -31,6 +31,8 @@
 #include "scripts.h"
 #include "server_players.h"
 #include "sim_clock.h"
+#include "game_dialog.h"
+#include "script_request_handler.h"
 #include "worldmap.h" // wmMapMusicStart — baseline music re-announce
 #include "object.h"
 #include "party_member.h" // objectIsPartyMember — companions ride the baseline (§C domain)
@@ -325,6 +327,22 @@ void serverSetHolodiskAnnouncer(std::function<void()> announcer)
     gHolodiskAnnouncer = std::move(announcer);
 }
 
+// Worldmap-knowledge baseline emitter, installed by f2_server (server_worldmap.cc
+// is server-only; this file also builds into the client's headless server loop).
+static std::function<void()> gWorldmapBaseline;
+
+void serverSetWorldmapBaseline(std::function<void()> emitter)
+{
+    gWorldmapBaseline = std::move(emitter);
+}
+
+static std::function<void()> gWorldmapBeat;
+
+void serverSetWorldmapBeat(std::function<void()> emitter)
+{
+    gWorldmapBeat = std::move(emitter);
+}
+
 static void serverEmitBaseline()
 {
     gBaselineGeneration = mapGetLoadGeneration();
@@ -398,6 +416,10 @@ static void serverEmitBaseline()
     // its OWN screen (while others saw it correctly off the wire). No-op under the
     // null/file presenter, so goldens are unaffected. [[vault-suit-appearance-gap]]
     presenter()->movieSeenState(gameMoviesSeenData(), MOVIE_COUNT);
+    if (gWorldmapBaseline) {
+        gWorldmapBaseline();
+    }
+    gvarDeltaEmitAll(); // quest/karma variables for the joiner (deltas alone never catch it up)
 
     // Server-authored holodisks (SERVER INFORMATION). Re-announced with every baseline,
     // which is why they need no persistence — see server_control.cc serverEmitHolodisks.
@@ -450,6 +472,24 @@ void serverTick(int tick, const std::function<void(int)>& intentsDrain, bool adv
     simClockAdvance(kServerTickDelta);
     _process_bk();
     scriptsHandleRequests();
+    // dialogue_system_enter (how scenery that talks starts its conversation:
+    // the Gecko robot terminal, consoles, computers) parks a pending-dialog
+    // game state plus gGameDialogSpeaker for the vanilla UI loop to pick up
+    // (_gdialogSystemEnter, game_ui.cc). The dedicated server has no UI loop,
+    // so the request sat there forever and the player only saw _obj_use's
+    // "You see: Computer". Service it here through the same handler the TALK
+    // request uses, so the drive is attributed to the clicking player and the
+    // nodes are streamed; mirror _gdialogSystemEnter's state bookkeeping.
+    if (gameGetState() == GAME_STATE_5 && gGameDialogSpeaker != nullptr) {
+        Object* speaker = gGameDialogSpeaker;
+        gameUpdateState(); // 5 -> 4
+        scriptRequestHandler()->dialogEnter(speaker);
+        gameRequestState(GAME_STATE_2);
+        gameUpdateState(); // 3 -> 2
+    }
+    if (gWorldmapBeat) {
+        gWorldmapBeat(); // city table to viewers when a script marked a town known
+    }
 
     // Player-initiated combat start (cstart verb): honor the claimant's intent to
     // enter combat on the idle tick — the wire equivalent of vanilla's 'A' toggle

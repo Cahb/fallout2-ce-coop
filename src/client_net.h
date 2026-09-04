@@ -250,6 +250,7 @@ bool clientViewerConsumeLootTargetInvDirty();
 // (gDude->netId == driverNetId); false to bypass (ESC/dend always allowed).
 void clientViewerDialogSay(int index);
 void clientViewerDialogEnd();
+void clientViewerDialogParty(); // Combat Control button -> server-side combat-orders node
 
 // Worldmap viewer verbs: send the travel-direction intent upstream. The server
 // routes these through serverControlLine into the worldmap intent queue, which the

@@ -340,6 +340,34 @@ void gvarDeltaReset()
             ? gGameGlobalVars + gGameGlobalVarsLength : nullptr);
 }
 
+// Baseline companion to gvarDeltaScan: ship the WHOLE table. The join blob is a
+// map save and carries no global variables, and only deltas were ever streamed,
+// so a client that joined after quest progress kept stale values for good (the
+// pipboy showed a finished quest as open). Chunked so no single event is huge.
+void gvarDeltaEmitAll()
+{
+    if (gGameGlobalVars == nullptr || gGameGlobalVarsLength <= 0) {
+        return;
+    }
+    const int kChunk = 64;
+    int indices[kChunk];
+    int values[kChunk];
+    int count = 0;
+    for (int index = 0; index < gGameGlobalVarsLength; index++) {
+        indices[count] = index;
+        values[count] = gGameGlobalVars[index];
+        count++;
+        if (count == kChunk) {
+            presenter()->gvarDelta(indices, values, count);
+            count = 0;
+        }
+    }
+    if (count != 0) {
+        presenter()->gvarDelta(indices, values, count);
+    }
+    gvarDeltaReset(); // the shadow now matches what every viewer holds
+}
+
 void gvarDeltaScan()
 {
     if (gGameGlobalVars == nullptr || gGameGlobalVarsLength <= 0) {

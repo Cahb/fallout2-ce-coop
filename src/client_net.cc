@@ -30,6 +30,7 @@
 #include "game.h" // GameMode — modal-screen detection for the viewer service ticker
 #include "game_mouse.h" // wait-watch cursor over combat transitions (§3.a)
 #include "game_sound.h" // sfx (§3.e S2)
+#include "audio_engine.h"
 #include "input.h" // enqueueInputEvent / tickersAdd — viewer modal service ticker
 #include "interface.h" // combat HUD bar hooks (§3.a)
 #include "inventory.h" // _inven_reset_dude — re-anchor the inventory on a local-actor rebind
@@ -212,6 +213,7 @@ enum : unsigned char {
     EVENT_LOOT_GRANT = 59, // the server opened a container FOR US — open the loot screen
     EVENT_STATE_AUDIT = 60, // authoritative object state — diff it against our mirror
     EVENT_UI_LOCK = 61, // scripted cutscene input lock, addressed (0 = everyone)
+    EVENT_WORLDMAP_AREAS = 62, // worldmap city table: known/visited/entrances for every area
 };
 
 // crc32 (IEEE, reflected) — MUST match server_loop.cc's joinBlobCrc32.
@@ -234,7 +236,7 @@ unsigned int crc32Of(const unsigned char* data, int length)
 static const int kViewerModalMask = GameMode::kInventory | GameMode::kSkilldex
     | GameMode::kEditor | GameMode::kPipboy | GameMode::kLoot | GameMode::kUseOn
     | GameMode::kDialog | GameMode::kWorldmap | GameMode::kBarter
-    | GameMode::kPreferences;
+    | GameMode::kPreferences | GameMode::kAutomap;
 
 // ─── Combat outlines on the wire viewer (COMBAT_CLIENT_DESIGN #8) ────────────
 // Vanilla draws colored critter outlines in combat (red=hostile / green=friendly by
@@ -1027,6 +1029,7 @@ public:
         case EVENT_WORLDMAP_END: onWorldmapEnd(r); break;
         case EVENT_WORLDMAP_STATE: onWorldmapState(r); break;
         case EVENT_WORLDMAP_SUBTILES: onWorldmapSubtiles(r); break;
+        case EVENT_WORLDMAP_AREAS: onWorldmapAreas(r); break;
         case EVENT_PLAYER_ROSTER: onPlayerRoster(r); break;
         case EVENT_INVENTORY_GRANT: onInventoryGrant(r); break;
         case EVENT_INVENTORY_REVOKE: onInventoryRevoke(r); break;
@@ -2858,6 +2861,7 @@ private:
 
     void onSnapshotEnd(Reader&)
     {
+        audioNotice();
         // The baseline walk just finished scoring against the blob-loaded world
         // (§D tripwire). ok>0 && bad==0 is the mid-join gate's oracle line.
         debugPrint("client_net: baseline tripwire ok=%d bad=%d (load #%d)\n",
@@ -4194,8 +4198,11 @@ private:
         // this" check — it deletes and reloads unconditionally, so without this a
         // rebaseline would restart the track from the top under everyone already
         // listening. Cleared by STOP so a retune to the same name still replays.
-        if (name == _musicTrack) return;
+        // ...but only while that track is actually still playing. If it died
+        // (see musicWatchdog) the re-announce is exactly what brings it back.
+        if (name == _musicTrack && backgroundSoundIsPlaying()) return;
         _musicTrack = name;
+        _musicRetryAtMs = 0;
 
         _gsound_background_play_level_music(name.c_str(), fadeIn);
     }
@@ -4391,10 +4398,11 @@ private:
             optionPtrs[i] = optionStorage[i].c_str();
             optionReactions[i] = r.i32(); // per-option reaction — the Empathy colours
         }
+        bool speakerIsPartyMember = r.remaining() >= 1 ? r.u8() != 0 : false; // trailing, optional
         if (!clientViewerActive() || r.overflow()) return;
         clientDialogOnNode(speakerNetId, driverNetId, reaction,
             reply.c_str(), optionPtrs, optionCount, audioFileName.c_str(), headFid,
-            optionReactions);
+            optionReactions, speakerIsPartyMember);
     }
 
     void onDialogEnd(Reader& r)
@@ -4481,6 +4489,32 @@ private:
     // session left behind. Scatter the flattened grid back into wmTileInfoList
     // (same tile-major/row/column order the server flattened it in) and mark the
     // worldmap dirty so the modal repaints with the new fog.
+    void onWorldmapAreas(Reader& r)
+    {
+        if (!clientViewerActive() || r.overflow()) return;
+        int count = r.u16();
+        if (count != wmMaxAreaNum || wmAreaInfoList == nullptr) {
+            debugPrint("client_net: worldmap areas size mismatch got=%d want=%d\n", count, wmMaxAreaNum);
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            int state = r.u8();
+            int visited = r.u8();
+            unsigned int mask = (unsigned int)r.i32();
+            if (r.overflow()) return;
+            CityInfo* city = &(wmAreaInfoList[i]);
+            city->state = state;
+            city->visitedState = visited;
+            int entrances = city->entrancesLength;
+            if (entrances > 32) entrances = 32;
+            for (int e = 0; e < entrances; e++) {
+                city->entrances[e].state = (mask >> e) & 1u;
+            }
+        }
+        debugPrint("client_net: onWorldmapAreas applied n=%d\n", count);
+        gWorldmapStateDirty = true;
+    }
+
     void onWorldmapSubtiles(Reader& r)
     {
         if (!clientViewerActive() || r.overflow()) return;
@@ -4517,6 +4551,46 @@ private:
     int _loadCount = 0;
     bool _inCombat = false; // P3 combat framing (presentation-only)
     std::string _musicTrack; // currently-playing background track, for MUSIC_PLAY dedupe
+    unsigned int _musicRetryAtMs = 0; // musicWatchdog backoff deadline (getTicks)
+    bool _audioNoticeShown = false; // one-time why-is-there-no-sound line on the HUD
+
+public:
+    // Background music watchdog, run once per pump. The track is a streamed,
+    // looping Sound; a long stall on this thread (a rebaseline blob, a modal,
+    // a map change) starves the mixer and the sound library retires the track
+    // as finished. Nothing restarted it: the server only re-announces music on
+    // baselines and onMusicPlay used to drop that by name. Vanilla music never
+    // stops, so re-arm the expected track whenever it is not playing, with a
+    // backoff so a missing music file cannot spin the load.
+    void musicWatchdog()
+    {
+        if (_musicTrack.empty() || backgroundSoundIsPlaying()) return;
+        unsigned int now = getTicks();
+        if (_musicRetryAtMs != 0 && now < _musicRetryAtMs) return;
+        _musicRetryAtMs = now + 10000;
+        _gsound_background_play_level_music(_musicTrack.c_str(), 12);
+    }
+
+    // One-time HUD line explaining silence. Shown after the first snapshot so
+    // the display monitor exists; a player with no sound otherwise has no clue.
+    void audioNotice()
+    {
+        if (_audioNoticeShown) return;
+        _audioNoticeShown = true;
+        static char line[320];
+        if (!settings.sound.initialize) {
+            snprintf(line, sizeof(line), "Sound is OFF in fallout2.cfg ([sound] initialize=0)");
+        } else if (audioEngineInitError() != nullptr) {
+            snprintf(line, sizeof(line), "Audio failed to start (%s): no sound this session", audioEngineInitError());
+        } else if (!gameSoundIsInitialized()) {
+            snprintf(line, sizeof(line), "Sound engine failed to initialize: no sound this session");
+        } else {
+            return;
+        }
+        displayMonitorAddMessage(line);
+    }
+
+private:
     bool _myTurn = false;
     bool _invGrantPending = false; // server granted an in-combat inventory; main loop opens it
     bool _encPromptPending = false; // encounter prompt latched out of the decoder
@@ -4588,6 +4662,8 @@ public:
         : _decoder()
     {
     }
+
+    void musicWatchdog() { _decoder.musicWatchdog(); }
 
     void feed(const unsigned char* data, size_t n)
     {
@@ -4867,6 +4943,7 @@ bool ClientConnection::pump()
     if (!netSocketValid(_impl->fd) || _impl->stream == nullptr) {
         return false;
     }
+    _impl->stream->musicWatchdog();
     unsigned char buf[8192];
     // Bound the bytes ingested per pump so a peer that streams as fast as the socket
     // delivers cannot spin this loop indefinitely, starving render/ESC and letting
@@ -5654,6 +5731,14 @@ void clientViewerDialogEnd()
         return;
     }
     gViewerConn->sendLine("dend");
+}
+
+void clientViewerDialogParty()
+{
+    if (gViewerConn == nullptr) {
+        return;
+    }
+    gViewerConn->sendLine("dparty");
 }
 
 void clientViewerWmMove(int x, int y)

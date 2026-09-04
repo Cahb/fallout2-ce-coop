@@ -72,6 +72,10 @@ typedef struct PartyMemberListItem {
     Script* script;
     int* vars;
     struct PartyMemberListItem* next;
+    // Co-op: player slot that recruited this member (-1 = unknown, e.g. after a
+    // load). partyMemberLeader() prefers this player over "the host" / "whoever
+    // is nearest", so a companion stops flip-flopping between two players.
+    int ownerSlot;
 } PartyMemberListItem;
 
 static int partyMemberGetDescription(Object* object, PartyMemberDescription** partyMemberDescriptionPtr);
@@ -399,6 +403,9 @@ int partyMemberAdd(Object* object)
     partyMember->object = object;
     partyMember->script = nullptr;
     partyMember->vars = nullptr;
+    // Under the co-op server the recruiting dialog runs with gDude bound to the
+    // recruiting player (ServerActorScope); single-player resolves to slot 0.
+    partyMember->ownerSlot = playerActorSlotOf(gDude);
 
     object->id = (object->pid & 0xFFFFFF) + 18000;
     object->flags |= (OBJECT_NO_REMOVE | OBJECT_NO_SAVE);
@@ -462,6 +469,7 @@ int partyMemberRemove(Object* object)
 
     if (index < gPartyMembersLength - 1) {
         gPartyMembers[index].object = gPartyMembers[gPartyMembersLength - 1].object;
+        gPartyMembers[index].ownerSlot = gPartyMembers[gPartyMembersLength - 1].ownerSlot;
     }
 
     object->flags &= ~(OBJECT_NO_REMOVE | OBJECT_NO_SAVE);
@@ -769,6 +777,7 @@ int partyMembersLoad(File* stream)
 
             if (object != nullptr) {
                 gPartyMembers[index].object = object;
+                gPartyMembers[index].ownerSlot = -1; // not persisted; nearest player until re-recruited
             } else {
                 debugPrint("Couldn't find party member on map...trying to load anyway.\n");
                 // ►► THIS IS SILENT DATA LOSS, AND IT MUST NOT BE. The id resolved
@@ -837,6 +846,52 @@ void _partyMemberClear()
 }
 
 // 0x494DD0
+// Which player a party member follows / keeps close to in co-op. Vanilla reads
+// the bare gDude, which under the dedicated server is whatever the last actor
+// scope left behind: the host, more often than not. So every companion tried
+// to stay near the HOST even when recruited by (and walking with) the other
+// player, and stalled when the host was on another elevation. Prefer the
+// recruiting player when they are online, alive and on this elevation; else
+// the nearest such player; else gDude. Single-player and the goldens
+// (playerActorCount() < 2) collapse to gDude exactly as before.
+Object* partyMemberLeader(Object* member)
+{
+    if (member == nullptr || !serverDedicatedActive() || playerActorCount() < 2) {
+        return gDude;
+    }
+    int ownerSlot = -1;
+    for (int index = 1; index < gPartyMembersLength; index++) {
+        if (gPartyMembers[index].object == member) {
+            ownerSlot = gPartyMembers[index].ownerSlot;
+            break;
+        }
+    }
+    if (ownerSlot >= 0 && ownerSlot < playerActorCount()) {
+        Object* owner = playerActorAt(ownerSlot);
+        if (owner != nullptr && playerActorOnline(ownerSlot) && !critterIsDead(owner)
+            && owner->elevation == member->elevation) {
+            return owner;
+        }
+    }
+    Object* nearest = nullptr;
+    int nearestDistance = 0;
+    for (int slot = 0; slot < playerActorCount(); slot++) {
+        Object* actor = playerActorAt(slot);
+        if (actor == nullptr || critterIsDead(actor) || !playerActorOnline(slot)) {
+            continue;
+        }
+        if (actor->elevation != member->elevation) {
+            continue;
+        }
+        int distance = tileDistanceBetween(actor->tile, member->tile);
+        if (nearest == nullptr || distance < nearestDistance) {
+            nearest = actor;
+            nearestDistance = distance;
+        }
+    }
+    return nearest != nullptr ? nearest : gDude;
+}
+
 int _partyMemberSyncPosition()
 {
     int clockwiseRotation = (gDude->rotation + 2) % ROTATION_COUNT;
@@ -848,15 +903,16 @@ int _partyMemberSyncPosition()
         PartyMemberListItem* partyMember = &(gPartyMembers[index]);
         Object* partyMemberObj = partyMember->object;
         if ((partyMemberObj->flags & OBJECT_HIDDEN) == 0 && PID_TYPE(partyMemberObj->pid) == OBJ_TYPE_CRITTER) {
+            // Co-op: gather around the member's own leader (== gDude when single).
+            Object* leader = partyMemberLeader(partyMemberObj);
             int rotation;
             if ((n % 2) != 0) {
-                rotation = clockwiseRotation;
+                rotation = (leader->rotation + 2) % ROTATION_COUNT;
             } else {
-                rotation = counterClockwiseRotation;
+                rotation = (leader->rotation + 4) % ROTATION_COUNT;
             }
-
-            int tile = tileGetTileInDirection(gDude->tile, rotation, distance / 2);
-            _objPMAttemptPlacement(partyMemberObj, tile, gDude->elevation);
+            int tile = tileGetTileInDirection(leader->tile, rotation, distance / 2);
+            _objPMAttemptPlacement(partyMemberObj, tile, leader->elevation);
 
             distance++;
             n++;

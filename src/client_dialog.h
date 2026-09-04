@@ -13,7 +13,9 @@ namespace fallout {
 void clientDialogOnNode(int speakerNetId, int driverNetId, int reaction,
     const char* reply, const char* const* options, int optionCount,
     const char* audioFileName = nullptr, int headFid = -1,
-    const int* optionReactions = nullptr);
+    const int* optionReactions = nullptr, bool speakerIsPartyMember = false);
+// True while the streamed conversation's speaker is a party member (from the node).
+bool clientDialogSpeakerIsPartyMember();
 
 // Called from the EVENT_DIALOG_END handler (and the local ESC bail). LATCHES the
 // conversation as over — clientModalWindowsSync() tears the windows down.

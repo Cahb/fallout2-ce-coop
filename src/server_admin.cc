@@ -1068,6 +1068,30 @@ bool serverAdminLine(const char* line,
         return true;
     }
 
+    if (strcmp(verb, "gvar") == 0) {
+        // `gvar <index> [value]` — read or set one global script variable. The
+        // repair tool for a world whose quest flags went wrong (indices are the
+        // GVAR_* numbers in data/vault13.gam; quests.txt maps quests to them).
+        if (!worldLoaded) {
+            reply("gvar: no world loaded");
+            return true;
+        }
+        int index = -1;
+        int value = 0;
+        int n = rest != nullptr ? sscanf(rest, "%d %d", &index, &value) : 0;
+        if (n < 1 || index < 0 || index >= gGameGlobalVarsLength) {
+            snprintf(msg, sizeof(msg), "usage: gvar <index 0-%d> [value]", gGameGlobalVarsLength - 1);
+            reply(msg);
+            return true;
+        }
+        if (n >= 2) {
+            gameSetGlobalVar(index, value);
+            fprintf(stderr, "f2_server: admin gvar %d set to %d\n", index, value);
+        }
+        snprintf(msg, sizeof(msg), "gvar %d = %d", index, gameGetGlobalVar(index));
+        reply(msg);
+        return true;
+    }
     if (strcmp(verb, "xp") == 0) {
         // `xp <slot> <amount>` — award experience to ONE seat. Slot-addressed for the same
         // reason revive is: the arg is a registry slot, so this can never land on a random
@@ -1660,8 +1684,18 @@ bool serverAdminLine(const char* line,
             return true;
         }
 
+        // Same refusal window as the autosave: the save routine fails part-way
+        // (and reports "error 0": none of its exits set an error code) when a
+        // fight, a streamed dialog node, worldmap travel, a map change or a
+        // movie is in flight. Say so instead of failing.
+        if (isInCombat() || mapTransitionPending()
+            || GameMode::isInGameMode(GameMode::kDialog | GameMode::kBarter | GameMode::kWorldmap)
+            || gameDialogServerNodeActive() || gameMovieIsPlaying()) {
+            reply("save: not now (combat, dialogue, worldmap travel or a map change is in progress) - try again in a moment");
+            return true;
+        }
         if (!adminWriteSave(slot, label)) {
-            snprintf(msg, sizeof(msg), "save: FAILED writing slot %d (error %d)",
+            snprintf(msg, sizeof(msg), "save: FAILED writing slot %d (error %d) - see the LOADSAVE line above for the step that failed",
                 slot + 1, savegameGetErrorCode());
             reply(msg);
             fprintf(stderr, "f2_server: admin save slot %d FAILED (error %d)\n",

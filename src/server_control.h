@@ -204,6 +204,7 @@ void serverControlEndDialogDrive();
 // Answers TRUE when no conversation is live, so the caller's other conditions
 // decide — this narrows the bail, it does not widen it.
 bool serverControlDialogDriverPresent();
+bool serverControlDialogDriveActive(); // a driven conversation is open
 
 // -- In-combat interaction (Stage 4) ------------------------------------------
 // Execute one dequeued COMBAT_INTENT_INTERACT for `actor`, on `actor`'s own turn.

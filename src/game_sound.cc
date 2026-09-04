@@ -1,5 +1,7 @@
 #include "game_sound.h"
 
+#include "game_movie.h" // gameMovieIsPlaying: paused music is only legitimate during a movie
+
 #include <stdio.h>
 #include <stdlib.h> // getenv — F2_NO_MUSIC
 #include <string.h>
@@ -762,6 +764,25 @@ void backgroundSoundDelete()
         soundDelete(gBackgroundSound);
         gBackgroundSound = nullptr;
     }
+}
+
+bool backgroundSoundIsPlaying()
+{
+    // Paused counts as playing only while a movie is actually running (it parks
+    // the track and resumes it itself). A track left paused after that is dead
+    // air the music watchdog must be allowed to restart.
+    if (gBackgroundSound == nullptr) {
+        return false;
+    }
+    if (soundIsPlaying(gBackgroundSound)) {
+        return true;
+    }
+    return soundIsPaused(gBackgroundSound) && gameMovieIsPlaying();
+}
+
+bool gameSoundIsInitialized()
+{
+    return gGameSoundInitialized;
 }
 
 // 0x450B0C

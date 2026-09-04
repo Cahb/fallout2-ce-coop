@@ -51,6 +51,12 @@ public:
 
     // SCRIPT_REQUEST_DIALOG: open the modal conversation with `speaker`.
     virtual void dialogEnter(Object* speaker) {}
+    // A script opened a conversation on its own (start_gdialog/gsay_start from
+    // use_p_proc: terminals, consoles, some scenery) without going through the
+    // TALK request above. The server attributes the drive to the player whose
+    // interaction fired the script, so their dsay/dend are accepted.
+    virtual void dialogDriveBegin() {}
+    virtual void dialogDriveEnd() {}
 
     // SCRIPT_REQUEST_ENDGAME: play the ending slideshow then movie.
     virtual void endgame() {}

@@ -23,7 +23,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GAME_DIR="${F2_GAME_DIR:-$ROOT/FO2}"
 BIN="${F2_BIN:-$ROOT/build/fallout2-ce}"
-GOLDEN_DIR="$ROOT/tests/golden/server"
+# F2_GOLDEN_DIR: alternate golden set (e.g. Windows-blessed goldens; the
+# checked-in set is Linux-blessed and diverges on Windows in RNG/timing fields).
+GOLDEN_DIR="${F2_GOLDEN_DIR:-$ROOT/tests/golden/server}"
 BLESS="${BLESS:-0}"
 RESULTS="$(mktemp -d)"
 trap 'rm -rf "$RESULTS"; pkill -9 -x fallout2-ce 2>/dev/null || true' EXIT

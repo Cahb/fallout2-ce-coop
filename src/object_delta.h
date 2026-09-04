@@ -82,6 +82,7 @@ void gvarDeltaReset();
 // Diff every gvar against the shadow and emit the changed indices. Called once per
 // resolved beat, beside objectDeltaScan.
 void gvarDeltaScan();
+void gvarDeltaEmitAll(); // every baseline: the whole table (see object_delta.cc)
 
 } // namespace fallout
 

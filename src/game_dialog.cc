@@ -1,6 +1,9 @@
+#include "client_dialog.h"
 #include "client_net.h"
 #include "msg_channel.h"
 #include "game_dialog.h"
+
+#include "script_request_handler.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -584,6 +587,7 @@ static void gameDialogReviewWindowUpdate(int win, int origin);
 static void dialogReviewEntriesClear();
 static int gameDialogAddReviewMessage(int messageListId, int messageId);
 static int gameDialogAddReviewText(const char* text);
+static void gameDialogReplyPagesReset();
 static int gameDialogSetReviewOptionMessage(int messageListId, int messageId);
 static int gameDialogSetReviewOptionText(const char* text);
 static int _gdProcessInit();
@@ -935,13 +939,15 @@ int _gdialogInitFromScript(int headFid, int reaction)
     if (serverLoopActive()) {
         _gdialog_state = 1;
         _gdDialogWentOff = true;
+        scriptRequestHandler()->dialogDriveBegin();
         return 0;
     }
 
     animationStop();
 
     _boxesWereDisabled = indicatorBarHide();
-    gGameDialogSpeakerIsPartyMember = objectIsPartyMember(gGameDialogSpeaker);
+    // The viewer has no party list; the flag came with the node (client_dialog).
+    gGameDialogSpeakerIsPartyMember = clientViewerActive() ? clientDialogSpeakerIsPartyMember() : objectIsPartyMember(gGameDialogSpeaker);
     _oldFont = fontGetCurrent();
     fontSetCurrent(101);
     dialogSetReplyWindow(135, 225, 379, 58, nullptr);
@@ -1004,6 +1010,7 @@ int _gdialogExitFromScript()
     // head, tickers or lips were ever created, so tear down only the state latch.
     if (serverLoopActive()) {
         _gdialog_state = 0;
+        scriptRequestHandler()->dialogDriveEnd();
         return 0;
     }
 
@@ -1206,6 +1213,7 @@ int gameDialogSetMessageReply(Program* program, int messageListId, int messageId
     gDialogReplyMessageListId = messageListId;
     gDialogReplyMessageId = messageId;
     dword_58F4E0 = 0;
+    gameDialogReplyPagesReset();
     gDialogReplyText[0] = '\0';
     gGameDialogOptionEntriesLength = 0;
 
@@ -1219,6 +1227,7 @@ int gameDialogSetTextReply(Program* program, int messageListId, const char* text
 
     gDialogReplyProgram = program;
     dword_58F4E0 = 0;
+    gameDialogReplyPagesReset();
     gDialogReplyMessageListId = -4;
     gDialogReplyMessageId = -4;
 
@@ -1263,7 +1272,7 @@ void _gdialogUpdatePartyStatus()
         return;
     }
 
-    bool isPartyMember = objectIsPartyMember(gGameDialogSpeaker);
+    bool isPartyMember = clientViewerActive() ? clientDialogSpeakerIsPartyMember() : objectIsPartyMember(gGameDialogSpeaker);
     if (isPartyMember == gGameDialogSpeakerIsPartyMember) {
         return;
     }
@@ -1996,10 +2005,151 @@ static void dialogEmitNode()
     presenter()->dialogNode(gGameDialogSpeaker, gDude, gGameDialogFidget,
         gDialogReplyText, optionPtrs, count,
         gDialogPendingAudio[0] != '\0' ? gDialogPendingAudio : nullptr,
-        gGameDialogHeadFid, optionReactions);
+        gGameDialogHeadFid, optionReactions, gGameDialogSpeakerIsPartyMember);
 }
 
 // 0x4465C0
+// ---------------------------------------------------------------------------
+// Party-member COMBAT ORDERS as a streamed dialog node (co-op server).
+//
+// Vanilla edits a party member's AI packet through the Combat Control /
+// Customize windows: SDL windows with their own blocking loops that the
+// headless server cannot run and the wire viewer must not run (it would edit
+// a local copy the server never sees). So the server aborted that branch and
+// the feature was simply missing in co-op.
+//
+// Here the six customizable orders are served as an ordinary dialog node: one
+// line per order showing its current value, picking a line cycles it to the
+// next value (same tables and message file as the Customize window), "Done"
+// returns to the conversation node that was showing. State lives on the
+// server, in the same AI packet fields vanilla writes, so it saves as before.
+// ---------------------------------------------------------------------------
+static bool gCustomMessageListLoaded = false;
+
+static const char* partyOrdersMessage(int num)
+{
+    if (!gCustomMessageListLoaded) {
+        if (messageListInit(&gCustomMessageList) && messageListLoad(&gCustomMessageList, "game\\custom.msg")) {
+            gCustomMessageListLoaded = true;
+        }
+    }
+    MessageListItem item;
+    item.num = num;
+    if (gCustomMessageListLoaded && messageListGetItem(&gCustomMessageList, &item)) {
+        return item.text;
+    }
+    return "?";
+}
+
+static int partyOrdersCount(int type)
+{
+    int count = 0;
+    while (count < 6 && _custom_settings[type][count].messageId != -1) {
+        count++;
+    }
+    return count;
+}
+
+static int partyOrdersCurrentIndex(Object* member, int type)
+{
+    int value = 0;
+    switch (type) {
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_AREA_ATTACK_MODE: value = aiGetAreaAttackMode(member); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_RUN_AWAY_MODE: value = aiGetRunAwayMode(member); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_BEST_WEAPON: value = aiGetBestWeapon(member); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_DISTANCE: value = aiGetDistance(member); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_ATTACK_WHO: value = aiGetAttackWho(member); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_CHEM_USE: value = aiGetChemUse(member); break;
+    }
+    // The Customize window uses the getter's value directly as the table index
+    // (partyMemberCustomizationWindowInit), so do the same, clamped.
+    int count = partyOrdersCount(type);
+    if (value < 0) value = 0;
+    if (value >= count) value = count - 1;
+    return value;
+}
+
+static void partyOrdersApply(Object* member, int type, int index)
+{
+    int value = _custom_settings[type][index].value;
+    switch (type) {
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_AREA_ATTACK_MODE: aiSetAreaAttackMode(member, value); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_RUN_AWAY_MODE: aiSetRunAwayMode(member, value); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_BEST_WEAPON: aiSetBestWeapon(member, value); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_DISTANCE: aiSetDistance(member, value); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_ATTACK_WHO: aiSetAttackWho(member, value); break;
+    case PARTY_MEMBER_CUSTOMIZATION_OPTION_CHEM_USE: aiSetChemUse(member, value); break;
+    }
+}
+
+static void serverDialogPartyOrders()
+{
+    Object* member = gGameDialogSpeaker;
+    if (member == nullptr || !objectIsPartyMember(member)) {
+        return;
+    }
+
+    // Park the real node so "Done" can put it back exactly.
+    static GameDialogOptionEntry savedOptions[DIALOG_OPTION_ENTRIES_CAPACITY];
+    static char savedReply[sizeof(gDialogReplyText)];
+    int savedLength = gGameDialogOptionEntriesLength;
+    if (savedLength > DIALOG_OPTION_ENTRIES_CAPACITY) savedLength = DIALOG_OPTION_ENTRIES_CAPACITY;
+    memcpy(savedOptions, gDialogOptionEntries, sizeof(GameDialogOptionEntry) * savedLength);
+    memcpy(savedReply, gDialogReplyText, sizeof(savedReply));
+
+    for (;;) {
+        snprintf(gDialogReplyText, sizeof(gDialogReplyText),
+            "%s: How do you want me to fight? Pick a line to change it.", critterGetName(member));
+        gameDialogClearOptions(); // length, scroll and clipping reset
+        for (int type = 0; type < PARTY_MEMBER_CUSTOMIZATION_OPTION_COUNT; type++) {
+            int index = partyOrdersCurrentIndex(member, type);
+            char line[256];
+            snprintf(line, sizeof(line), "%s: %s", partyOrdersMessage(type),
+                partyOrdersMessage(_custom_settings[type][index].messageId));
+            gameDialogAddTextOption(-1, line, GAME_DIALOG_REACTION_NEUTRAL);
+        }
+        gameDialogAddTextOption(-1, partyOrdersMessage(10), GAME_DIALOG_REACTION_NEUTRAL); // Done
+
+        if (gDialogServerPump != nullptr) {
+            dialogEmitNode();
+        }
+        DialogIntent intent;
+        bool haveIntent = dialogIntentPeek(&intent);
+        if (gDialogServerPump != nullptr) {
+            while (!haveIntent) {
+                if (!gDialogServerPump()) {
+                    break;
+                }
+                haveIntent = dialogIntentPeek(&intent);
+            }
+        }
+        if (!haveIntent) {
+            break; // pump gave up: restore and let the caller's own wait decide
+        }
+        dialogIntentPop();
+        if (intent.kind == DIALOG_INTENT_END) {
+            dialogIntentPush(DIALOG_INTENT_END, 0); // the caller ends the conversation
+            break;
+        }
+        if (intent.kind != DIALOG_INTENT_SELECT) {
+            break; // Combat Control / barter pressed again: treat as Done
+        }
+        if (intent.arg < 0 || intent.arg >= PARTY_MEMBER_CUSTOMIZATION_OPTION_COUNT) {
+            break; // Done (or out of range)
+        }
+        int type = intent.arg;
+        int next = (partyOrdersCurrentIndex(member, type) + 1) % partyOrdersCount(type);
+        partyOrdersApply(member, type, next);
+        fprintf(stderr, "f2_server: party orders %s: %s -> %s\n", critterGetName(member),
+            partyOrdersMessage(type), partyOrdersMessage(_custom_settings[type][next].messageId));
+    }
+
+    gameDialogClearOptions(); // drops the orders node's entries, resets scroll/clipping
+    memcpy(gDialogOptionEntries, savedOptions, sizeof(GameDialogOptionEntry) * savedLength);
+    memcpy(gDialogReplyText, savedReply, sizeof(savedReply));
+    gGameDialogOptionEntriesLength = savedLength;
+}
+
 int _gdProcess()
 {
     if (_gdReenterLevel == 0) {
@@ -2110,6 +2260,12 @@ int _gdProcess()
             }
 
             int choiceResult = 0;
+            if (intent.kind == DIALOG_INTENT_PARTY) {
+                // Combat Control on a party member: serve the orders node, then
+                // fall through to re-emit the conversation node it replaced.
+                serverDialogPartyOrders();
+                continue;
+            }
             if (intent.kind == DIALOG_INTENT_BARTER) {
                 // The routed Barter button (server_control dbarter). WHETHER this
                 // speaker barters is ours to decide, exactly as the interactive
@@ -2611,6 +2767,82 @@ void gameDialogRenderReply()
     windowRefresh(gGameDialogReplyWindow);
 }
 
+// Review history on the wire viewer. Vanilla records entries from the script
+// setters (which run on the server), so the viewer's Review button had nothing
+// to show and was a hard no-op. The viewer now records what it renders: the
+// streamed reply when a node lands, the picked option when the player answers.
+void gameDialogReviewReset()
+{
+    // dialogReviewEntriesClear frees the texts but leaves the COUNT alone (vanilla
+    // zeroes it in the dialog-entry path the viewer never runs), so a new
+    // conversation's review opened with the old one's entries as blank lines.
+    dialogReviewEntriesClear();
+    gGameDialogReviewEntriesLength = 0;
+}
+
+void gameDialogReviewRecordReply(const char* text)
+{
+    gameDialogAddReviewText(text);
+}
+
+void gameDialogReviewRecordOption(const char* text)
+{
+    if (gGameDialogReviewEntriesLength > 0) {
+        gameDialogSetReviewOptionText(text);
+    }
+}
+
+// Reply-text paging for the wire viewer. Vanilla pages an over-long reply
+// inside _gdProcess's own loop (SPACE / a 10 s timer); the viewer never runs
+// that loop, so the overflow offset text_to_rect_wrapped left in dword_58F4E0
+// was simply dropped and the tail of the reply was never shown.
+// Page stack, same shape as vanilla's pageOffsets[10] in _gdProcess: entry i is
+// the text offset page i starts at. dword_58F4E0 is the offset the NEXT page
+// starts at after a render (0 once the last page has been drawn).
+static int gDialogReplyPageOffsets[10];
+static int gDialogReplyPageIndex = 0;
+static int gDialogReplyPageCount = 0;
+
+static void gameDialogReplyPagesReset()
+{
+    gDialogReplyPageOffsets[0] = 0;
+    gDialogReplyPageIndex = 0;
+    gDialogReplyPageCount = 0;
+}
+
+bool gameDialogReplyHasMore()
+{
+    return dword_58F4E0 != 0;
+}
+
+bool gameDialogReplyCanPageUp()
+{
+    return gDialogReplyPageIndex > 0;
+}
+
+void gameDialogReplyNextPage()
+{
+    if (dword_58F4E0 == 0 || gDialogReplyPageIndex >= 9) {
+        return;
+    }
+    gDialogReplyPageIndex++;
+    gDialogReplyPageOffsets[gDialogReplyPageIndex] = dword_58F4E0;
+    if (gDialogReplyPageIndex > gDialogReplyPageCount) {
+        gDialogReplyPageCount = gDialogReplyPageIndex;
+    }
+    gameDialogRenderReply(); // renders from the offset and advances it (0 at the end)
+}
+
+void gameDialogReplyPrevPage()
+{
+    if (gDialogReplyPageIndex <= 0) {
+        return;
+    }
+    gDialogReplyPageIndex--;
+    dword_58F4E0 = gDialogReplyPageOffsets[gDialogReplyPageIndex];
+    gameDialogRenderReply();
+}
+
 // Resolve option `index`'s final display text (including the SFALL number/bullet
 // prefix, exactly as the render loop bakes it) into `out`. Shared by the render
 // loop and the dialog-streaming emitter so the two can never drift on how an
@@ -2694,6 +2926,8 @@ bool gameDialogGetOptionText(int index, char* out, size_t size)
 void gameDialogSetReplyText(const char* text)
 {
     snprintf(gDialogReplyText, sizeof(gDialogReplyText), "%s", text != nullptr ? text : "");
+    dword_58F4E0 = 0;
+    gameDialogReplyPagesReset();
 }
 
 // ►► OPTION-LIST SCROLLING. The options panel is a fixed 393x117 and the renderer drops
@@ -2711,6 +2945,11 @@ static bool gDialogOptionsClipped = false;
 
 void gameDialogClearOptions()
 {
+    // The wire path (clientDialogRenderPendingNode) is the one re-render that
+    // used to skip this: the old node's option BUTTONS survived under the new
+    // node's text, so stale replies drew over live ones and caught clicks.
+    // Every other re-render in this file cleans up first; do it here too.
+    _gdProcessCleanup();
     gGameDialogOptionEntriesLength = 0;
     // A new node starts at the top. Without this, picking an option while scrolled down
     // would open the next node already scrolled, hiding its first replies.
@@ -4351,6 +4590,13 @@ void partyMemberControlWindowUpdate()
 // 0x44928C
 void gameDialogCombatControlButtonOnMouseUp(int btn, int keyCode)
 {
+    // Wire viewer: the control window is a local SDL loop editing a LOCAL copy
+    // of the AI packet the server never sees. Ask the server for its
+    // combat-orders node instead (serverDialogPartyOrders).
+    if (clientViewerActive()) {
+        clientViewerDialogParty();
+        return;
+    }
     _dialogue_switch_mode = 8;
     _dialogue_state = 10;
 

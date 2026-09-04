@@ -7,6 +7,7 @@
 
 #include "debug.h"
 #include "platform_compat.h"
+#include "input.h"
 #include "scripts.h"
 #include "sfall_config.h"
 
@@ -251,6 +252,13 @@ static void randomSeedPrerandomInternal(int seed)
 // 0x4A3258
 static unsigned int randomGetSeed()
 {
+    // Under the synthetic clock (golden probes) the seed must be a pure
+    // function of the execution path too. The wall-clock branch below is
+    // ms-since-boot on Windows but ms-since-first-call on POSIX, which made
+    // Linux runs deterministic by accident and Windows runs never.
+    if (getTicksIsSynthetic()) {
+        return getTicks();
+    }
     return compat_timeGetTime();
 }
 

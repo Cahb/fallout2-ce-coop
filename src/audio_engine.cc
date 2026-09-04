@@ -1,11 +1,13 @@
 #include "audio_engine.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include <mutex>
 
 #include <SDL.h>
 
+#include "debug.h"
 #include "game_movie.h" // gameMovieIsPlaying — keep the movie audio-clock alive when unfocused
 
 namespace fallout {
@@ -119,6 +121,13 @@ static void audioEngineMixin(void* userData, Uint8* stream, int length)
     }
 }
 
+static char gAudioEngineInitError[256];
+
+const char* audioEngineInitError()
+{
+    return gAudioEngineInitError[0] != '\0' ? gAudioEngineInitError : nullptr;
+}
+
 bool audioEngineInit()
 {
     SDL_AudioSpec desiredSpec;
@@ -128,9 +137,41 @@ bool audioEngineInit()
     desiredSpec.samples = 1024;
     desiredSpec.callback = audioEngineMixin;
 
+    // SDL_OpenAudioDevice returns 0 on failure, never -1. The upstream check
+    // (== -1) let a refused device pass as "open": every later play went to
+    // device 0 (nothing) and the player simply had no sound, with no error
+    // anywhere. That is the "client has no audio at all" report. Test the
+    // real failure value, then try the other SDL audio drivers before giving
+    // up, and keep the reason so the viewer can show it on screen.
+    gAudioEngineInitError[0] = '\0';
     gAudioEngineDeviceId = SDL_OpenAudioDevice(nullptr, 0, &desiredSpec, &gAudioEngineSpec, SDL_AUDIO_ALLOW_ANY_CHANGE);
-    if (gAudioEngineDeviceId == -1) {
-        return false;
+    if (gAudioEngineDeviceId == 0) {
+        const char* firstDriver = SDL_GetCurrentAudioDriver();
+        snprintf(gAudioEngineInitError, sizeof(gAudioEngineInitError), "%s: %s",
+            firstDriver != nullptr ? firstDriver : "no audio driver", SDL_GetError());
+        debugPrint("audioEngineInit: device open failed (%s)\n", gAudioEngineInitError);
+        fprintf(stderr, "audioEngineInit: device open failed (%s)\n", gAudioEngineInitError);
+
+        static const char* kFallbackDrivers[] = { "directsound", "winmm", "wasapi", "pulseaudio", "alsa", "coreaudio" };
+        for (const char* driver : kFallbackDrivers) {
+            if (firstDriver != nullptr && strcmp(driver, firstDriver) == 0) {
+                continue;
+            }
+            SDL_AudioQuit();
+            if (SDL_AudioInit(driver) != 0) {
+                continue;
+            }
+            gAudioEngineDeviceId = SDL_OpenAudioDevice(nullptr, 0, &desiredSpec, &gAudioEngineSpec, SDL_AUDIO_ALLOW_ANY_CHANGE);
+            if (gAudioEngineDeviceId != 0) {
+                debugPrint("audioEngineInit: recovered with the %s driver\n", driver);
+                fprintf(stderr, "audioEngineInit: recovered with the %s driver\n", driver);
+                gAudioEngineInitError[0] = '\0';
+                break;
+            }
+        }
+        if (gAudioEngineDeviceId == 0) {
+            return false;
+        }
     }
 
     SDL_PauseAudioDevice(gAudioEngineDeviceId, 0);

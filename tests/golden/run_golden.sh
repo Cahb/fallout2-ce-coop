@@ -17,7 +17,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GAME_DIR="${F2_GAME_DIR:-$ROOT/FO2}"
 BIN="${F2_BIN:-$ROOT/build/fallout2-ce}"
-GOLDEN_DIR="$ROOT/tests/golden"
+# F2_GOLDEN_DIR: alternate golden set (e.g. Windows-blessed goldens; the
+# checked-in set is Linux-blessed and diverges on Windows in RNG/timing fields).
+GOLDEN_DIR="${F2_GOLDEN_DIR:-$ROOT/tests/golden}"
+# Input-replay traces are inputs, not goldens: always from the checked-in dir.
+TRACE_DIR="$ROOT/tests/golden"
+mkdir -p "$GOLDEN_DIR"
 BLESS="${BLESS:-0}"
 RESULTS="$(mktemp -d)"
 trap 'rm -rf "$RESULTS"' EXIT
@@ -32,7 +37,7 @@ run_case() {
         F2_FAKE_CLOCK=1 F2_HEADLESS_PROBE=1 \
         F2_PROBE_MAP="$map" F2_PROBE_SEED="$seed" F2_PROBE_TICKS="$ticks" \
         F2_PROBE_DUMP="$out" \
-        ${trace:+F2_INPUT_REPLAY="$GOLDEN_DIR/$trace"} \
+        ${trace:+F2_INPUT_REPLAY="$TRACE_DIR/$trace"} \
         ${aggro:+F2_PROBE_AGGRO="$aggro"} \
         ${actions:+F2_PROBE_ACTIONS="$actions"} \
         timeout 300 "$BIN" > /dev/null 2>&1) || {

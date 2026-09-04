@@ -1665,9 +1665,14 @@ static int useStairs(Object* user, Object* stairs)
 }
 
 // 0x49CAF4
+static const bool kWorldTrace = getenv("F2_TRACE_WORLD") != nullptr; // [world] diagnostics (doors, containers, map state)
+
 static int _set_door_state_open(Object* door, Object* obj2)
 {
     door->data.scenery.door.openFlags |= 0x01;
+    if (kWorldTrace) {
+        fprintf(stderr, "[world] door netId=%d tile=%d elev=%d -> OPEN\n", door->netId, door->tile, door->elevation);
+    }
     return 0;
 }
 
@@ -1675,6 +1680,9 @@ static int _set_door_state_open(Object* door, Object* obj2)
 static int _set_door_state_closed(Object* door, Object* obj2)
 {
     door->data.scenery.door.openFlags &= ~0x01;
+    if (kWorldTrace) {
+        fprintf(stderr, "[world] door netId=%d tile=%d elev=%d -> CLOSED\n", door->netId, door->tile, door->elevation);
+    }
     return 0;
 }
 

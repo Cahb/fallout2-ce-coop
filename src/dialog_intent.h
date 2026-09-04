@@ -24,6 +24,7 @@ enum DialogIntentKind {
     // button). Server-authoritative: the CRITTER_BARTER check and the "will not
     // barter" refusal are made in the drain, not on the viewer.
     DIALOG_INTENT_BARTER,
+    DIALOG_INTENT_PARTY, // party member: open the combat-orders node (viewer's Combat Control button)
 };
 
 struct DialogIntent {

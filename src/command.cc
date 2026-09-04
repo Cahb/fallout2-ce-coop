@@ -542,6 +542,32 @@ void commandDispatch(const Command& command)
         } else {
             debugPrint("headless-probe: no door found\n");
         }
+    } else if (strcmp(command.name, "names") == 0) {
+        // Diagnostic: every scenery object on the dude's elevation with its name.
+        for (Object* o = objectFindFirst(); o != nullptr; o = objectFindNext()) {
+            if (PID_TYPE(o->pid) == OBJ_TYPE_SCENERY && o->elevation == gDude->elevation) {
+                debugPrint("headless-probe: scenery canuse=%d netId=%d pid=0x%X tile=%d sid=%d name=%s\n",
+                    _obj_action_can_use(o) ? 1 : 0, o->netId, o->pid, o->tile, o->sid, objectGetName(o));
+            }
+        }
+    } else if (strcmp(command.name, "useobj") == 0) {
+        // Use ANY object by netId (scenery with a use_p_proc: terminals, consoles).
+        // Diagnostic twin of usedoor: goes straight to _obj_use like the server's
+        // kInteractUse callback does after the approach.
+        Object* found = nullptr;
+        for (Object* candidate = objectFindFirst(); candidate != nullptr; candidate = objectFindNext()) {
+            if (candidate->netId == command.arg) {
+                found = candidate;
+                break;
+            }
+        }
+        if (found != nullptr) {
+            debugPrint("headless-probe: useobj netId=%d pid=0x%X sid=%d\n", found->netId, found->pid, found->sid);
+            int rc = _obj_use(gDude, found);
+            debugPrint("headless-probe: useobj rc=%d\n", rc);
+        } else {
+            debugPrint("headless-probe: useobj netId=%d not found\n", command.arg);
+        }
     } else if (strcmp(command.name, "pickup") == 0) {
         // Pick up the nearest ground item on the dude's elevation
         // (excludes containers — those open the loot modal). Drives

@@ -36,6 +36,25 @@ namespace fallout {
 // happen" in co-op, look here first (docs/COOP_COVERAGE.md).
 class ServerScriptRequestHandler : public ScriptRequestHandler {
 public:
+    void dialogDriveBegin() override
+    {
+        // TALK dialogs already hold a drive (dialogEnter above) when the script's
+        // start_gdialog fires; only a script-initiated conversation needs one here.
+        if (serverControlDialogDriveActive()) {
+            return;
+        }
+        serverControlBeginDialogDrive();
+        _scriptedDrive = true;
+    }
+
+    void dialogDriveEnd() override
+    {
+        if (_scriptedDrive) {
+            _scriptedDrive = false;
+            serverControlEndDialogDrive();
+        }
+    }
+
     void dialogEnter(Object* speaker) override
     {
         // ►► THE ONE PLACE A SERVER-SIDE CONVERSATION IS ENTERED, and gameDialogEnter
@@ -140,6 +159,9 @@ public:
 
         return -1;
     }
+
+private:
+    bool _scriptedDrive = false; // drive begun by dialogDriveBegin, ended by dialogDriveEnd
 };
 
 static ServerScriptRequestHandler gServerScriptRequestHandler;

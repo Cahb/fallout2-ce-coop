@@ -1015,6 +1015,13 @@ void protoPlayerActorsUpdateLook()
             continue;
         }
 
+        // A dead player keeps the corpse art. This runs on EVERY baseline (each
+        // join/reconnect), and rebuilding the standing fid here is what stood
+        // dead players back up on their feet for everyone who reconnected.
+        if (critterIsDead(actor)) {
+            continue;
+        }
+
         Proto* proto;
         if (protoGetProto(actor->pid, &proto) == -1) {
             continue;

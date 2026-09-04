@@ -582,6 +582,8 @@ void mapNewMap()
 }
 
 // 0x482A68
+static const bool kWorldTrace = getenv("F2_TRACE_WORLD") != nullptr; // [world] diagnostics (doors, containers, map state)
+
 int mapLoadByName(char* fileName)
 {
     int rc;
@@ -602,12 +604,18 @@ int mapLoadByName(char* fileName)
 
         if (stream != nullptr) {
             fileClose(stream);
+            if (kWorldTrace) {
+                fprintf(stderr, "[world] map load %s: from saved .SAV (state kept)\n", fileName);
+            }
             rc = mapLoadSaved(fileName);
             wmMapMusicStart();
         }
     }
 
     if (rc == -1) {
+        if (kWorldTrace) {
+            fprintf(stderr, "[world] map load %s: fresh .MAP (no saved state: doors/loot reset)\n", fileName);
+        }
         const char* filePath = mapBuildPath(fileName);
         File* stream = fileOpen(filePath, "rb");
         if (stream != nullptr) {
@@ -1550,10 +1558,16 @@ int _map_save_in_game(bool a1)
 
         strcpy(name, gMapHeader.name);
         _strmfe(gMapHeader.name, name, "SAV");
+        if (kWorldTrace) {
+            fprintf(stderr, "[world] map exit %s: NOT saveable, erasing .SAV (state resets on re-entry)\n", name);
+        }
         _MapDirEraseFile_("MAPS\\", gMapHeader.name);
         strcpy(gMapHeader.name, name);
     } else {
         debugPrint("\n Saving \".SAV\" map.");
+        if (kWorldTrace) {
+            fprintf(stderr, "[world] map exit %s: writing .SAV\n", gMapHeader.name);
+        }
 
         strcpy(name, gMapHeader.name);
         _strmfe(gMapHeader.name, name, "SAV");

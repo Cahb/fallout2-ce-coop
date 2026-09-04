@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include "window_manager.h"
 
 #include <string.h>
@@ -1318,7 +1320,10 @@ void programWindowSetTitle(const char* title)
 #ifdef _WIN32
     if (_GNW95_title_mutex == INVALID_HANDLE_VALUE) {
         _GNW95_title_mutex = CreateMutexA(nullptr, TRUE, title);
-        if (GetLastError() != ERROR_SUCCESS) {
+        // Third copy of the single-instance lock (see autorunMutexCreate()).
+        // Headless probes keep the (valid) handle so the title-set check still
+        // passes, but ignore that another instance already owns the name.
+        if (GetLastError() != ERROR_SUCCESS && getenv("F2_HEADLESS_PROBE") == nullptr) {
             _GNW95_already_running = true;
             return;
         }
@@ -1336,6 +1341,13 @@ void programWindowSetTitle(const char* title)
 // 0x4D8200
 bool showMesageBox(const char* text)
 {
+    // Headless probes have no desktop to show a modal on; a box would stall the
+    // gate until someone clicks it. Report on stderr and let the caller proceed.
+    if (getenv("F2_HEADLESS_PROBE") != nullptr) {
+        fprintf(stderr, "%s\n", text);
+        return true;
+    }
+
     SDL_Cursor* prev = SDL_GetCursor();
     SDL_Cursor* cursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
     SDL_SetCursor(cursor);

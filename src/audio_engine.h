@@ -12,6 +12,9 @@ namespace fallout {
 #define AUDIO_ENGINE_SOUND_BUFFER_STATUS_LOOPING 0x00000004
 
 bool audioEngineInit();
+// Non-null after audioEngineInit() failed (every driver refused a device).
+// Lets the viewer tell the player WHY they have no sound instead of staying mute.
+const char* audioEngineInitError();
 void audioEngineExit();
 void audioEnginePause();
 void audioEngineResume();

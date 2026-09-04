@@ -1,4 +1,6 @@
 #include "game_config.h"
+
+#include <stdlib.h>
 #include "sfall_config.h"
 
 #include <stdio.h>
@@ -202,6 +204,12 @@ bool gameConfigInit(bool isMapper, int argc, char** argv)
 // 0x444C14
 bool gameConfigSave()
 {
+    // Headless probes never write the config back: dozens run in parallel on one
+    // game folder and an exiting probe's preferences would poison the ones still
+    // starting (the golden gates saw the Normal/Hard skill offset appear at random).
+    if (getenv("F2_HEADLESS_PROBE") != nullptr) {
+        return true;
+    }
     if (!gGameConfigInitialized) {
         return false;
     }

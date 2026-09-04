@@ -30,9 +30,13 @@ int main(int argc, char* argv[])
     int rc;
 
 #if _WIN32
-    GNW95_mutex = CreateMutexA(0, TRUE, "GNW95MUTEX");
-    if (GetLastError() != ERROR_SUCCESS) {
-        return 0;
+    // See autorunMutexCreate(): headless probes are exempt from the
+    // single-instance lock.
+    if (getenv("F2_HEADLESS_PROBE") == nullptr) {
+        GNW95_mutex = CreateMutexA(0, TRUE, "GNW95MUTEX");
+        if (GetLastError() != ERROR_SUCCESS) {
+            return 0;
+        }
     }
 #endif
 

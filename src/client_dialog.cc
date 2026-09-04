@@ -57,14 +57,31 @@ static std::string gPendingAudio;
 // EVENT_DIALOG_NODE handler. LATCHES the node — no window calls (I6). The first
 // node marks the conversation live; clientModalWindowsSync() builds the windows on
 // the next frame and clientDialogRenderPendingNode() applies this content into them.
+static bool gPendingSpeakerIsPartyMember = false;
+
+bool clientDialogSpeakerIsPartyMember()
+{
+    return gPendingSpeakerIsPartyMember;
+}
+
 void clientDialogOnNode(int speakerNetId, int driverNetId, int reaction,
     const char* reply, const char* const* options, int optionCount,
-    const char* audioFileName, int headFid, const int* optionReactions)
+    const char* audioFileName, int headFid, const int* optionReactions, bool speakerIsPartyMember)
 {
     gPendingSpeakerNetId = speakerNetId;
+    gPendingSpeakerIsPartyMember = speakerIsPartyMember;
     gPendingReaction = reaction;
     gPendingHeadFid = headFid;
     gPendingReply = reply != nullptr ? reply : "";
+    // Review button history: one entry per node, recorded on arrival (the render
+    // below can run more than once per node and would duplicate it). A fresh
+    // conversation starts with an empty history, as in vanilla.
+    if (!gClientDialogActive) {
+        gameDialogReviewReset();
+    }
+    if (!gPendingReply.empty()) {
+        gameDialogReviewRecordReply(gPendingReply.c_str());
+    }
     gPendingOptions.clear();
     gPendingOptionReactions.clear();
     if (optionCount > 0 && options != nullptr) {
@@ -127,6 +144,7 @@ void clientModalWindowsSync()
         // _gdSetupFidget read gGameDialogHeadFid to locate the head art for lipsync
         // and the idle fidget. See client_dialog history for the Arroyo Elder repro.
         gGameDialogSpeaker = speaker;
+        gGameDialogSpeakerIsPartyMember = gPendingSpeakerIsPartyMember; // party-member window (Combat Control)
         gGameDialogHeadFid = gPendingHeadFid;
         gGameDialogFidget = gPendingReaction;
         _gdialogInitFromScript(gPendingHeadFid, gPendingReaction);
@@ -284,6 +302,17 @@ bool clientDialogHandleKey(int keyCode)
         return true;
     }
 
+    // REPLY PAGING: a reply longer than the 379x58 window used to be cut off
+    // (see gameDialogReplyNextPage). SPACE shows the next page, as in vanilla.
+    if (gameDialogReplyHasMore()
+        && (keyCode == KEY_SPACE || keyCode == KEY_PAGE_DOWN || keyCode == KEY_ARROW_DOWN)) {
+        gameDialogReplyNextPage();
+        return true;
+    }
+    if (gameDialogReplyCanPageUp() && (keyCode == KEY_PAGE_UP || keyCode == KEY_ARROW_UP)) {
+        gameDialogReplyPrevPage();
+        return true;
+    }
     // OPTION SCROLLING (the panel is fixed-size and the renderer drops what does not fit).
     // Both the page keys and the arrows/wheel, since a viewer does not run the reply's own
     // paging state and so has nothing to compete with.
@@ -306,6 +335,7 @@ bool clientDialogHandleKey(int keyCode)
     int optionCount = (int)gPendingOptions.size();
     if (optionCount > 0 && keyCode >= 49 && keyCode < 49 + optionCount) {
         int index = keyCode - 49;
+        gameDialogReviewRecordOption(gPendingOptions[index].c_str()); // Review button history
         clientViewerDialogSay(index);
         gClientDialogWaitingForResponse = true;
         return true;

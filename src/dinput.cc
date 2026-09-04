@@ -118,7 +118,20 @@ bool keyboardDeviceGetData(KeyboardData* keyboardData)
 // 0x4E070C
 bool mouseDeviceInit()
 {
-    return SDL_SetRelativeMouseMode(SDL_TRUE) == 0;
+    if (SDL_SetRelativeMouseMode(SDL_TRUE) == 0) {
+        return true;
+    }
+
+    // Headless runs (SDL "dummy" video driver: golden probes, CI) have no
+    // relative-mouse implementation on Windows. That is not an input failure,
+    // there is no pointer to confine. The driver check is deliberately narrow
+    // so a real desktop failure still aborts init exactly as before.
+    const char* driver = SDL_GetCurrentVideoDriver();
+    if (driver != nullptr && SDL_strcmp(driver, "dummy") == 0) {
+        return true;
+    }
+
+    return false;
 }
 
 // 0x4E078C
