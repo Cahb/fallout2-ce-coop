@@ -182,7 +182,7 @@ int _init_vesa_mode(int width, int height)
 }
 
 // 0x4CAEDC
-int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
+/*int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
 {
     if (gSdlWindow == nullptr) {
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
@@ -219,6 +219,86 @@ int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
         // pointer slips off the edge and clicks land outside (fullscreen already
         // confines). SDL releases the confine while the window is unfocused, so
         // alt-tab still works; input.cc re-applies it on focus gain.
+        gSdlWindowedMode = !fullscreen;
+        SDL_SetWindowGrab(gSdlWindow, gSdlWindowedMode ? SDL_TRUE : SDL_FALSE);
+    }
+
+    return 0;
+}*/
+
+// 0x4CAEDC new with resolution and borderless
+int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
+{
+    if (gSdlWindow == nullptr) {
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest"); // Nearest-neighbor pixel-perfect scaling
+
+        // --- Enhanced coop_res.ini with window borderless ---
+        int game_w = 640;
+        int game_h = 480;
+        int win_w = 1600;
+        int win_h = 900;
+        int use_borderless = 1; // 1 = Enable borderless window, 0 = Classic windowed mode with frame
+
+        FILE* ini = fopen("coop_res.ini", "r");
+        if (ini) {
+            // Read all 5 display parameters from the custom INI configuration
+            fscanf(ini, "game_w=%d\ngame_h=%d\nwin_w=%d\nwin_h=%d\nborderless=%d",
+                &game_w, &game_h, &win_w, &win_h, &use_borderless);
+            fclose(ini);
+        } else {
+            ini = fopen("coop_res.ini", "w");
+            if (ini) {
+                // Generate default configuration if coop_res.ini is missing
+                fprintf(ini, "game_w=640\ngame_h=480\nwin_w=1600\nwin_h=900\nborderless=1");
+                fclose(ini);
+            }
+        }
+
+        // Apply background scaling flags and disable focus pause for borderless mode
+        if (!fullscreen && use_borderless == 1) {
+            SDL_SetHint("SDL_ALLOW_BACKGROUND_EVENTS", "1"); // Process network and logic in background
+            SDL_SetHint("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0"); // Prevent window from freezing or minimizing
+
+            // Completely disable window state events to bypass focus-loss background sleep
+            SDL_EventState(SDL_WINDOWEVENT, SDL_DISABLE);
+        }
+        
+        Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
+        if (fullscreen) {
+            windowFlags |= SDL_WINDOW_FULLSCREEN;
+        } else {
+            if (use_borderless == 1) {
+                windowFlags |= SDL_WINDOW_BORDERLESS;
+            }
+        }
+
+        // Create the physical window using custom viewport metrics from the INI file
+        gSdlWindow = SDL_CreateWindow(gProgramWindowTitle, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, windowFlags);
+        if (gSdlWindow == nullptr) {
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+            windowFlags &= ~SDL_WINDOW_OPENGL;
+            gSdlWindow = SDL_CreateWindow(gProgramWindowTitle, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, windowFlags);
+            if (gSdlWindow == nullptr) {
+                return -1;
+            }
+        }
+
+        // Initialize the accelerated hardware renderer inside the custom physical window
+        gSdlRenderer = SDL_CreateRenderer(gSdlWindow, -1, 0);
+        if (gSdlRenderer == nullptr) {
+            return -1;
+        }
+
+        // Force SDL2 scaling subsystem to stretch game resolution up to physical window size
+        SDL_RenderSetLogicalSize(gSdlRenderer, game_w, game_h);
+
+        // Allocate texture buffers bound to original game dimensions to prevent viewport clipping
+        gSdlTexture = SDL_CreateTexture(gSdlRenderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, game_w, game_h);
+        Uint32 format;
+        SDL_QueryTexture(gSdlTexture, &format, nullptr, nullptr, nullptr);
+        gSdlTextureSurface = SDL_CreateRGBSurfaceWithFormat(0, game_w, game_h, SDL_BITSPERPIXEL(format), format);
+
         gSdlWindowedMode = !fullscreen;
         SDL_SetWindowGrab(gSdlWindow, gSdlWindowedMode ? SDL_TRUE : SDL_FALSE);
     }
