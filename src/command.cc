@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "actions.h"
+#include "art.h"
+#include "cache.h"
 #include "animation.h"
 #include "barter_intent.h"
 #include "steal_intent.h"
@@ -20,12 +22,14 @@
 #include "input.h"
 #include "inventory.h"
 #include "item.h"
+#include "server_players.h"
 #include "map.h"
 #include "object.h"
 #include "party_member.h"
 #include "perk.h"
 #include "pipboy.h"
 #include "pres_record.h"
+#include "presenter.h"
 #include "proto.h"
 #include "proto_instance.h"
 #include "savegame.h"
@@ -37,6 +41,7 @@
 #include "state_audit.h" // stateAuditEmit — the `audit` probe command
 #include "state_dump.h"
 #include "stat.h"
+#include "tile.h"
 #include "trait.h"
 #include "worldmap.h"
 #include "worldmap_intent.h"
@@ -967,6 +972,225 @@ void commandDispatch(const Command& command)
         debugPrint("headless-probe: entermap %d elev=%d\n",
             transition.map, transition.elevation);
         mapSetTransition(&transition);
+    } else if (strcmp(command.name, "setgvar") == 0) {
+        // TEST HOOK (issue #10 check): set global var `arg` to `arg2`.
+        gameSetGlobalVar(command.arg, command.arg2);
+        fprintf(stderr, "f2_server: setgvar %d=%d\n", command.arg, gameGetGlobalVar(command.arg));
+    } else if (strcmp(command.name, "entermapas") == 0) {
+        // TEST HOOK (issue #10 check): like entermap, but INITIATED by player slot
+        // `arg` (map = arg2) — the real exit-grid path for a non-host player.
+        Object* actor = playerActorAt(command.arg);
+        MapTransition transition;
+        memset(&transition, 0, sizeof(transition));
+        transition.map = command.arg2;
+        transition.tile = -1;
+        transition.rotation = ROTATION_SE;
+        fprintf(stderr, "f2_server: entermapas slot=%d map=%d actor=%d\n",
+            command.arg, command.arg2, actor != nullptr ? actor->netId : -1);
+        // Headless extras spawn after the boot map loaded, so they were never
+        // planted on it. Stand every one beside the host, as joined players would
+        // be — objectReattach, as the server's owner-returned path does (an
+        // off-list body fails a plain objectSetLocation).
+        for (int slot = 1; slot < playerActorCount(); slot++) {
+            Object* extra = playerActorAt(slot);
+            if (extra != nullptr && extra->tile == -1) {
+                int tile = playerActorFindFreeTileNear(gDude->tile, gDude->elevation);
+                int rc = objectReattach(extra, tile, gDude->elevation);
+                if (rc == 0) {
+                    playerActorSetOnline(slot, true); // same as the owner-returned path
+                }
+                fprintf(stderr, "f2_server: entermapas planted slot=%d tile=%d rc=%d\n", slot, tile, rc);
+            }
+        }
+        if (actor != nullptr) {
+            mapSetTransitionForActor(&transition, actor);
+        }
+    } else if (strcmp(command.name, "actors") == 0) {
+        // TEST HOOK (issue #10 check): where is every player actor?
+        for (int slot = 0; slot < playerActorCount(); slot++) {
+            Object* actor = playerActorAt(slot);
+            if (actor != nullptr) {
+                fprintf(stderr, "f2_server: actors map=%d slot=%d tile=%d elev=%d\n",
+                    gMapHeader.index, slot, actor->tile, actor->elevation);
+            }
+        }
+    } else if (strcmp(command.name, "usetile") == 0) {
+        // TEST HOOK: `use` the object standing on `tile` (the vanilla USE verb —
+        // runs the object's USE script through _obj_use). Scenery only, like the
+        // real path. Added for the Modoc outhouse repro (miToilet).
+        Object* target = nullptr;
+        int bestDistance = INT_MAX;
+        for (Object* candidate = objectFindFirst(); candidate != nullptr; candidate = objectFindNext()) {
+            if (candidate->tile != command.arg || candidate->elevation != gDude->elevation) {
+                continue;
+            }
+            if (FID_TYPE(candidate->fid) != OBJ_TYPE_SCENERY) {
+                continue;
+            }
+            int distance = objectGetDistanceBetween(gDude, candidate);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                target = candidate;
+            }
+        }
+        if (target == nullptr) {
+            fprintf(stderr, "f2_server: usetile %d — no scenery there\n", command.arg);
+        } else if (bestDistance > 1) {
+            fprintf(stderr, "f2_server: usetile %d — scenery netId=%d is %d away\n",
+                command.arg, target->netId, bestDistance);
+        } else {
+            fprintf(stderr, "f2_server: usetile %d — using netId=%d pid=0x%X frame=%d\n",
+                command.arg, target->netId, target->pid, target->frame);
+            _obj_use(gDude, target);
+            fprintf(stderr, "f2_server: usetile %d — after use frame=%d\n", command.arg, target->frame);
+        }
+    } else if (strcmp(command.name, "explodetile") == 0) {
+        // TEST HOOK: `explodetile <tile> [damage]` — a real explosion centred on an
+        // arbitrary tile (actionExplode), so harnesses can reproduce scenery damage
+        // (the Modoc outhouse) without a critter at the blast point.
+        int damage = command.arg2 > 0 ? command.arg2 : 200;
+        fprintf(stderr, "f2_server: explodetile %d damage=%d\n", command.arg, damage);
+        int rc = actionExplode(command.arg, gDude->elevation, damage, damage, gDude, true);
+        fprintf(stderr, "f2_server: explodetile %d rc=%d\n", command.arg, rc);
+    } else if (strcmp(command.name, "tp") == 0) {
+
+        // TEST HOOK: absolute teleport of the dude, for harnesses whose target is
+        // behind walls a pathfind can't cross (e.g. the Modoc B&B toilet).
+        if (command.arg >= 0) {
+            objectSetLocation(gDude, command.arg, gDude->elevation, nullptr);
+            tileSetCenter(gDude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+            fprintf(stderr, "f2_server: command 'tp' tile=%d\n", gDude->tile);
+        }
+    } else if (strcmp(command.name, "wear") == 0) {
+        // TEST HOOK (issue #9 check): wear the first unworn armor of pid `arg`.
+        Inventory* inventory = &(gDude->data.inventory);
+        Object* armor = nullptr;
+        for (int index = 0; index < inventory->length; index++) {
+            Object* item = inventory->items[index].item;
+            if (item->pid == command.arg && (item->flags & OBJECT_WORN) == 0) {
+                armor = item;
+                break;
+            }
+        }
+        // Same stack peel as the server's invwield verb (server_control.cc): a
+        // stack of N is one object, so wield exactly one split-off copy.
+        if (armor != nullptr && itemGetQuantity(gDude, armor) > 1 && itemRemove(gDude, armor, 1) == 0) {
+            armor->flags |= OBJECT_WORN;
+            itemAdd(gDude, armor, 1);
+            armor->flags &= ~OBJECT_WORN;
+        }
+        int rc = armor != nullptr ? _inven_wield(gDude, armor, HAND_RIGHT) : -1;
+        fprintf(stderr, "f2_server: wear pid=%d rc=%d ac=%d\n",
+            command.arg, rc, critterGetStat(gDude, STAT_ARMOR_CLASS));
+        for (int index = 0; index < inventory->length; index++) {
+            Object* item = inventory->items[index].item;
+            if (item->pid == command.arg) {
+                fprintf(stderr, "f2_server: wear   inv[%d] netId=%d qty=%d flags=0x%X\n",
+                    index, item->netId, inventory->items[index].quantity, item->flags);
+            }
+        }
+    } else if (strcmp(command.name, "lootput") == 0) {
+        // TEST HOOK (issue #9 check): the `put` verb's source pick + move, into
+        // the nearest container (any distance). arg = armor/item pid.
+        Object* container = nullptr;
+        int bestDistance = INT_MAX;
+        for (Object* candidate = objectFindFirst(); candidate != nullptr; candidate = objectFindNext()) {
+            if (candidate->elevation != gDude->elevation || PID_TYPE(candidate->pid) != OBJ_TYPE_ITEM
+                || itemGetType(candidate) != ITEM_TYPE_CONTAINER) {
+                continue;
+            }
+            int distance = objectGetDistanceBetween(gDude, candidate);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                container = candidate;
+            }
+        }
+        int qty = 0;
+        Object* item = serverLootFindStack(gDude, command.arg, &qty);
+        int rc = (container != nullptr && item != nullptr) ? itemMove(gDude, container, item, qty) : -1;
+        Object* worn = critterGetArmor(gDude);
+        fprintf(stderr, "f2_server: lootput pid=%d rc=%d movedWorn=%d stillWearing=%d ac=%d (container=%d item=%d)\n",
+            command.arg, rc, (item != nullptr && item == worn) ? 1 : 0,
+            (worn != nullptr && worn->pid == command.arg) ? 1 : 0,
+            critterGetStat(gDude, STAT_ARMOR_CLASS),
+            container != nullptr ? container->netId : -1, item != nullptr ? item->netId : -1);
+    } else if (strcmp(command.name, "lootscript") == 0) {
+        // TEST HOOK (issue #8 check): find the container whose script is scripts.lst
+        // index `arg` (0-based), stand the dude next to it, shut it, then run the
+        // REAL server open gate (serverLootOpen: use + lootOpenCheck/pickup_p_proc).
+        Object* target = nullptr;
+        for (Object* candidate = objectFindFirst(); candidate != nullptr; candidate = objectFindNext()) {
+            Script* script;
+            if (PID_TYPE(candidate->pid) == OBJ_TYPE_ITEM && candidate->sid != -1
+                && scriptGetScript(candidate->sid, &script) != -1 && script->index == command.arg) {
+                target = candidate;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            fprintf(stderr, "f2_server: lootscript %d — no such container on this map\n", command.arg);
+        } else {
+            if (objectGetDistanceBetween(gDude, target) > 1) {
+                int tile = playerActorFindFreeTileNear(target->tile, target->elevation);
+                objectSetLocation(gDude, tile, target->elevation, nullptr);
+            }
+            target->frame = 0;
+            bool granted = serverLootOpen(gDude, target);
+            CacheEntry* frameCache = nullptr;
+            Art* frameArt = artLock(target->fid, &frameCache);
+            int frameCount = frameArt != nullptr ? artGetFrameCount(frameArt) : -1;
+            if (frameArt != nullptr) {
+                artUnlock(frameCache);
+            }
+            fprintf(stderr, "f2_server: lootscript %d — netId=%d tile=%d dist=%d artFrames=%d granted=%d\n",
+                command.arg, target->netId, target->tile, objectGetDistanceBetween(gDude, target),
+                frameCount, granted ? 1 : 0);
+        }
+    } else if (strcmp(command.name, "loottile") == 0) {
+        // TEST HOOK (repro harness): perform the kInteractLoot OUTCOME on the
+        // container standing on `tile`, addressed by TILE rather than netId so a
+        // harness does not have to decode the baseline. Mirrors the server-side
+        // loot interaction body: `_obj_use_container` (which runs USE and toggles
+        // the open frame) + the addressed lootGrant that makes the viewer open
+        // its loot modal. Used to reproduce scripted container behaviour (the
+        // Modoc toilet's `load_map`) with a real viewer, headlessly.
+        Object* target = nullptr;
+        int bestDistance = INT_MAX;
+        for (Object* candidate = objectFindFirst(); candidate != nullptr; candidate = objectFindNext()) {
+            if (candidate->tile != command.arg || candidate->elevation != gDude->elevation) {
+                continue;
+            }
+            if (PID_TYPE(candidate->pid) != OBJ_TYPE_ITEM || itemGetType(candidate) != ITEM_TYPE_CONTAINER) {
+                continue;
+            }
+            int distance = objectGetDistanceBetween(gDude, candidate);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                target = candidate;
+            }
+        }
+        if (target == nullptr) {
+            fprintf(stderr, "f2_server: loottile %d — no container there\n", command.arg);
+        } else if (bestDistance > 1) {
+            fprintf(stderr, "f2_server: loottile %d — container netId=%d is %d away (not adjacent)\n",
+                command.arg, target->netId, bestDistance);
+        } else {
+            CacheEntry* frameCache = nullptr;
+            Art* frameArt = artLock(target->fid, &frameCache);
+            int frameCount = frameArt != nullptr ? artGetFrameCount(frameArt) : -1;
+            if (frameArt != nullptr) {
+                artUnlock(frameCache);
+            }
+            fprintf(stderr, "f2_server: loottile %d — firing netId=%d pid=0x%X fid=0x%X frame=%d artFrames=%d\n",
+                command.arg, target->netId, target->pid, target->fid, target->frame, frameCount);
+            // The REAL server-side open gate (use + lootOpenCheck), not a copy.
+            bool granted = serverLootOpen(gDude, target);
+            fprintf(stderr, "f2_server: loottile %d — after use frame=%d granted=%d\n",
+                command.arg, target->frame, granted ? 1 : 0);
+            if (granted) {
+                presenter()->lootGrant(gDude->netId, target->netId);
+            }
+        }
     } else {
         debugPrint("headless-probe: unknown action '%s'\n", command.name);
     }

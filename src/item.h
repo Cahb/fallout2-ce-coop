@@ -204,6 +204,14 @@ int explosionGetMaxTargets();
 void explosionSetMaxTargets(int maxTargets);
 bool itemIsHealing(int pid);
 
+// Loot transfer source pick (issue #9): first top-level stack of `pid` that is
+// NOT equipped. nullptr when only an equipped copy (or nothing) matches.
+Object* serverLootFindStack(Object* from, int pid, int* quantityOut);
+
+// Loot open (issue #8): USE the target + vanilla's lootOpenCheck gate (runs
+// pickup_p_proc). False = refused, do not grant the loot screen.
+bool serverLootOpen(Object* actor, Object* target);
+
 } // namespace fallout
 
 #endif /* ITEM_H */

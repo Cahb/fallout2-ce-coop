@@ -539,7 +539,9 @@ static void interactionFire(int verb, Object* actor, Object* target, int arg)
         if (_check_scenery_ap_cost(actor, target) == -1) {
             break;
         }
-        _obj_use_container(actor, target);
+        if (!serverLootOpen(actor, target)) {
+            break;
+        }
         // ►► TELL THE CLIENT TO OPEN IT. This was the one interaction outcome with no
         // line in the log AND no word on the wire: the viewer re-judged adjacency for
         // itself and opened the screen when IT thought the dude had arrived. When the
@@ -3709,14 +3711,7 @@ void serverControlLine(int sessionId, const char* line)
         Object* item = nullptr;
         int stackQty = 0;
         {
-            Inventory* inv = &from->data.inventory;
-            for (int i = 0; i < inv->length; i++) {
-                if (inv->items[i].item != nullptr && inv->items[i].item->pid == pid) {
-                    item = inv->items[i].item;
-                    stackQty = inv->items[i].quantity;
-                    break;
-                }
-            }
+            item = serverLootFindStack(from, pid, &stackQty);
         }
         if (item == nullptr) {
             fprintf(stderr, "f2_server: control %s no pid=%d in source netId=%d ignored\n", verb, pid, netId);

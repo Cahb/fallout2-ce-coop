@@ -572,7 +572,7 @@ static void opOverrideMapStart(Program* program)
             scriptError("\nError: %s: obj_move_to_tile failed in override_map_start!", program->name);
 
             if (objectSetLocation(gDude, previousTile, elevation, nullptr) != 0) {
-                scriptError("\nError: %s: obj_move_to_tile RECOVERY Also failed!");
+                scriptError("\nError: %s: obj_move_to_tile RECOVERY Also failed!", program->name);
                 exit(1);
             }
         }

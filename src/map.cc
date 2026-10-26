@@ -1719,9 +1719,13 @@ static void _map_place_dude_and_mouse()
     // re-plants them beside the host. The transition path then moves the whole
     // group again if it has a specific entry tile; landing twice is harmless,
     // landing never is a body standing inside a wall on the wrong map.
-    for (int slot = 1; slot < playerActorCount(); slot++) {
+    // Issue #10: gDude is not always slot 0 here — a non-host transition
+    // initiator is bound via ServerActorScope across mapLoadById. Walk EVERY
+    // slot and skip whoever gDude is, or the host is never re-planted (MODINN
+    // skips the transition-path placement, stranding it on the wrong elevation).
+    for (int slot = 0; slot < playerActorCount(); slot++) {
         Object* actor = playerActorAt(slot);
-        if (actor == nullptr || gDude == nullptr) {
+        if (actor == nullptr || gDude == nullptr || actor == gDude) {
             continue;
         }
         // Same offline rule as the transition placement above: a despawned body

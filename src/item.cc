@@ -4419,4 +4419,42 @@ bool itemIsHealing(int pid)
     return false;
 }
 
+Object* serverLootFindStack(Object* from, int pid, int* quantityOut)
+{
+    // Issue #9: the worn armor / wielded weapon lives in this same list.
+    // Never pick an EQUIPPED copy — moving it skips _adjust_ac, so the
+    // bonus stays on the actor and stacks with every repeat.
+    Inventory* inv = &from->data.inventory;
+    for (int i = 0; i < inv->length; i++) {
+        Object* item = inv->items[i].item;
+        if (item != nullptr && item->pid == pid && (item->flags & OBJECT_EQUIPPED) == 0) {
+            *quantityOut = inv->items[i].quantity;
+            return item;
+        }
+    }
+    *quantityOut = 0;
+    return nullptr;
+}
+
+bool serverLootOpen(Object* actor, Object* target)
+{
+    // Issue #8: vanilla's loot screen gates on lootOpenCheck, which runs the
+    // target's pickup_p_proc — that is where owned containers keep their
+    // sneak roll + alarm (VIDARBOX & co: script_overrides on a failed roll).
+    // A container whose use_p_proc overrode (or that the use toggled shut)
+    // does not open either. Corpses fail _obj_use_container by design, so
+    // its rc only gates real containers.
+    int useRc = _obj_use_container(actor, target);
+    bool isContainerTarget = PID_TYPE(target->pid) == OBJ_TYPE_ITEM;
+    LootOpenResult openRc = (isContainerTarget && useRc != 0)
+        ? LOOT_OPEN_BLOCKED
+        : lootOpenCheck(actor, target, false);
+    if ((isContainerTarget && useRc != 0) || openRc != LOOT_OPEN_OK) {
+        fprintf(stderr, "f2_server: interact loot REFUSED netId=%d useRc=%d openRc=%d frame=%d\n",
+            target->netId, useRc, openRc, target->frame);
+        return false;
+    }
+    return true;
+}
+
 } // namespace fallout
