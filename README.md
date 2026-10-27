@@ -22,6 +22,9 @@ still the ordinary game (see [Single-player](#single-player-original--ce)).
 > [Steam](https://store.steampowered.com/app/38410). The engine ships no game assets — you
 > supply `master.dat`, `critter.dat`, `patch000.dat` and the `data` folder from your own copy.
 
+P.S. also check out a more maintained - https://github.com/gusmarcum/fallout2-coop - fork of the project!
+
+
 ## How it fits together
 
 There are two binaries:
